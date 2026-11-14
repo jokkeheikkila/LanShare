@@ -6,6 +6,21 @@ Built in **Rust** from a single shared core powering both a lightweight native G
 
 ---
 
+## Table of Contents
+
+- [How the Share-Ring Works](#how-the-share-ring-works)
+- [Key Features](#key-features)
+- [Screenshots](#screenshots)
+- [Download](#download)
+- [Usage](#usage)
+  - [GUI (`lanshare-gui`)](#gui-lanshare-gui)
+  - [Terminal UI (TUI) & Direct CLI (`lanshare-cli`)](#terminal-ui-tui--direct-cli-lanshare-cli)
+  - [Connecting Across Tailscale (Remote Peers)](#connecting-across-tailscale-remote-peers)
+- [Security & How It Works](#security--how-it-works)
+- [Building from Source](#building-from-source)
+
+---
+
 ## How the Share-Ring Works
 
 Instead of configuring IP addresses, user accounts, or SMB shares:
