@@ -1639,7 +1639,7 @@ impl LanShareApp {
         let mut close_requested = false;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("About LanShare")
-            .with_inner_size([540.0, 500.0])
+            .with_inner_size([540.0, 535.0])
             .with_min_inner_size([460.0, 360.0])
             .with_active(true)
             .with_resizable(true);
