@@ -1090,16 +1090,9 @@ pub fn format_remaining_time(seconds: u64) -> String {
     }
 }
 
-/// Formats a completed download timestamp.
-/// If completed on the current date, returns "HH:MM:SS".
-/// If completed on a different date, includes the date: "YYYY-MM-DD HH:MM:SS".
+/// Formats a completed download timestamp as local time (`HH:MM:SS`).
 pub fn format_completed_timestamp(dt: DateTime<Local>) -> String {
-    let now = Local::now();
-    if dt.date_naive() == now.date_naive() {
-        dt.format("%H:%M:%S").to_string()
-    } else {
-        dt.format("%Y-%m-%d %H:%M:%S").to_string()
-    }
+    dt.format("%H:%M:%S").to_string()
 }
 
 /// Calculates estimated remaining seconds given bytes remaining and speed in MB/s (MiB/s).
@@ -2251,7 +2244,7 @@ mod tests {
             estimate_folder_remaining_seconds(0, 50.0, 100, 100, Some(Duration::from_secs(50)));
         assert_eq!(done_est, Some(0));
 
-        // Test completed timestamp formatting: today vs different day
+        // Test completed timestamp formatting: always time-only (HH:MM:SS) even across dates
         let now = Local::now();
         let today_formatted = format_completed_timestamp(now);
         assert_eq!(today_formatted, now.format("%H:%M:%S").to_string());
@@ -2260,7 +2253,7 @@ mod tests {
         let yesterday_formatted = format_completed_timestamp(yesterday);
         assert_eq!(
             yesterday_formatted,
-            yesterday.format("%Y-%m-%d %H:%M:%S").to_string()
+            yesterday.format("%H:%M:%S").to_string()
         );
 
         // File and folder size formatting (whole integers for B/KB/MB, 2 decimals for GB/TB)

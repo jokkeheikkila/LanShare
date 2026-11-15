@@ -4459,12 +4459,14 @@ impl LanShareApp {
                                     ui.horizontal(|ui| {
                                         let row_avail_w = ui.available_width();
                                         let right_pad = 12.0_f32;
-                                        let size_col_w = 132.0_f32;
+                                        let size_col_w = 88.0_f32;
                                         let eta_col_w = 166.0_f32;
                                         let gap_w = 8.0_f32;
+                                        let min_text_gap = 20.0_f32;
                                         let right_cols_w =
                                             right_pad + size_col_w + eta_col_w + gap_w;
-                                        let left_w = (row_avail_w - right_cols_w - 8.0).max(120.0);
+                                        let left_w =
+                                            (row_avail_w - right_cols_w - min_text_gap).max(80.0);
 
                                         let (badge, color) = match &item.status {
                                             QueueItemStatus::Downloading => {
@@ -4488,20 +4490,11 @@ impl LanShareApp {
                                             QueueItemStatus::Pending => {
                                                 let item_bytes =
                                                     item.total_bytes.unwrap_or(item.entry.size);
-                                                let kind_tag =
-                                                    if item.entry.is_dir { "Folder" } else { "" };
-                                                let sz_str = if item_bytes > 0 {
-                                                    format_file_size(item_bytes)
-                                                } else if item.entry.is_dir {
-                                                    "-".to_string()
-                                                } else {
-                                                    String::new()
-                                                };
-                                                if !kind_tag.is_empty() || !sz_str.is_empty() {
-                                                    size_text =
-                                                        format!("{:<6} {:>9}", kind_tag, sz_str);
-                                                }
                                                 if item_bytes > 0 {
+                                                    size_text = format!(
+                                                        "{:>9}",
+                                                        format_file_size(item_bytes)
+                                                    );
                                                     if let Some(item_s) =
                                                         active_speed.and_then(|spd| {
                                                             estimate_remaining_seconds(
@@ -4520,13 +4513,8 @@ impl LanShareApp {
                                             QueueItemStatus::Completed => {
                                                 let final_bytes =
                                                     item.total_bytes.unwrap_or(item.entry.size);
-                                                let kind_tag =
-                                                    if item.entry.is_dir { "Folder" } else { "" };
-                                                size_text = format!(
-                                                    "{:<6} {:>9}",
-                                                    kind_tag,
-                                                    format_file_size(final_bytes)
-                                                );
+                                                size_text =
+                                                    format!("{:>9}", format_file_size(final_bytes));
                                                 let took_str = item.elapsed_duration.map(|dur| {
                                                     if dur.as_secs() == 0 {
                                                         "< 1s".to_string()
@@ -4556,6 +4544,7 @@ impl LanShareApp {
                                             QueueItemStatus::Cancelled => {}
                                         }
 
+                                        let cross_col_w = 26.0_f32;
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(left_w, 20.0),
                                             egui::Layout::left_to_right(egui::Align::Center),
@@ -4564,31 +4553,47 @@ impl LanShareApp {
                                                 ui.set_max_size(egui::vec2(left_w, 20.0));
                                                 ui.spacing_mut().item_spacing.x = 6.0;
 
-                                                if matches!(
-                                                    item.status,
-                                                    QueueItemStatus::Pending
-                                                        | QueueItemStatus::Failed(_)
-                                                ) {
-                                                    let tip = if item.status
-                                                        == QueueItemStatus::Pending
-                                                    {
-                                                        "Remove from queue"
-                                                    } else {
-                                                        "Remove from list"
-                                                    };
-                                                    if ui
-                                                        .add_sized(
-                                                            [22.0, 18.0],
-                                                            egui::Button::new("✖"),
-                                                        )
-                                                        .on_hover_text(tip)
-                                                        .clicked()
-                                                    {
-                                                        remove_id = Some(item.id);
-                                                    }
-                                                } else {
-                                                    ui.allocate_space(egui::vec2(22.0, 18.0));
-                                                }
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(cross_col_w, 18.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_min_size(egui::vec2(
+                                                            cross_col_w,
+                                                            18.0,
+                                                        ));
+                                                        ui.set_max_size(egui::vec2(
+                                                            cross_col_w,
+                                                            18.0,
+                                                        ));
+                                                        if matches!(
+                                                            item.status,
+                                                            QueueItemStatus::Pending
+                                                                | QueueItemStatus::Failed(_)
+                                                        ) {
+                                                            let tip = if item.status
+                                                                == QueueItemStatus::Pending
+                                                            {
+                                                                "Remove from queue"
+                                                            } else {
+                                                                "Remove from list"
+                                                            };
+                                                            ui.spacing_mut().button_padding =
+                                                                egui::vec2(4.0, 1.0);
+                                                            if ui
+                                                                .add_sized(
+                                                                    [cross_col_w, 18.0],
+                                                                    egui::Button::new("✖"),
+                                                                )
+                                                                .on_hover_text(tip)
+                                                                .clicked()
+                                                            {
+                                                                remove_id = Some(item.id);
+                                                            }
+                                                        }
+                                                    },
+                                                );
 
                                                 Self::render_fixed_metric_col(ui, 52.0, |ui| {
                                                     ui.label(
@@ -4616,10 +4621,17 @@ impl LanShareApp {
                                                     size_col_w,
                                                     |ui| {
                                                         if !size_text.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(size_text)
-                                                                    .monospace()
-                                                                    .color(p.text_muted),
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        RichText::new(size_text)
+                                                                            .monospace()
+                                                                            .color(p.text_muted),
+                                                                    );
+                                                                },
                                                             );
                                                         }
                                                     },
@@ -4632,17 +4644,28 @@ impl LanShareApp {
                                                     eta_col_w,
                                                     |ui| {
                                                         if !detail_text.is_empty() {
-                                                            let resp = ui.add(
-                                                                egui::Label::new(
-                                                                    RichText::new(detail_text)
-                                                                        .monospace()
-                                                                        .color(detail_color),
-                                                                )
-                                                                .truncate(),
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    let resp = ui.add(
+                                                                        egui::Label::new(
+                                                                            RichText::new(
+                                                                                detail_text,
+                                                                            )
+                                                                            .monospace()
+                                                                            .color(detail_color),
+                                                                        )
+                                                                        .truncate(),
+                                                                    );
+                                                                    if let Some(ref tip) =
+                                                                        detail_tooltip
+                                                                    {
+                                                                        resp.on_hover_text(tip);
+                                                                    }
+                                                                },
                                                             );
-                                                            if let Some(ref tip) = detail_tooltip {
-                                                                resp.on_hover_text(tip);
-                                                            }
                                                         }
                                                     },
                                                 );
@@ -8329,17 +8352,41 @@ mod tests {
             );
         }
 
-        // 3. Download queue cross button sits on the left before Queued badge/filename,
-        // and ETA + Size columns stay aligned across differing filename lengths
+        // 3. Download queue cross button sits on the left before aligned Queued/Done badges,
+        // no 'Folder' indicator is shown, ETA is padded right near Size, and long names truncate cleanly before ETA
+        let mut done_item = make_item(
+            4,
+            "finished.tar",
+            200 * 1024 * 1024,
+            QueueItemStatus::Completed,
+        );
+        done_item.elapsed_duration = Some(Duration::from_secs(12));
+        app.download_queue.push_back(done_item);
+        if let Some(long_item) = app.download_queue.iter_mut().find(|i| i.id == 3) {
+            long_item.entry.is_dir = true;
+            long_item.entry.name =
+                "extremely_long_folder_name_to_force_ellipsis_before_eta".to_string();
+        }
         let q_out = run_test_ui(&ctx, Default::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                app.render_download_queue_panel(ui, 220.0);
+                ui.allocate_ui(egui::vec2(560.0, 260.0), |ui| {
+                    app.render_download_queue_panel(ui, 240.0);
+                });
             });
         });
-        let mut text_positions: Vec<(String, egui::Pos2)> = Vec::new();
-        fn collect_pos(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+        struct PlacedText {
+            text: String,
+            pos: egui::Pos2,
+            size: egui::Vec2,
+        }
+        let mut text_positions: Vec<PlacedText> = Vec::new();
+        fn collect_pos(s: &egui::epaint::Shape, out: &mut Vec<PlacedText>) {
             match s {
-                egui::epaint::Shape::Text(t) => out.push((t.galley.job.text.clone(), t.pos)),
+                egui::epaint::Shape::Text(t) => out.push(PlacedText {
+                    text: t.galley.job.text.clone(),
+                    pos: t.pos,
+                    size: t.galley.size(),
+                }),
                 egui::epaint::Shape::Vec(v) => v.iter().for_each(|c| collect_pos(c, out)),
                 _ => {}
             }
@@ -8349,46 +8396,75 @@ mod tests {
             .iter()
             .for_each(|c| collect_pos(&c.shape, &mut text_positions));
 
+        assert!(
+            !text_positions.iter().any(|t| t.text.contains("Folder")),
+            "Queue must omit Folder indicator to save horizontal space"
+        );
         let cross_xs: Vec<f32> = text_positions
             .iter()
-            .filter(|(t, _)| t == "✖")
-            .map(|(_, p)| p.x)
+            .filter(|t| t.text == "✖")
+            .map(|t| t.pos.x)
             .collect();
         let queued_xs: Vec<f32> = text_positions
             .iter()
-            .filter(|(t, _)| t == "Queued")
-            .map(|(_, p)| p.x)
+            .filter(|t| t.text == "Queued")
+            .map(|t| t.pos.x)
+            .collect();
+        let done_xs: Vec<f32> = text_positions
+            .iter()
+            .filter(|t| t.text == "Done")
+            .map(|t| t.pos.x)
             .collect();
         let row_name_pos = text_positions
             .iter()
-            .find(|(t, _)| t.starts_with("queued.zip"))
-            .map(|(_, p)| p.x)
+            .find(|t| t.text.starts_with("queued.zip"))
+            .map(|t| t.pos.x)
             .expect("queued.zip must render");
         assert!(!cross_xs.is_empty());
+        assert_eq!(queued_xs.len(), 2);
+        assert_eq!(done_xs.len(), 1);
         assert!(cross_xs[0] < queued_xs[0]);
+        assert!(
+            (queued_xs[0] - done_xs[0]).abs() < 0.5,
+            "Queued ({}) and Done ({}) badges must start at same X",
+            queued_xs[0],
+            done_xs[0]
+        );
         assert!(queued_xs[0] < row_name_pos);
 
         let queue_eta_xs: Vec<f32> = text_positions
             .iter()
-            .filter(|(t, p)| t.starts_with("ETA:") && p.y > 80.0)
-            .map(|(_, p)| p.x)
+            .filter(|t| t.text.starts_with("ETA:") && t.pos.y > 80.0)
+            .map(|t| t.pos.x)
             .collect();
-        assert_eq!(queue_eta_xs.len(), 2, "{:?}", text_positions);
+        assert_eq!(queue_eta_xs.len(), 2);
         assert!(
             (queue_eta_xs[0] - queue_eta_xs[1]).abs() < 0.5,
             "Queued ETA columns must align vertically: {:?}",
             queue_eta_xs
         );
 
+        let long_row_right = text_positions
+            .iter()
+            .find(|t| t.text.starts_with("extremely_long_folder_name"))
+            .map(|t| t.pos.x + t.size.x)
+            .expect("truncated long row must render");
+        assert!(
+            long_row_right <= queue_eta_xs[0] - 20.0,
+            "Long filename ({}) must truncate well before ETA ({})",
+            long_row_right,
+            queue_eta_xs[0]
+        );
+
         let queue_size_xs: Vec<f32> = text_positions
             .iter()
-            .filter(|(t, p)| (t.ends_with("MB") || t.ends_with("GB")) && p.y > 80.0)
-            .map(|(_, p)| p.x)
+            .filter(|t| (t.text.ends_with("MB") || t.text.ends_with("GB")) && t.pos.y > 80.0)
+            .map(|t| t.pos.x)
             .collect();
-        assert_eq!(queue_size_xs.len(), 2, "{:?}", text_positions);
+        assert_eq!(queue_size_xs.len(), 3);
         assert!(
-            (queue_size_xs[0] - queue_size_xs[1]).abs() < 0.5,
-            "Queued Size columns must align vertically: {:?}",
+            queue_size_xs.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5),
+            "Queued & Done Size columns must align vertically: {:?}",
             queue_size_xs
         );
     }
