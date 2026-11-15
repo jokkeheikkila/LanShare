@@ -3716,391 +3716,457 @@ impl LanShareApp {
         let browser_height = (total_avail - queue_h - 48.0).max(80.0);
 
         ui.add_space(4.0);
-        ui.group(|ui| {
-            ui.spacing_mut().scroll = Self::visible_scroll_style();
-            let is_loading_empty = self.client_loading && self.client_file_list.is_empty();
-            let show_spinner = crate::core::should_show_loading_spinner(
-                self.client_loading,
-                self.client_loading_started_at,
-            ) && self.client_file_list.is_empty();
-            let browse_scroll_visibility = if has_browser_view && !is_loading_empty {
-                egui::scroll_area::ScrollBarVisibility::AlwaysVisible
-            } else {
-                egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-            };
-            ScrollArea::vertical()
-                .id_salt("client_file_list_scroll")
-                .auto_shrink([false, false])
-                .scroll_bar_visibility(browse_scroll_visibility)
-                .min_scrolled_height(browser_height)
-                .max_height(browser_height)
-                .show(ui, |ui| {
-                    if is_loading_empty {
-                        if show_spinner {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space((browser_height * 0.35).max(32.0));
-                                ui.add(egui::Spinner::new().size(28.0));
-                            });
-                        }
-                        return;
-                    }
-                    if !has_browser_view {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(40.0);
-                            ui.label(
+        let browse_outer_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(browse_outer_w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(browse_outer_w);
+                ui.group(|ui| {
+                    ui.spacing_mut().scroll = Self::visible_scroll_style();
+                    let scroll_max_w = ui.available_width();
+                    let is_loading_empty = self.client_loading && self.client_file_list.is_empty();
+                    let show_spinner = crate::core::should_show_loading_spinner(
+                        self.client_loading,
+                        self.client_loading_started_at,
+                    ) && self.client_file_list.is_empty();
+                    let browse_scroll_visibility = if has_browser_view && !is_loading_empty {
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+                    } else {
+                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                    };
+                    ScrollArea::both()
+                        .id_salt("client_file_list_scroll")
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(browse_scroll_visibility)
+                        .max_width(scroll_max_w)
+                        .min_scrolled_height(browser_height)
+                        .max_height(browser_height)
+                        .show(ui, |ui| {
+                            if is_loading_empty {
+                                if show_spinner {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space((browser_height * 0.35).max(32.0));
+                                        ui.add(egui::Spinner::new().size(28.0));
+                                    });
+                                }
+                                return;
+                            }
+                            if !has_browser_view {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.label(
                                 RichText::new(
                                     "Select a computer from the list on the left to browse shares",
                                 )
                                 .size(13.5)
                                 .color(p.text_muted),
                             );
-                        });
-                        return;
-                    }
-
-                    let min_table_w = self.browse_col_name_w
-                        + BROWSE_COL_SIZE_W
-                        + BROWSE_COL_DATE_W
-                        + BROWSE_COL_ACTION_W
-                        + (3.0 * 16.0);
-                    let row_w = (min_table_w - 6.0).max(self.browse_col_name_w);
-                    let mut next_hovered_browse_idx = None;
-
-                    ui.scope(|ui| {
-                        ui.style_mut().interaction.selectable_labels = false;
-                        egui::Grid::new("file_grid")
-                            .striped(false)
-                            .min_col_width(50.0)
-                            .spacing([16.0, 8.0])
-                            .show(ui, |ui| {
-                                // Column 0: Name with drag resize handle
-                                ui.horizontal(|ui| {
-                                    ui.set_width(self.browse_col_name_w);
-                                    ui.set_max_width(self.browse_col_name_w);
-                                    ui.add_space(8.0);
-                                    ui.label(RichText::new("Name").strong());
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let (res_id, res_rect) =
-                                                ui.allocate_space(egui::vec2(10.0, 18.0));
-                                            let res_resp =
-                                                ui.interact(res_rect, res_id, egui::Sense::drag());
-                                            if res_resp.hovered() || res_resp.dragged() {
-                                                ui.ctx().set_cursor_icon(
-                                                    egui::CursorIcon::ResizeColumn,
-                                                );
-                                                ui.painter().vline(
-                                                    res_rect.center().x,
-                                                    res_rect.y_range(),
-                                                    Stroke::new(2.0_f32, p.accent_blue),
-                                                );
-                                            } else {
-                                                ui.painter().vline(
-                                                    res_rect.center().x,
-                                                    res_rect.y_range(),
-                                                    Stroke::new(1.0_f32, p.border),
-                                                );
-                                            }
-                                            if res_resp.dragged() {
-                                                self.browse_col_name_w = (self.browse_col_name_w
-                                                    + res_resp.drag_delta().x)
-                                                    .clamp(80.0, 1200.0);
-                                            }
-                                        },
-                                    );
                                 });
+                                return;
+                            }
 
-                                // Column 1: Size (fixed width, centered)
-                                ui.horizontal(|ui| {
-                                    ui.set_width(BROWSE_COL_SIZE_W);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(RichText::new("Size").strong());
-                                    });
-                                });
+                            let min_table_w = self.browse_col_name_w
+                                + BROWSE_COL_SIZE_W
+                                + BROWSE_COL_DATE_W
+                                + BROWSE_COL_ACTION_W
+                                + (3.0 * 16.0);
+                            let row_w = (min_table_w - 6.0).max(self.browse_col_name_w);
+                            let mut next_hovered_browse_idx = None;
 
-                                // Column 2: Modified (fixed width, centered)
-                                ui.horizontal(|ui| {
-                                    ui.set_width(BROWSE_COL_DATE_W);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(RichText::new("Modified").strong());
-                                    });
-                                });
-
-                                // Column 3: Action (fixed width, centered)
-                                ui.horizontal(|ui| {
-                                    ui.set_width(BROWSE_COL_ACTION_W);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(RichText::new("Action").strong());
-                                    });
-                                });
-                                ui.end_row();
-
-                                let files = self.client_file_list.clone();
-                                if files.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            RichText::new("(Folder is empty)")
-                                                .italics()
-                                                .color(p.text_muted),
-                                        );
-                                    });
-                                    ui.label("");
-                                    ui.label("");
-                                    ui.label("");
-                                    ui.end_row();
-                                } else {
-                                    for (idx, entry) in files.into_iter().enumerate() {
-                                        let is_highlighted =
-                                            self.hovered_browse_download_idx == Some(idx);
-                                        let row_start = ui.cursor().min;
-                                        let row_rect = egui::Rect::from_min_size(
-                                            row_start,
-                                            egui::vec2(row_w, 24.0),
-                                        );
-
-                                        // Viewport virtualization for massive folders (tens of thousands of files)
-                                        if !ui.is_rect_visible(row_rect) && !is_highlighted {
-                                            ui.allocate_space(egui::vec2(
-                                                self.browse_col_name_w,
-                                                24.0,
-                                            ));
-                                            ui.allocate_space(egui::vec2(BROWSE_COL_SIZE_W, 24.0));
-                                            ui.allocate_space(egui::vec2(BROWSE_COL_DATE_W, 24.0));
-                                            ui.allocate_space(egui::vec2(
-                                                BROWSE_COL_ACTION_W,
-                                                24.0,
-                                            ));
-                                            ui.end_row();
-                                            continue;
-                                        }
-
-                                        if is_highlighted {
-                                            ui.painter().rect_filled(
-                                                row_rect,
-                                                CornerRadius::same(4),
-                                                p.browse_row_hover_bg,
-                                            );
-                                        }
-
-                                        if entry.is_dir {
-                                            let mut clicked = false;
-                                            let dir_color = if self.client_connection_lost {
-                                                p.text_muted
-                                            } else {
-                                                p.accent_blue
-                                            };
-                                            ui.horizontal(|ui| {
-                                                ui.set_width(self.browse_col_name_w);
-                                                ui.set_max_width(self.browse_col_name_w);
-                                                ui.add_space(8.0);
-                                                ui.spacing_mut().item_spacing.x = 6.0;
-                                                let icon_resp =
-                                                    Self::draw_mini_folder_icon(ui, dir_color);
-                                                let label = egui::Label::new(
-                                                    RichText::new(&entry.name)
-                                                        .strong()
-                                                        .color(dir_color),
-                                                )
-                                                .sense(egui::Sense::click())
-                                                .truncate();
-                                                let (galley_pos, galley, text_resp) =
-                                                    label.layout_in_ui(ui);
-
-                                                let is_hovered = icon_resp.hovered()
-                                                    || text_resp.hovered()
-                                                    || is_highlighted;
-                                                if is_hovered {
-                                                    ui.ctx()
-                                                        .set_cursor_icon(egui::CursorIcon::Default);
-                                                }
-
-                                                if ui.is_rect_visible(text_resp.rect) {
-                                                    let underline = if is_hovered
-                                                        && !self.client_connection_lost
-                                                    {
-                                                        Stroke::new(1.0_f32, dir_color)
-                                                    } else {
-                                                        Stroke::NONE
-                                                    };
-                                                    ui.painter().add(
-                                                        egui::epaint::TextShape::new(
-                                                            galley_pos, galley, dir_color,
-                                                        )
-                                                        .with_underline(underline),
+                            ui.scope(|ui| {
+                                ui.style_mut().interaction.selectable_labels = false;
+                                egui::Grid::new("file_grid")
+                                    .striped(false)
+                                    .min_col_width(50.0)
+                                    .spacing([16.0, 8.0])
+                                    .show(ui, |ui| {
+                                        // Column 0: Name with drag resize handle
+                                        ui.horizontal(|ui| {
+                                            ui.set_width(self.browse_col_name_w);
+                                            ui.set_max_width(self.browse_col_name_w);
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Name").strong());
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let (res_id, res_rect) =
+                                                        ui.allocate_space(egui::vec2(10.0, 18.0));
+                                                    let res_resp = ui.interact(
+                                                        res_rect,
+                                                        res_id,
+                                                        egui::Sense::drag(),
                                                     );
-                                                }
-
-                                                if icon_resp.clicked() || text_resp.clicked() {
-                                                    clicked = true;
-                                                }
-                                                text_resp.on_hover_text(&entry.name);
-                                            });
-                                            if clicked {
-                                                self.navigate_into(&entry.name);
-                                            }
-                                        } else {
-                                            ui.horizontal(|ui| {
-                                                ui.set_width(self.browse_col_name_w);
-                                                ui.set_max_width(self.browse_col_name_w);
-                                                ui.add_space(8.0);
-                                                let label_text = RichText::new(&entry.name)
-                                                    .strong()
-                                                    .color(if is_highlighted {
-                                                        p.accent_blue
+                                                    if res_resp.hovered() || res_resp.dragged() {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::ResizeColumn,
+                                                        );
+                                                        ui.painter().vline(
+                                                            res_rect.center().x,
+                                                            res_rect.y_range(),
+                                                            Stroke::new(2.0_f32, p.accent_blue),
+                                                        );
                                                     } else {
-                                                        p.text_primary
-                                                    });
-                                                let file_resp = ui.add(
-                                                    egui::Label::new(label_text)
-                                                        .selectable(false)
-                                                        .truncate(),
-                                                );
-                                                if file_resp.hovered() {
-                                                    ui.ctx()
-                                                        .set_cursor_icon(egui::CursorIcon::Default);
-                                                }
-                                                file_resp.on_hover_text(&entry.name);
-                                            });
-                                        }
+                                                        ui.painter().vline(
+                                                            res_rect.center().x,
+                                                            res_rect.y_range(),
+                                                            Stroke::new(1.0_f32, p.border),
+                                                        );
+                                                    }
+                                                    if res_resp.dragged() {
+                                                        self.browse_col_name_w = (self
+                                                            .browse_col_name_w
+                                                            + res_resp.drag_delta().x)
+                                                            .clamp(80.0, 1200.0);
+                                                    }
+                                                },
+                                            );
+                                        });
 
-                                        let size_str = if entry.is_dir {
-                                            "-".to_string()
-                                        } else {
-                                            format_file_size(entry.size)
-                                        };
+                                        // Column 1: Size (fixed width, centered)
                                         ui.horizontal(|ui| {
                                             ui.set_width(BROWSE_COL_SIZE_W);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add_space(6.0);
-                                                    let size_resp = ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(size_str).monospace(),
-                                                        )
-                                                        .selectable(false),
-                                                    );
-                                                    if size_resp.hovered() {
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::Default,
-                                                        );
-                                                    }
-                                                },
-                                            );
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new("Size").strong());
+                                            });
                                         });
 
-                                        let date_str = if entry.modified_timestamp > 0 {
-                                            if let Some(dt) = Local
-                                                .timestamp_opt(entry.modified_timestamp as i64, 0)
-                                                .single()
-                                            {
-                                                dt.format("%Y-%m-%d %H:%M").to_string()
-                                            } else {
-                                                "-".to_string()
-                                            }
-                                        } else {
-                                            "-".to_string()
-                                        };
+                                        // Column 2: Modified (fixed width, centered)
                                         ui.horizontal(|ui| {
                                             ui.set_width(BROWSE_COL_DATE_W);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add_space(6.0);
-                                                    let date_resp = ui.add(
-                                                        egui::Label::new(date_str)
-                                                            .selectable(false),
-                                                    );
-                                                    if date_resp.hovered() {
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::Default,
-                                                        );
-                                                    }
-                                                },
-                                            );
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new("Modified").strong());
+                                            });
                                         });
 
-                                        let row_subpath = if self.client_current_path.is_empty() {
-                                            entry.name.clone()
-                                        } else {
-                                            format!("{}/{}", self.client_current_path, entry.name)
-                                        };
-                                        let existing_status = self
-                                            .download_queue
-                                            .iter()
-                                            .find(|i| {
-                                                i.conn_ctx.ip == self.client_ip
-                                                    && i.remote_subpath == row_subpath
-                                                    && matches!(
-                                                        i.status,
-                                                        QueueItemStatus::Pending
-                                                            | QueueItemStatus::Downloading
-                                                    )
-                                            })
-                                            .map(|i| i.status.clone());
+                                        // Column 3: Action (fixed width, centered)
+                                        ui.horizontal(|ui| {
+                                            ui.set_width(BROWSE_COL_ACTION_W);
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new("Action").strong());
+                                            });
+                                        });
+                                        ui.end_row();
 
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.set_min_width(BROWSE_COL_ACTION_W);
-                                                ui.add_space(6.0);
-                                                let (btn_label, btn_enabled, is_download_action) =
-                                                    match existing_status {
-                                                        Some(QueueItemStatus::Downloading) => {
-                                                            ("Active", false, false)
+                                        let files = self.client_file_list.clone();
+                                        if files.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label(
+                                                    RichText::new("(Folder is empty)")
+                                                        .italics()
+                                                        .color(p.text_muted),
+                                                );
+                                            });
+                                            ui.label("");
+                                            ui.label("");
+                                            ui.label("");
+                                            ui.end_row();
+                                        } else {
+                                            for (idx, entry) in files.into_iter().enumerate() {
+                                                let is_highlighted =
+                                                    self.hovered_browse_download_idx == Some(idx);
+                                                let row_start = ui.cursor().min;
+                                                let row_h_est = (ui
+                                                    .text_style_height(&egui::TextStyle::Button)
+                                                    + ui.spacing().button_padding.y * 2.0)
+                                                    .max(22.0);
+                                                let row_rect = egui::Rect::from_min_size(
+                                                    row_start,
+                                                    egui::vec2(row_w, row_h_est),
+                                                );
+
+                                                // Viewport virtualization for massive folders (tens of thousands of files)
+                                                if !ui.is_rect_visible(row_rect) && !is_highlighted
+                                                {
+                                                    ui.allocate_space(egui::vec2(
+                                                        self.browse_col_name_w,
+                                                        row_h_est,
+                                                    ));
+                                                    ui.allocate_space(egui::vec2(
+                                                        BROWSE_COL_SIZE_W,
+                                                        row_h_est,
+                                                    ));
+                                                    ui.allocate_space(egui::vec2(
+                                                        BROWSE_COL_DATE_W,
+                                                        row_h_est,
+                                                    ));
+                                                    ui.allocate_space(egui::vec2(
+                                                        BROWSE_COL_ACTION_W,
+                                                        row_h_est,
+                                                    ));
+                                                    ui.end_row();
+                                                    continue;
+                                                }
+
+                                                let highlight_shape_idx = is_highlighted
+                                                    .then(|| ui.painter().add(egui::Shape::Noop));
+
+                                                if entry.is_dir {
+                                                    let mut clicked = false;
+                                                    let dir_color = if self.client_connection_lost {
+                                                        p.text_muted
+                                                    } else {
+                                                        p.accent_blue
+                                                    };
+                                                    ui.horizontal(|ui| {
+                                                        ui.set_min_height(row_h_est);
+                                                        ui.set_width(self.browse_col_name_w);
+                                                        ui.set_max_width(self.browse_col_name_w);
+                                                        ui.add_space(8.0);
+                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                        let icon_resp = Self::draw_mini_folder_icon(
+                                                            ui, dir_color,
+                                                        );
+                                                        let label = egui::Label::new(
+                                                            RichText::new(&entry.name)
+                                                                .strong()
+                                                                .color(dir_color),
+                                                        )
+                                                        .sense(egui::Sense::click())
+                                                        .truncate();
+                                                        let (galley_pos, galley, text_resp) =
+                                                            label.layout_in_ui(ui);
+
+                                                        let is_hovered = icon_resp.hovered()
+                                                            || text_resp.hovered()
+                                                            || is_highlighted;
+                                                        if is_hovered {
+                                                            ui.ctx().set_cursor_icon(
+                                                                egui::CursorIcon::Default,
+                                                            );
                                                         }
-                                                        Some(QueueItemStatus::Pending) => {
-                                                            ("Queued", false, false)
+
+                                                        if ui.is_rect_visible(text_resp.rect) {
+                                                            let underline = if is_hovered
+                                                                && !self.client_connection_lost
+                                                            {
+                                                                Stroke::new(1.0_f32, dir_color)
+                                                            } else {
+                                                                Stroke::NONE
+                                                            };
+                                                            ui.painter().add(
+                                                                egui::epaint::TextShape::new(
+                                                                    galley_pos, galley, dir_color,
+                                                                )
+                                                                .with_underline(underline),
+                                                            );
                                                         }
-                                                        _ => {
-                                                            let label =
-                                                                if self.active_queue_id.is_some() {
+
+                                                        if icon_resp.clicked()
+                                                            || text_resp.clicked()
+                                                        {
+                                                            clicked = true;
+                                                        }
+                                                        text_resp.on_hover_text(&entry.name);
+                                                    });
+                                                    if clicked {
+                                                        self.navigate_into(&entry.name);
+                                                    }
+                                                } else {
+                                                    ui.horizontal(|ui| {
+                                                        ui.set_min_height(row_h_est);
+                                                        ui.set_width(self.browse_col_name_w);
+                                                        ui.set_max_width(self.browse_col_name_w);
+                                                        ui.add_space(8.0);
+                                                        let label_text = RichText::new(&entry.name)
+                                                            .strong()
+                                                            .color(if is_highlighted {
+                                                                p.accent_blue
+                                                            } else {
+                                                                p.text_primary
+                                                            });
+                                                        let file_resp = ui.add(
+                                                            egui::Label::new(label_text)
+                                                                .selectable(false)
+                                                                .truncate(),
+                                                        );
+                                                        if file_resp.hovered() {
+                                                            ui.ctx().set_cursor_icon(
+                                                                egui::CursorIcon::Default,
+                                                            );
+                                                        }
+                                                        file_resp.on_hover_text(&entry.name);
+                                                    });
+                                                }
+
+                                                let size_str = if entry.is_dir {
+                                                    "-".to_string()
+                                                } else {
+                                                    format_file_size(entry.size)
+                                                };
+                                                ui.horizontal(|ui| {
+                                                    ui.set_min_height(row_h_est);
+                                                    ui.set_width(BROWSE_COL_SIZE_W);
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.add_space(6.0);
+                                                            let size_resp = ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(size_str)
+                                                                        .monospace(),
+                                                                )
+                                                                .selectable(false),
+                                                            );
+                                                            if size_resp.hovered() {
+                                                                ui.ctx().set_cursor_icon(
+                                                                    egui::CursorIcon::Default,
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                });
+
+                                                let date_str = if entry.modified_timestamp > 0 {
+                                                    if let Some(dt) = Local
+                                                        .timestamp_opt(
+                                                            entry.modified_timestamp as i64,
+                                                            0,
+                                                        )
+                                                        .single()
+                                                    {
+                                                        dt.format("%Y-%m-%d %H:%M").to_string()
+                                                    } else {
+                                                        "-".to_string()
+                                                    }
+                                                } else {
+                                                    "-".to_string()
+                                                };
+                                                ui.horizontal(|ui| {
+                                                    ui.set_min_height(row_h_est);
+                                                    ui.set_width(BROWSE_COL_DATE_W);
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.add_space(6.0);
+                                                            let date_resp = ui.add(
+                                                                egui::Label::new(date_str)
+                                                                    .selectable(false),
+                                                            );
+                                                            if date_resp.hovered() {
+                                                                ui.ctx().set_cursor_icon(
+                                                                    egui::CursorIcon::Default,
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                });
+
+                                                let row_subpath =
+                                                    if self.client_current_path.is_empty() {
+                                                        entry.name.clone()
+                                                    } else {
+                                                        format!(
+                                                            "{}/{}",
+                                                            self.client_current_path, entry.name
+                                                        )
+                                                    };
+                                                let existing_status = self
+                                                    .download_queue
+                                                    .iter()
+                                                    .find(|i| {
+                                                        i.conn_ctx.ip == self.client_ip
+                                                            && i.remote_subpath == row_subpath
+                                                            && matches!(
+                                                                i.status,
+                                                                QueueItemStatus::Pending
+                                                                    | QueueItemStatus::Downloading
+                                                            )
+                                                    })
+                                                    .map(|i| i.status.clone());
+
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_min_width(BROWSE_COL_ACTION_W);
+                                                        ui.add_space(6.0);
+                                                        let (
+                                                            btn_label,
+                                                            btn_enabled,
+                                                            is_download_action,
+                                                        ) = match existing_status {
+                                                            Some(QueueItemStatus::Downloading) => {
+                                                                ("Active", false, false)
+                                                            }
+                                                            Some(QueueItemStatus::Pending) => {
+                                                                ("Queued", false, false)
+                                                            }
+                                                            _ => {
+                                                                let label = if self
+                                                                    .active_queue_id
+                                                                    .is_some()
+                                                                {
                                                                     "Queue"
                                                                 } else {
                                                                     "Download"
                                                                 };
-                                                            (
-                                                                label,
-                                                                !self.client_connection_lost,
-                                                                true,
-                                                            )
+                                                                (
+                                                                    label,
+                                                                    !self.client_connection_lost,
+                                                                    true,
+                                                                )
+                                                            }
+                                                        };
+                                                        let btn_resp = ui
+                                                            .add_enabled_ui(btn_enabled, |ui| {
+                                                                ui.add_sized(
+                                                                    egui::vec2(78.0, 22.0),
+                                                                    egui::Button::new(btn_label),
+                                                                )
+                                                            })
+                                                            .inner;
+                                                        if let Some(shape_idx) = highlight_shape_idx
+                                                        {
+                                                            let highlight_rect =
+                                                                egui::Rect::from_x_y_ranges(
+                                                                    row_start.x
+                                                                        ..=(row_start.x + row_w),
+                                                                    btn_resp.rect.min.y
+                                                                        ..=btn_resp.rect.max.y,
+                                                                );
+                                                            ui.painter().set(
+                                                                shape_idx,
+                                                                egui::Shape::rect_filled(
+                                                                    highlight_rect,
+                                                                    CornerRadius::same(4),
+                                                                    p.browse_row_hover_bg,
+                                                                ),
+                                                            );
                                                         }
-                                                    };
-                                                let btn_resp = ui
-                                                    .add_enabled_ui(btn_enabled, |ui| {
-                                                        ui.add_sized(
-                                                            egui::vec2(78.0, 22.0),
-                                                            egui::Button::new(btn_label),
-                                                        )
-                                                    })
-                                                    .inner;
-                                                if btn_resp.hovered()
-                                                    && (!is_download_action || btn_enabled)
-                                                {
-                                                    next_hovered_browse_idx = Some(idx);
-                                                }
-                                                if is_download_action
-                                                    && btn_resp.clicked()
-                                                    && btn_enabled
-                                                {
-                                                    self.enqueue_download(entry);
-                                                }
-                                            },
-                                        );
-                                        ui.end_row();
-                                    }
-                                }
+                                                        if btn_resp.hovered()
+                                                            && (!is_download_action || btn_enabled)
+                                                        {
+                                                            next_hovered_browse_idx = Some(idx);
+                                                        }
+                                                        if is_download_action
+                                                            && btn_resp.clicked()
+                                                            && btn_enabled
+                                                        {
+                                                            self.enqueue_download(entry);
+                                                        }
+                                                    },
+                                                );
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
                             });
-                    });
 
-                    if self.hovered_browse_download_idx != next_hovered_browse_idx {
-                        self.hovered_browse_download_idx = next_hovered_browse_idx;
-                        ui.ctx().request_repaint();
-                    }
+                            if self.hovered_browse_download_idx != next_hovered_browse_idx {
+                                self.hovered_browse_download_idx = next_hovered_browse_idx;
+                                ui.ctx().request_repaint();
+                            }
+                        });
                 });
-        });
+            },
+        );
 
         // Multi-Item Download Queue & Live Progress Panel (Always-Visible Resizable Splitter)
         ui.add_space(2.0);
@@ -4162,19 +4228,42 @@ impl LanShareApp {
     }
 
     /// Allocates a fixed-width single-line slot so changing monospace metrics never shift neighbors.
+    fn render_fixed_metric_col_with_layout(
+        ui: &mut egui::Ui,
+        width: f32,
+        layout: egui::Layout,
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) {
+        let (_id, rect) = ui.allocate_space(egui::vec2(width, 18.0));
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(rect).layout(layout),
+            add_contents,
+        );
+    }
+
     fn render_fixed_metric_col(
         ui: &mut egui::Ui,
         width: f32,
         add_contents: impl FnOnce(&mut egui::Ui),
     ) {
-        ui.allocate_ui_with_layout(
-            egui::vec2(width, 18.0),
+        Self::render_fixed_metric_col_with_layout(
+            ui,
+            width,
             egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_min_size(egui::vec2(width, 18.0));
-                ui.set_max_size(egui::vec2(width, 18.0));
-                add_contents(ui);
-            },
+            add_contents,
+        );
+    }
+
+    fn render_right_aligned_metric_col(
+        ui: &mut egui::Ui,
+        width: f32,
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) {
+        Self::render_fixed_metric_col_with_layout(
+            ui,
+            width,
+            egui::Layout::right_to_left(egui::Align::Center),
+            add_contents,
         );
     }
 
@@ -4331,20 +4420,20 @@ impl LanShareApp {
                         });
 
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
                             let avail_w = ui.available_width();
-                            let right_pad = 12.0_f32;
-                            let size_col_w = 172.0_f32;
-                            let total_col_w = 110.0_f32;
-                            let eta_col_w = 92.0_f32;
-                            let speed_col_w = 100.0_f32;
-                            let gap_w = 8.0_f32;
+                            let right_pad = 8.0_f32;
+                            let speed_col_w = 86.0_f32;
+                            let eta_col_w = 64.0_f32;
+                            let total_col_w = 96.0_f32;
+                            let size_col_w = 146.0_f32;
                             let metrics_total_w = right_pad
-                                + size_col_w
-                                + total_col_w
-                                + eta_col_w
                                 + speed_col_w
-                                + gap_w * 4.0;
-                            let bar_w = (avail_w - metrics_total_w).clamp(90.0, 420.0);
+                                + eta_col_w
+                                + total_col_w
+                                + size_col_w
+                                + 6.0 * 4.0;
+                            let bar_w = (avail_w - metrics_total_w).max(90.0);
 
                             ui.add(
                                 egui::ProgressBar::new(pct)
@@ -4352,77 +4441,58 @@ impl LanShareApp {
                                     .desired_width(bar_w),
                             );
 
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(right_pad);
+                            Self::render_right_aligned_metric_col(ui, speed_col_w, |ui| {
+                                if prog.speed_mbps > 0.0 {
+                                    ui.label(
+                                        RichText::new(format!("{:>6.1} MB/s", prog.speed_mbps))
+                                            .monospace(),
+                                    );
+                                }
+                            });
 
-                                    Self::render_fixed_metric_col(ui, size_col_w, |ui| {
-                                        if prog.bytes_total > 0 {
-                                            let done_str = format_file_size(prog.bytes_done);
-                                            let total_str = format_file_size(prog.bytes_total);
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{:>9} / {:<9}",
-                                                    done_str, total_str
-                                                ))
-                                                .monospace()
-                                                .color(p.text_muted),
-                                            );
-                                        }
-                                    });
+                            Self::render_right_aligned_metric_col(ui, eta_col_w, |ui| {
+                                let is_active_in_progress = !prog.is_finished;
+                                if let Some(act_s) = active_eta {
+                                    if active_remaining > 0 || is_active_in_progress {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "ETA: {:<4}",
+                                                format_remaining_time(act_s)
+                                            ))
+                                            .monospace()
+                                            .strong()
+                                            .color(p.accent_blue),
+                                        );
+                                    }
+                                }
+                            });
 
-                                    ui.add_space(gap_w);
+                            Self::render_right_aligned_metric_col(ui, total_col_w, |ui| {
+                                if let Some(tot_s) = total_eta {
+                                    if pending_count > 0 {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "(Total: {:<4})",
+                                                format_remaining_time(tot_s)
+                                            ))
+                                            .monospace()
+                                            .color(p.text_muted),
+                                        );
+                                    }
+                                }
+                            });
 
-                                    Self::render_fixed_metric_col(ui, total_col_w, |ui| {
-                                        if let Some(tot_s) = total_eta {
-                                            if pending_count > 0 {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "(Total: {:<5})",
-                                                        format_remaining_time(tot_s)
-                                                    ))
-                                                    .monospace()
-                                                    .color(p.text_muted),
-                                                );
-                                            }
-                                        }
-                                    });
-
-                                    ui.add_space(gap_w);
-
-                                    Self::render_fixed_metric_col(ui, eta_col_w, |ui| {
-                                        let is_active_in_progress = !prog.is_finished;
-                                        if let Some(act_s) = active_eta {
-                                            if active_remaining > 0 || is_active_in_progress {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "ETA: {:<5}",
-                                                        format_remaining_time(act_s)
-                                                    ))
-                                                    .monospace()
-                                                    .strong()
-                                                    .color(p.accent_blue),
-                                                );
-                                            }
-                                        }
-                                    });
-
-                                    ui.add_space(gap_w);
-
-                                    Self::render_fixed_metric_col(ui, speed_col_w, |ui| {
-                                        if prog.speed_mbps > 0.0 {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{:>6.1} MB/s",
-                                                    prog.speed_mbps
-                                                ))
-                                                .monospace(),
-                                            );
-                                        }
-                                    });
-                                },
-                            );
+                            Self::render_right_aligned_metric_col(ui, size_col_w, |ui| {
+                                if prog.bytes_total > 0 {
+                                    let done_str = format_file_size(prog.bytes_done);
+                                    let total_str = format_file_size(prog.bytes_total);
+                                    ui.label(
+                                        RichText::new(format!("{} / {}", done_str, total_str))
+                                            .monospace()
+                                            .color(p.text_muted),
+                                    );
+                                }
+                            });
                         });
                     }
 
@@ -5159,6 +5229,7 @@ impl LanShareApp {
                                         );
                                     });
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                         let pct = if upload.total_size > 0 {
                                             (upload.bytes_sent as f32 / upload.total_size as f32)
                                                 .clamp(0.0, 1.0)
@@ -5166,17 +5237,16 @@ impl LanShareApp {
                                             0.0
                                         };
                                         let avail_w = ui.available_width();
-                                        let right_pad = 12.0_f32;
-                                        let size_col_w = 172.0_f32;
-                                        let eta_col_w = 92.0_f32;
-                                        let speed_col_w = 100.0_f32;
-                                        let gap_w = 8.0_f32;
+                                        let right_pad = 8.0_f32;
+                                        let speed_col_w = 86.0_f32;
+                                        let eta_col_w = 64.0_f32;
+                                        let size_col_w = 146.0_f32;
                                         let metrics_total_w = right_pad
-                                            + size_col_w
-                                            + eta_col_w
                                             + speed_col_w
-                                            + gap_w * 3.0;
-                                        let bar_w = (avail_w - metrics_total_w).clamp(90.0, 420.0);
+                                            + eta_col_w
+                                            + size_col_w
+                                            + 6.0 * 3.0;
+                                        let bar_w = (avail_w - metrics_total_w).max(90.0);
 
                                         ui.add(
                                             egui::ProgressBar::new(pct)
@@ -5184,82 +5254,63 @@ impl LanShareApp {
                                                 .desired_width(bar_w),
                                         );
 
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
+                                        Self::render_right_aligned_metric_col(
+                                            ui,
+                                            speed_col_w,
                                             |ui| {
-                                                ui.add_space(right_pad);
+                                                if upload.speed_mbps > 0.0 {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{:>6.1} MB/s",
+                                                            upload.speed_mbps
+                                                        ))
+                                                        .monospace(),
+                                                    );
+                                                }
+                                            },
+                                        );
 
-                                                Self::render_fixed_metric_col(
-                                                    ui,
-                                                    size_col_w,
-                                                    |ui| {
-                                                        if upload.total_size > 0 {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "{:>9} / {:<9}",
-                                                                    format_file_size(
-                                                                        upload.bytes_sent
-                                                                    ),
-                                                                    format_file_size(
-                                                                        upload.total_size
-                                                                    )
-                                                                ))
-                                                                .monospace()
-                                                                .color(p.text_muted),
-                                                            );
-                                                        }
-                                                    },
-                                                );
+                                        Self::render_right_aligned_metric_col(
+                                            ui,
+                                            eta_col_w,
+                                            |ui| {
+                                                let remaining = upload
+                                                    .total_size
+                                                    .saturating_sub(upload.bytes_sent);
+                                                if remaining > 0 {
+                                                    if let Some(eta_s) = estimate_remaining_seconds(
+                                                        remaining,
+                                                        upload.speed_mbps,
+                                                    ) {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "ETA: {:<4}",
+                                                                format_remaining_time(eta_s)
+                                                            ))
+                                                            .monospace()
+                                                            .strong()
+                                                            .color(p.accent_blue),
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        );
 
-                                                ui.add_space(gap_w);
-
-                                                Self::render_fixed_metric_col(
-                                                    ui,
-                                                    eta_col_w,
-                                                    |ui| {
-                                                        let remaining = upload
-                                                            .total_size
-                                                            .saturating_sub(upload.bytes_sent);
-                                                        if remaining > 0 {
-                                                            if let Some(eta_s) =
-                                                                estimate_remaining_seconds(
-                                                                    remaining,
-                                                                    upload.speed_mbps,
-                                                                )
-                                                            {
-                                                                ui.label(
-                                                                    RichText::new(format!(
-                                                                        "ETA: {:<5}",
-                                                                        format_remaining_time(
-                                                                            eta_s
-                                                                        )
-                                                                    ))
-                                                                    .monospace()
-                                                                    .strong()
-                                                                    .color(p.accent_blue),
-                                                                );
-                                                            }
-                                                        }
-                                                    },
-                                                );
-
-                                                ui.add_space(gap_w);
-
-                                                Self::render_fixed_metric_col(
-                                                    ui,
-                                                    speed_col_w,
-                                                    |ui| {
-                                                        if upload.speed_mbps > 0.0 {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "{:>6.1} MB/s",
-                                                                    upload.speed_mbps
-                                                                ))
-                                                                .monospace(),
-                                                            );
-                                                        }
-                                                    },
-                                                );
+                                        Self::render_right_aligned_metric_col(
+                                            ui,
+                                            size_col_w,
+                                            |ui| {
+                                                if upload.total_size > 0 {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} / {}",
+                                                            format_file_size(upload.bytes_sent),
+                                                            format_file_size(upload.total_size)
+                                                        ))
+                                                        .monospace()
+                                                        .color(p.text_muted),
+                                                    );
+                                                }
                                             },
                                         );
                                     });
@@ -7085,6 +7136,7 @@ mod tests {
     #[test]
     fn test_browse_table_download_hover_highlight() {
         let ctx = egui::Context::default();
+        configure_readable_style(&ctx, true);
         let mut app = create_test_app();
         app.secret_confirmed = true;
         app.client_connected = true;
@@ -7162,20 +7214,33 @@ mod tests {
             - 6.0;
         let mut hover_rects = Vec::new();
         let mut dl_btn_rects = Vec::new();
+        let mut dl_btn_bg_rects = Vec::new();
+        let hover_center = dl_centers[0];
         fn collect_rects(
             shape: &egui::epaint::Shape,
             color: Color32,
+            hover_center: egui::Pos2,
             out: &mut Vec<egui::Rect>,
             dl: &mut Vec<egui::Rect>,
+            dl_bg: &mut Vec<egui::Rect>,
         ) {
             match shape {
                 egui::epaint::Shape::Rect(r) if r.fill == color => out.push(r.rect),
+                egui::epaint::Shape::Rect(r)
+                    if r.rect.width() >= 70.0
+                        && r.rect.width() <= 90.0
+                        && r.rect.height() >= 20.0
+                        && r.rect.height() <= 40.0
+                        && r.rect.contains(hover_center) =>
+                {
+                    dl_bg.push(r.rect);
+                }
                 egui::epaint::Shape::Text(t) if t.galley.text() == "Download" => {
                     dl.push(egui::Rect::from_min_size(t.pos, t.galley.size()));
                 }
                 egui::epaint::Shape::Vec(v) => {
                     for s in v {
-                        collect_rects(s, color, out, dl);
+                        collect_rects(s, color, hover_center, out, dl, dl_bg);
                     }
                 }
                 _ => {}
@@ -7185,11 +7250,24 @@ mod tests {
             collect_rects(
                 &c.shape,
                 expected_color,
+                hover_center,
                 &mut hover_rects,
                 &mut dl_btn_rects,
+                &mut dl_btn_bg_rects,
             );
         }
         assert_eq!(hover_rects.len(), 1);
+        assert!(
+            !dl_btn_bg_rects.is_empty(),
+            "Expected background rect for hovered Download button"
+        );
+        assert!(
+            (hover_rects[0].min.y - dl_btn_bg_rects[0].min.y).abs() < 0.5
+                && (hover_rects[0].max.y - dl_btn_bg_rects[0].max.y).abs() < 0.5,
+            "Highlight row y-range ({:?}) must match button height & alignment ({:?})",
+            hover_rects[0].y_range(),
+            dl_btn_bg_rects[0].y_range()
+        );
         assert!(
             (hover_rects[0].width() - expected_max_w).abs() < 1.0,
             "Browse hover highlight width ({}) must stop at table content ({}) rather than spanning wide panel",
@@ -7207,46 +7285,116 @@ mod tests {
     #[test]
     fn test_browse_table_resizable_columns() {
         let ctx = egui::Context::default();
-        let _ = run_test_ui(&ctx, Default::default(), |ui| {
-            let mut app = create_test_app();
-            app.secret_confirmed = true;
-            app.client_connected = true;
-            app.client_file_list = vec![
-                FileEntry {
-                    name: "sample_extremely_long_filename_that_exceeds_normal_column_width_to_test_truncation.txt".to_string(),
-                    is_dir: false,
-                    size: 4096,
-                    modified_timestamp: 1700000000,
-                },
-                FileEntry {
-                    name: "Long_Folder_Name_That_Should_Truncate".to_string(),
-                    is_dir: true,
-                    size: 0,
-                    modified_timestamp: 1700000000,
-                },
-            ];
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.client_connected = true;
+        app.client_file_list = vec![
+            FileEntry {
+                name: "sample_extremely_long_filename_that_exceeds_normal_column_width_to_test_truncation.txt".to_string(),
+                is_dir: false,
+                size: 4096,
+                modified_timestamp: 1700000000,
+            },
+            FileEntry {
+                name: "Long_Folder_Name_That_Should_Truncate".to_string(),
+                is_dir: true,
+                size: 0,
+                modified_timestamp: 1700000000,
+            },
+        ];
 
-            assert_eq!(app.browse_col_name_w, 260.0);
-            assert_eq!(BROWSE_COL_SIZE_W, 85.0);
-            assert_eq!(BROWSE_COL_DATE_W, 135.0);
+        assert_eq!(app.browse_col_name_w, 260.0);
+        assert_eq!(BROWSE_COL_SIZE_W, 85.0);
+        assert_eq!(BROWSE_COL_DATE_W, 135.0);
 
-            // Adjust name column width smaller than long text to test truncation
-            app.browse_col_name_w = 120.0;
-
-            egui::CentralPanel::default().show(ui, |ui| {
-                app.render_client_browser_panel(ui);
-            });
-
-            assert_eq!(app.browse_col_name_w, 120.0);
-
-            // Now expand wider
-            app.browse_col_name_w = 400.0;
-            egui::CentralPanel::default().show(ui, |ui| {
-                app.render_client_browser_panel(ui);
-            });
-
-            assert_eq!(app.browse_col_name_w, 400.0);
+        let dl_conn = ConnectionContext {
+            ip: "192.168.1.20".to_string(),
+            port: 4433,
+            password: "test-secret-ring".to_string(),
+            peer_name: Some("Host-A".to_string()),
+        };
+        app.active_queue_id = Some(1);
+        app.active_progress = Some(TransferProgress {
+            selected_target: "movie.mkv".to_string(),
+            file_name: "movie.mkv".to_string(),
+            bytes_done: 500_000_000,
+            bytes_total: 1_000_000_000,
+            speed_mbps: 100.0,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+            is_finished: false,
         });
+        app.download_queue.push_back(QueuedDownloadItem {
+            id: 1,
+            peer_name: "Host-A".to_string(),
+            conn_ctx: dl_conn,
+            is_mock: true,
+            entry: FileEntry {
+                name: "movie.mkv".to_string(),
+                is_dir: false,
+                size: 1_000_000_000,
+                modified_timestamp: 0,
+            },
+            remote_subpath: "movie.mkv".to_string(),
+            local_dest_dir: std::env::temp_dir(),
+            status: QueueItemStatus::Downloading,
+            started_at: Some(Instant::now() - Duration::from_secs(5)),
+            elapsed_duration: None,
+            completed_at: None,
+            total_bytes: Some(1_000_000_000),
+        });
+
+        let collect_speed_x = |out: &egui::FullOutput| -> f32 {
+            fn walk(shape: &egui::epaint::Shape) -> Option<f32> {
+                match shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text().contains("MB/s") => {
+                        Some(t.pos.x)
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(walk),
+                    _ => None,
+                }
+            }
+            out.shapes
+                .iter()
+                .find_map(|c| walk(&c.shape))
+                .expect("Missing Active Downloads speed text")
+        };
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+
+        // Render with narrow Name column
+        app.browse_col_name_w = 120.0;
+        let out_narrow = run_test_ui(&ctx, raw_input.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        assert_eq!(app.browse_col_name_w, 120.0);
+
+        // Render with very wide Name column exceeding panel width -> Active Downloads must NOT move
+        app.browse_col_name_w = 1100.0;
+        let out_wide = run_test_ui(&ctx, raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        assert_eq!(app.browse_col_name_w, 1100.0);
+
+        let speed_x_narrow = collect_speed_x(&out_narrow);
+        let speed_x_wide = collect_speed_x(&out_wide);
+        assert!(
+            (speed_x_narrow - speed_x_wide).abs() < 0.5,
+            "Resizing Browse Name column must not shift Active Downloads columns ({} vs {})",
+            speed_x_narrow,
+            speed_x_wide
+        );
     }
 
     #[test]
@@ -7809,7 +7957,14 @@ mod tests {
 
         // 1. Host tab shows active upload badge on shared folder + active upload row with GB decimal sizes
         app.current_tab = AppTab::Host;
-        let host_out = run_test_ui(&ctx, Default::default(), |ui| {
+        let wide_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let host_out = run_test_ui(&ctx, wide_input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_host_tab(ui);
             });
@@ -7823,6 +7978,81 @@ mod tests {
         assert!(host_texts
             .iter()
             .any(|t| t.contains("1.40 GB / 1.86 GB") || t.contains("GB /")));
+
+        let find_bar_rect = |shapes: &[egui::epaint::ClippedShape], y_center: f32| -> egui::Rect {
+            fn walk(shape: &egui::epaint::Shape, y_center: f32) -> Option<egui::Rect> {
+                match shape {
+                    egui::epaint::Shape::Rect(r)
+                        if r.rect.width() > 300.0
+                            && r.rect.height() >= 10.0
+                            && r.rect.height() <= 30.0
+                            && r.rect.y_range().contains(y_center) =>
+                    {
+                        Some(r.rect)
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(|s| walk(s, y_center)),
+                    _ => None,
+                }
+            }
+            shapes
+                .iter()
+                .find_map(|c| walk(&c.shape, y_center))
+                .expect("Missing Active Upload ProgressBar rect")
+        };
+
+        let row_texts: Vec<(String, egui::Rect)> = {
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => out.push((
+                        t.galley.text().to_string(),
+                        t.galley.rect.translate(t.pos.to_vec2()),
+                    )),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for c in &host_out.shapes {
+                walk(&c.shape, &mut out);
+            }
+            out
+        };
+        let find_row_text_rect = |needle: &str| -> egui::Rect {
+            row_texts
+                .iter()
+                .find(|(t, r)| t.contains(needle) && r.center().y > 540.0)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing text shape matching '{}' in {:?}",
+                        needle,
+                        row_texts
+                            .iter()
+                            .filter(|(_, r)| r.center().y > 540.0)
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let speed_rect = find_row_text_rect("MB/s");
+        let eta_rect = find_row_text_rect("ETA:");
+        let size_rect = find_row_text_rect("1.40 GB / 1.86 GB");
+        let bar_rect = find_bar_rect(&host_out.shapes, speed_rect.center().y);
+        assert!(
+            bar_rect.width() > 500.0 && (speed_rect.left() - bar_rect.right()) <= 24.0,
+            "Active upload ProgressBar right ({}) must sit close to Speed ({})",
+            bar_rect.right(),
+            speed_rect.left()
+        );
+        assert!(
+            size_rect.right() <= 1185.0 && (size_rect.left() - eta_rect.right()) <= 24.0,
+            "Active upload ETA right ({}) must sit close to Size ({:?})",
+            eta_rect.right(),
+            size_rect
+        );
 
         // 2. Left navigation tab buttons render active download and upload badges
         let p = app.palette(&ctx);
