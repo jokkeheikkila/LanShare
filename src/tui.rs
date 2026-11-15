@@ -4,8 +4,9 @@ use crate::core::{
     estimate_remaining_seconds, format_completed_timestamp, format_file_size,
     format_remaining_time, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
-    queue_status_sort_rank, sort_peers_alphabetically, spawn_next_queued_download,
+    open_url, queue_status_sort_rank, sort_peers_alphabetically, spawn_next_queued_download,
     test_downloads_dir, ClientActionResult, EtaStabilizer, QueueItemStatus, QueuedDownloadItem,
+    GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
@@ -621,6 +622,8 @@ pub struct LanShareTui {
     pub last_host_folders_header_range: Option<(usize, usize)>,
     pub last_host_logs_header_range: Option<(usize, usize)>,
     pub last_login_copy_bounds: Option<(usize, usize, usize)>,
+    pub last_about_github_bounds: Option<(usize, usize, usize)>,
+    pub last_about_updates_bounds: Option<(usize, usize, usize)>,
 
     // Client Activity Log (hidden by default)
     pub client_logs: VecDeque<String>,
@@ -790,6 +793,8 @@ impl LanShareTui {
             last_host_folders_header_range: None,
             last_host_logs_header_range: None,
             last_login_copy_bounds: None,
+            last_about_github_bounds: None,
+            last_about_updates_bounds: None,
 
             client_logs,
             show_client_logs: false,
@@ -1637,6 +1642,24 @@ impl LanShareTui {
                 | KeyEvent::Char('q')
                 | KeyEvent::F(1) => {
                     self.show_how_it_works = false;
+                    self.last_about_github_bounds = None;
+                    self.last_about_updates_bounds = None;
+                }
+                KeyEvent::Char('g') | KeyEvent::Char('G') => {
+                    self.open_about_url(GITHUB_REPO_URL, "GitHub repository");
+                }
+                KeyEvent::Char('u') | KeyEvent::Char('U') => {
+                    self.open_about_url(GITHUB_RELEASES_URL, "GitHub Releases");
+                }
+                KeyEvent::MouseClick { col, row } => {
+                    let hit = |bounds: Option<(usize, usize, usize)>| {
+                        bounds.is_some_and(|(r, c0, c1)| row == r && col >= c0 && col <= c1)
+                    };
+                    if hit(self.last_about_github_bounds) {
+                        self.open_about_url(GITHUB_REPO_URL, "GitHub repository");
+                    } else if hit(self.last_about_updates_bounds) {
+                        self.open_about_url(GITHUB_RELEASES_URL, "GitHub Releases");
+                    }
                 }
                 _ => {}
             }
@@ -3733,9 +3756,19 @@ impl LanShareTui {
         );
     }
 
-    fn render_how_it_works_modal(&self, buf: &mut ScreenBuffer) {
+    fn open_about_url(&mut self, url: &str, label: &str) {
+        match open_url(url) {
+            Ok(()) => self.set_flash(format!("Opened {} in browser.", label)),
+            Err(e) => self.set_flash(format!("Could not open {} ({}): {}", label, e, url)),
+        }
+    }
+
+    fn render_how_it_works_modal(&mut self, buf: &mut ScreenBuffer) {
+        self.last_about_github_bounds = None;
+        self.last_about_updates_bounds = None;
+
         let mw = buf.width.saturating_sub(6).min(84);
-        let mh = 17.min(buf.height.saturating_sub(2));
+        let mh = 18.min(buf.height.saturating_sub(2));
         let mx = (buf.width.saturating_sub(mw)) / 2;
         let my = (buf.height.saturating_sub(mh)) / 2;
 
@@ -3749,6 +3782,8 @@ impl LanShareTui {
             Color::Black,
         );
 
+        let github_line = format!("[g] GitHub: {}", GITHUB_REPO_URL);
+        let updates_line = format!("[u] Updates: {}", GITHUB_RELEASES_URL);
         let lines = [
             (
                 format!(
@@ -3759,11 +3794,8 @@ impl LanShareTui {
                 true,
             ),
             ("Author: Jokke Heikkilä".to_string(), Color::White, false),
-            (
-                "GitHub: https://github.com/jokkeheikkila/LanShare".to_string(),
-                Color::Cyan,
-                false,
-            ),
+            (github_line, Color::Cyan, false),
+            (updates_line, Color::Cyan, false),
             ("".to_string(), Color::Gray, false),
             (
                 "Encrypted peer-to-peer LAN folder sharing powered by Share-Ring.".to_string(),
@@ -3810,25 +3842,30 @@ impl LanShareTui {
             ),
             ("".to_string(), Color::Gray, false),
             (
-                "Press [Enter], [Esc], or [?] to close.".to_string(),
+                "Click links or press [g] GitHub / [u] Updates. [Enter]/[Esc]/[?] to close."
+                    .to_string(),
                 Color::Yellow,
                 true,
             ),
         ];
 
+        let max_w = mw.saturating_sub(4);
         for (i, (text, color, bold)) in lines.iter().enumerate() {
             if i + 2 >= mh {
                 break;
             }
-            buf.draw_text(
-                mx + 2,
-                my + 1 + i,
-                mw.saturating_sub(4),
-                text,
-                *color,
-                Color::Black,
-                *bold,
-            );
+            let row = my + 1 + i;
+            let start = mx + 2;
+            let visible_chars = text.chars().count().min(max_w);
+            if visible_chars > 0 {
+                let end = start + visible_chars - 1;
+                if i == 2 {
+                    self.last_about_github_bounds = Some((row, start, end));
+                } else if i == 3 {
+                    self.last_about_updates_bounds = Some((row, start, end));
+                }
+            }
+            buf.draw_text(start, row, max_w, text, *color, Color::Black, *bold);
         }
     }
 
@@ -4535,6 +4572,40 @@ mod tests {
         assert!(about_text.contains("About LanShare"));
         assert!(about_text.contains("Jokke Heikkilä"));
         assert!(about_text.contains("github.com/jokkeheikkila/LanShare"));
+        assert!(about_text.contains("github.com/jokkeheikkila/LanShare/releases"));
+
+        // Clicking GitHub and Updates links in About modal opens them
+        let (gh_row, gh_c0, _gh_c1) = tui
+            .last_about_github_bounds
+            .expect("GitHub link bounds recorded");
+        tui.handle_key(KeyEvent::MouseClick {
+            col: gh_c0 + 2,
+            row: gh_row,
+        });
+        assert!(tui
+            .status_flash
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("GitHub repository")));
+
+        let (up_row, up_c0, _up_c1) = tui
+            .last_about_updates_bounds
+            .expect("Updates link bounds recorded");
+        tui.handle_key(KeyEvent::MouseClick {
+            col: up_c0 + 2,
+            row: up_row,
+        });
+        assert!(tui
+            .status_flash
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("GitHub Releases")));
+
+        // Keyboard shortcut 'u' also triggers Updates link
+        tui.status_flash = None;
+        tui.handle_key(KeyEvent::Char('u'));
+        assert!(tui
+            .status_flash
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("GitHub Releases")));
     }
 
     #[test]

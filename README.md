@@ -70,12 +70,12 @@ Instead of configuring IP addresses, user accounts, or SMB shares:
 
 ## Download
 
-Standalone binaries are built automatically by [GitHub Actions](.github/workflows/build.yml) and published on **GitHub Releases**:
+Download the latest portable binaries directly from **[GitHub Releases](https://github.com/jokkeheikkila/LanShare/releases)**
 
 * **Windows (x64)**: `lanshare-gui-windows-x64.exe` (GUI) and `lanshare-cli-windows-x64.exe` (TUI & CLI) — portable, zero external DLLs.
 * **Linux (x64)**: `lanshare-gui-linux-x64` (GUI) and `lanshare-cli-linux-x64` (TUI & CLI) — X11 & Wayland, built against Ubuntu 22.04 `glibc` for broad distro compatibility.
 
-*(On Linux, run `chmod +x lanshare-gui-linux-x64 lanshare-cli-linux-x64` before launching.)*
+*(Binaries are built automatically by [GitHub Actions](.github/workflows/build.yml). On Linux, run `chmod +x lanshare-gui-linux-x64 lanshare-cli-linux-x64` before launching.)*
 
 ---
 

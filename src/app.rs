@@ -4,9 +4,9 @@ use crate::core::{
     estimate_remaining_seconds, format_completed_timestamp, format_file_size,
     format_remaining_time, format_secret_display, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
-    open_file_in_default_app, open_folder_in_explorer, queue_status_sort_rank,
+    open_file_in_default_app, open_folder_in_explorer, open_url, queue_status_sort_rank,
     sort_peers_alphabetically, spawn_next_queued_download, test_downloads_dir, ClientActionResult,
-    EtaStabilizer, QueueItemStatus, QueuedDownloadItem,
+    EtaStabilizer, QueueItemStatus, QueuedDownloadItem, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
@@ -1599,6 +1599,35 @@ impl LanShareApp {
             });
     }
 
+    fn render_about_link(
+        ui: &mut egui::Ui,
+        p: &AppPalette,
+        label: &str,
+        url: &str,
+    ) -> egui::Response {
+        let link = egui::Label::new(RichText::new(label).size(12.5).color(p.accent_blue))
+            .sense(egui::Sense::click());
+        let (galley_pos, galley, resp) = link.layout_in_ui(ui);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        }
+        if ui.is_rect_visible(resp.rect) {
+            let underline = if resp.hovered() {
+                Stroke::new(1.0_f32, p.accent_blue)
+            } else {
+                Stroke::NONE
+            };
+            ui.painter().add(
+                egui::epaint::TextShape::new(galley_pos, galley, p.accent_blue)
+                    .with_underline(underline),
+            );
+        }
+        if resp.clicked() {
+            let _ = open_url(url);
+        }
+        resp
+    }
+
     fn render_about_modal(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             return;
@@ -1661,11 +1690,18 @@ impl LanShareApp {
                                         .color(p.text_muted),
                                 );
                                 ui.add_space(4.0);
-                                ui.hyperlink_to(
-                                    RichText::new("https://github.com/jokkeheikkila/LanShare")
-                                        .size(12.5)
-                                        .color(p.accent_blue),
-                                    "https://github.com/jokkeheikkila/LanShare",
+                                Self::render_about_link(
+                                    ui,
+                                    &p,
+                                    GITHUB_REPO_URL,
+                                    GITHUB_REPO_URL,
+                                );
+                                ui.add_space(2.0);
+                                Self::render_about_link(
+                                    ui,
+                                    &p,
+                                    "Check for updates (GitHub Releases)",
+                                    GITHUB_RELEASES_URL,
                                 );
                             });
 
@@ -6784,5 +6820,45 @@ mod tests {
             stopped_card_h,
             active_card_h
         );
+    }
+
+    #[test]
+    fn test_about_link_uses_default_cursor_and_stays_centered() {
+        let ctx = egui::Context::default();
+        let app = create_test_app();
+        let p = app.palette(&ctx);
+
+        let mut link_rect = egui::Rect::NOTHING;
+        let _ = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    link_rect = LanShareApp::render_about_link(
+                        ui,
+                        &p,
+                        "Check for updates (GitHub Releases)",
+                        GITHUB_RELEASES_URL,
+                    )
+                    .rect;
+                });
+            });
+        });
+
+        let hover_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(link_rect.center())],
+            ..Default::default()
+        };
+        let out = run_test_ui(&ctx, hover_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    let _ = LanShareApp::render_about_link(
+                        ui,
+                        &p,
+                        "Check for updates (GitHub Releases)",
+                        GITHUB_RELEASES_URL,
+                    );
+                });
+            });
+        });
+        assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::Default);
     }
 }

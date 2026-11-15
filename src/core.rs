@@ -1301,8 +1301,11 @@ pub fn open_folder_in_explorer(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
+pub const GITHUB_REPO_URL: &str = "https://github.com/jokkeheikkila/LanShare";
+pub const GITHUB_RELEASES_URL: &str = "https://github.com/jokkeheikkila/LanShare/releases";
+
 #[cfg(target_os = "windows")]
-fn windows_shell_open(path: &std::path::Path) -> Result<(), String> {
+fn windows_shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "shell32")]
@@ -1319,11 +1322,7 @@ fn windows_shell_open(path: &std::path::Path) -> Result<(), String> {
 
     const SW_SHOWNORMAL: i32 = 1;
     let op: Vec<u16> = "open\0".encode_utf16().collect();
-    let file: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let file: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `op` and `file` are valid NUL-terminated UTF-16 buffers kept alive across the call;
     // unused pointer arguments and `hwnd` are intentionally null.
     let rc = unsafe {
@@ -1339,7 +1338,37 @@ fn windows_shell_open(path: &std::path::Path) -> Result<(), String> {
     if rc > 32 {
         Ok(())
     } else {
-        Err(format!("Failed to open file (ShellExecuteW code {})", rc))
+        Err(format!("Failed to open target (ShellExecuteW code {})", rc))
+    }
+}
+
+fn open_in_os(target: &std::ffi::OsStr, kind: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_shell_open(target)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open {}: {}", kind, e))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let res = std::process::Command::new("xdg-open").arg(target).spawn();
+        match res {
+            Ok(_) => Ok(()),
+            Err(_) => std::process::Command::new("gio")
+                .arg("open")
+                .arg(target)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to open {}: {}", kind, e)),
+        }
     }
 }
 
@@ -1358,33 +1387,18 @@ pub fn open_file_in_default_app(path: &std::path::Path) -> Result<(), String> {
             .open(path);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        windows_shell_open(path)
-    }
+    open_in_os(path.as_os_str(), "file")
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed to open file: {}", e))
+/// Opens an `http://` or `https://` URL in the user's default browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http:// and https:// URLs are supported.".to_string());
     }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let res = std::process::Command::new("xdg-open").arg(path).spawn();
-        match res {
-            Ok(_) => Ok(()),
-            Err(_) => std::process::Command::new("gio")
-                .arg("open")
-                .arg(path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| format!("Failed to open file: {}", e)),
-        }
+    if cfg!(test) {
+        return Ok(());
     }
+    open_in_os(std::ffi::OsStr::new(url), "URL")
 }
 
 static LOG_FILE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -2123,6 +2137,15 @@ mod tests {
         let res = open_file_in_default_app(&temp_file);
         assert!(res.is_ok());
         let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_open_url_validates_scheme() {
+        assert!(open_url(GITHUB_REPO_URL).is_ok());
+        assert!(open_url(GITHUB_RELEASES_URL).is_ok());
+        assert!(open_url("http://example.com").is_ok());
+        assert!(open_url("file:///etc/passwd").is_err());
+        assert!(open_url("javascript:alert(1)").is_err());
     }
 
     #[tokio::test]
