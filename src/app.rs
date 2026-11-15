@@ -4423,10 +4423,10 @@ impl LanShareApp {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             let avail_w = ui.available_width();
                             let right_pad = 8.0_f32;
-                            let speed_col_w = 86.0_f32;
-                            let eta_col_w = 64.0_f32;
-                            let total_col_w = 96.0_f32;
-                            let size_col_w = 146.0_f32;
+                            let speed_col_w = 94.0_f32;
+                            let eta_col_w = 78.0_f32;
+                            let total_col_w = 112.0_f32;
+                            let size_col_w = 148.0_f32;
                             let metrics_total_w = right_pad
                                 + speed_col_w
                                 + eta_col_w
@@ -4527,16 +4527,14 @@ impl LanShareApp {
 
                                 for item in display_items {
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                         let row_avail_w = ui.available_width();
-                                        let right_pad = 12.0_f32;
-                                        let size_col_w = 88.0_f32;
-                                        let eta_col_w = 166.0_f32;
-                                        let gap_w = 8.0_f32;
-                                        let min_text_gap = 20.0_f32;
+                                        let right_pad = 8.0_f32;
+                                        let eta_col_w = 76.0_f32;
+                                        let size_col_w = 80.0_f32;
                                         let right_cols_w =
-                                            right_pad + size_col_w + eta_col_w + gap_w;
-                                        let left_w =
-                                            (row_avail_w - right_cols_w - min_text_gap).max(80.0);
+                                            right_pad + eta_col_w + size_col_w + 6.0 * 2.0;
+                                        let left_w = (row_avail_w - right_cols_w).max(80.0);
 
                                         let (badge, color) = match &item.status {
                                             QueueItemStatus::Downloading => {
@@ -4573,7 +4571,7 @@ impl LanShareApp {
                                                         })
                                                     {
                                                         detail_text = format!(
-                                                            "ETA: {:<5}",
+                                                            "ETA: {:<4}",
                                                             format_remaining_time(item_s)
                                                         );
                                                         detail_color = p.accent_blue;
@@ -4585,26 +4583,10 @@ impl LanShareApp {
                                                     item.total_bytes.unwrap_or(item.entry.size);
                                                 size_text =
                                                     format!("{:>9}", format_file_size(final_bytes));
-                                                let took_str = item.elapsed_duration.map(|dur| {
-                                                    if dur.as_secs() == 0 {
-                                                        "< 1s".to_string()
-                                                    } else {
-                                                        format_remaining_time(dur.as_secs())
-                                                    }
-                                                });
-                                                let time_str = item
+                                                detail_text = item
                                                     .completed_at
-                                                    .map(format_completed_timestamp);
-                                                detail_text = match (took_str, time_str) {
-                                                    (Some(took), Some(ts)) => {
-                                                        format!("Took {:<4}  {}", took, ts)
-                                                    }
-                                                    (Some(took), None) => {
-                                                        format!("Took {}", took)
-                                                    }
-                                                    (None, Some(ts)) => ts,
-                                                    (None, None) => String::new(),
-                                                };
+                                                    .map(format_completed_timestamp)
+                                                    .unwrap_or_default();
                                             }
                                             QueueItemStatus::Failed(ref err) => {
                                                 detail_text = format!("Error: {}", err);
@@ -4681,64 +4663,37 @@ impl LanShareApp {
                                             },
                                         );
 
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
+                                        Self::render_right_aligned_metric_col(
+                                            ui,
+                                            eta_col_w,
                                             |ui| {
-                                                ui.add_space(right_pad);
+                                                if !detail_text.is_empty() {
+                                                    let resp = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(detail_text)
+                                                                .monospace()
+                                                                .color(detail_color),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                    if let Some(ref tip) = detail_tooltip {
+                                                        resp.on_hover_text(tip);
+                                                    }
+                                                }
+                                            },
+                                        );
 
-                                                Self::render_fixed_metric_col(
-                                                    ui,
-                                                    size_col_w,
-                                                    |ui| {
-                                                        if !size_text.is_empty() {
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    ui.label(
-                                                                        RichText::new(size_text)
-                                                                            .monospace()
-                                                                            .color(p.text_muted),
-                                                                    );
-                                                                },
-                                                            );
-                                                        }
-                                                    },
-                                                );
-
-                                                ui.add_space(gap_w);
-
-                                                Self::render_fixed_metric_col(
-                                                    ui,
-                                                    eta_col_w,
-                                                    |ui| {
-                                                        if !detail_text.is_empty() {
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    let resp = ui.add(
-                                                                        egui::Label::new(
-                                                                            RichText::new(
-                                                                                detail_text,
-                                                                            )
-                                                                            .monospace()
-                                                                            .color(detail_color),
-                                                                        )
-                                                                        .truncate(),
-                                                                    );
-                                                                    if let Some(ref tip) =
-                                                                        detail_tooltip
-                                                                    {
-                                                                        resp.on_hover_text(tip);
-                                                                    }
-                                                                },
-                                                            );
-                                                        }
-                                                    },
-                                                );
+                                        Self::render_right_aligned_metric_col(
+                                            ui,
+                                            size_col_w,
+                                            |ui| {
+                                                if !size_text.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(size_text)
+                                                            .monospace()
+                                                            .color(p.text_muted),
+                                                    );
+                                                }
                                             },
                                         );
                                     });
@@ -5238,9 +5193,9 @@ impl LanShareApp {
                                         };
                                         let avail_w = ui.available_width();
                                         let right_pad = 8.0_f32;
-                                        let speed_col_w = 86.0_f32;
-                                        let eta_col_w = 64.0_f32;
-                                        let size_col_w = 146.0_f32;
+                                        let speed_col_w = 94.0_f32;
+                                        let eta_col_w = 78.0_f32;
+                                        let size_col_w = 148.0_f32;
                                         let metrics_total_w = right_pad
                                             + speed_col_w
                                             + eta_col_w
@@ -8173,6 +8128,48 @@ mod tests {
             "Total ETA must update immediately after enqueue"
         );
 
+        // Under readable GUI styling (13pt monospace), ETA and (Total: ...) keep clear spacing
+        configure_readable_style(&ctx, true);
+        let q_styled_out = run_test_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_download_queue_panel(ui, 300.0);
+                });
+            },
+        );
+        let find_styled_rect = |needle: &str| -> egui::Rect {
+            fn walk(shape: &egui::epaint::Shape, needle: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text().starts_with(needle) => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()))
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                    _ => None,
+                }
+            }
+            q_styled_out
+                .shapes
+                .iter()
+                .find_map(|c| walk(&c.shape, needle))
+                .unwrap_or_else(|| panic!("Missing styled active download text '{needle}'"))
+        };
+        let active_eta_rect = find_styled_rect("ETA:");
+        let active_total_rect = find_styled_rect("(Total:");
+        assert!(
+            active_total_rect.left() - active_eta_rect.right() >= 8.0,
+            "(Total: ...) left ({}) must have clear space after ETA right ({})",
+            active_total_rect.left(),
+            active_eta_rect.right()
+        );
+
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -8583,7 +8580,8 @@ mod tests {
         }
 
         // 3. Download queue cross button sits on the left before aligned Queued/Done badges,
-        // no 'Folder' indicator is shown, ETA is padded right near Size, and long names truncate cleanly before ETA
+        // no 'Folder' indicator is shown, Done shows only completion time (no 'Took'), ETA sits
+        // compactly near Size, and long names extend near ETA before truncating with '...'
         let mut done_item = make_item(
             4,
             "finished.tar",
@@ -8591,6 +8589,7 @@ mod tests {
             QueueItemStatus::Completed,
         );
         done_item.elapsed_duration = Some(Duration::from_secs(12));
+        done_item.completed_at = Some(Local::now());
         app.download_queue.push_back(done_item);
         if let Some(long_item) = app.download_queue.iter_mut().find(|i| i.id == 3) {
             long_item.entry.is_dir = true;
@@ -8612,11 +8611,14 @@ mod tests {
         let mut text_positions: Vec<PlacedText> = Vec::new();
         fn collect_pos(s: &egui::epaint::Shape, out: &mut Vec<PlacedText>) {
             match s {
-                egui::epaint::Shape::Text(t) => out.push(PlacedText {
-                    text: t.galley.job.text.clone(),
-                    pos: t.pos,
-                    size: t.galley.size(),
-                }),
+                egui::epaint::Shape::Text(t) => {
+                    let rect = t.galley.rect.translate(t.pos.to_vec2());
+                    out.push(PlacedText {
+                        text: t.galley.job.text.clone(),
+                        pos: rect.min,
+                        size: rect.size(),
+                    });
+                }
                 egui::epaint::Shape::Vec(v) => v.iter().for_each(|c| collect_pos(c, out)),
                 _ => {}
             }
@@ -8629,6 +8631,17 @@ mod tests {
         assert!(
             !text_positions.iter().any(|t| t.text.contains("Folder")),
             "Queue must omit Folder indicator to save horizontal space"
+        );
+        assert!(
+            !text_positions.iter().any(|t| t.text.contains("Took")),
+            "Done rows must omit 'Took' duration and show only completion time"
+        );
+        let expected_hh = Local::now().format("%H:").to_string();
+        assert!(
+            text_positions
+                .iter()
+                .any(|t| t.text.starts_with(&expected_hh) && t.pos.y > 80.0),
+            "Done row must render completion time-only HH:MM:SS"
         );
         let cross_xs: Vec<f32> = text_positions
             .iter()
@@ -8680,22 +8693,24 @@ mod tests {
             .map(|t| t.pos.x + t.size.x)
             .expect("truncated long row must render");
         assert!(
-            long_row_right <= queue_eta_xs[0] - 20.0,
-            "Long filename ({}) must truncate well before ETA ({})",
+            long_row_right <= queue_eta_xs[0] - 8.0 && (queue_eta_xs[0] - long_row_right) <= 40.0,
+            "Long filename ({}) must extend close to ETA ({}) without wasting excessive horizontal space",
             long_row_right,
             queue_eta_xs[0]
         );
 
-        let queue_size_xs: Vec<f32> = text_positions
+        let queue_size_rights: Vec<f32> = text_positions
             .iter()
             .filter(|t| (t.text.ends_with("MB") || t.text.ends_with("GB")) && t.pos.y > 80.0)
-            .map(|t| t.pos.x)
+            .map(|t| t.pos.x + t.size.x)
             .collect();
-        assert_eq!(queue_size_xs.len(), 3);
+        assert_eq!(queue_size_rights.len(), 3);
         assert!(
-            queue_size_xs.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5),
-            "Queued & Done Size columns must align vertically: {:?}",
-            queue_size_xs
+            queue_size_rights
+                .windows(2)
+                .all(|w| (w[0] - w[1]).abs() < 0.5),
+            "Queued & Done Size columns must align on right edge: {:?}",
+            queue_size_rights
         );
     }
 }

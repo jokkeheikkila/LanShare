@@ -22,9 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI fail-fast path validation**: validate `lanshare-cli host` and `lanshare-cli download` paths before prompting for the Ring Secret (`src/cli.rs`, `src/main.rs`).
 - **Concurrent multi-GB `--test` mock uploads**: simulate multiple concurrent uploads with multi-gigabyte test files in offline `--test` mode (`src/core.rs`).
 - **Large file size formatting**: formatted `GB` and `TB` values with two decimal places (`{:.2}`) while keeping `B`, `KB`, and `MB` as whole integers so gigabyte transfer progress remains distinct (`src/core.rs`).
+- **Non-jumping transfer metrics & TUI upload summary**: stabilized active download/upload speed, ETA, and byte-count columns in GUI and TUI, moved TUI transfer metrics before filenames with `Total ETA` and collapsed multi-upload summaries, and tightened GUI progress-bar-to-metrics spacing (`src/app.rs`, `src/tui.rs`, `src/core.rs`).
+- **Browse table & Download Queue alignment**: unified Browse action buttons (`Queue`, `Active`, `Queued`, `Download`) to a consistent size, removed alternating Browse row striping, moved queue remove (`✖`) buttons to the left column, aligned `Queued`/`Done` badges and `ETA`/`Size` columns, and formatted completed timestamps as time-only (`src/app.rs`, `src/core.rs`).
 
 ### Fixed
 - **Download queue ETA accuracy**: aligned `Total ETA` with active transfer `ETA` when no other items are pending, and recalculated `Total ETA` immediately whenever queue items are added, removed, completed, or resolved (`src/core.rs`, `src/app.rs`, `src/tui.rs`).
+- **Browse resize isolation, hover highlight height, and spinner debounce**: prevented resizing the Browse `Name` column from shifting Active Downloads columns, matched Browse row highlight height to the rendered button height, and debounced the loading spinner (`250ms`) so fast folder loads avoid flicker (`src/app.rs`, `src/tui.rs`, `src/core.rs`).
 - **About dialog layout & link opening**: increased GUI About window height so the Close button fits without clipping, and fixed opening repository/release links (`src/app.rs`, `src/tui.rs`, `src/core.rs`).
 - **Windows compiler warning**: removed an unused `kind` variable warning in `src/core.rs`.
 

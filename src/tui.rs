@@ -3198,7 +3198,7 @@ impl LanShareTui {
                     .map(format_remaining_time)
                     .unwrap_or_else(|| "--".to_string());
                 let eta_info = format!(" | ETA: {:<5}", eta_val);
-                let total_info = if pending_count > 0 && total_remaining_bytes > active_remaining {
+                let total_info = if pending_count > 0 && total_remaining_bytes > 0 {
                     let tot_val = total_eta
                         .map(format_remaining_time)
                         .unwrap_or_else(|| "--".to_string());
@@ -3212,8 +3212,9 @@ impl LanShareTui {
                     } else {
                         format!("{} ({})", prog.file_name, prog.selected_target)
                     };
+                let file_num_w = prog.total_files.max(1).to_string().len();
                 let target_info = format!(
-                    "{:>6.1} MB/s{}{} | {:>9} / {:<9} | File ({}/{}) — {}",
+                    "{:>6.1} MB/s{}{} | {:>10} / {:<10} | File ({:>file_num_w$}/{}) — {}",
                     prog.speed_mbps,
                     eta_info,
                     total_info,
@@ -3329,7 +3330,7 @@ impl LanShareTui {
                                         estimate_remaining_seconds(item_bytes, spd)
                                     {
                                         format!(
-                                            "{} (ETA: {})",
+                                            "{} (ETA: {:<4})",
                                             prefix,
                                             format_remaining_time(item_s)
                                         )
@@ -3369,7 +3370,7 @@ impl LanShareTui {
                         _ => String::new(),
                     };
                     let q_line = format!(
-                        "{}  {:<6} {:<29} | {}  (from {})",
+                        "{}  {:<6} {:<34} | {}  (from {})",
                         badge.0, kind_icon, est_col, item.entry.name, item.peer_name
                     );
                     let (fg, bg) = if is_sel {
@@ -3800,7 +3801,7 @@ impl LanShareTui {
                     let speed_col = format!("{:>6.1} MB/s", upload.speed_mbps);
                     let eta_col = format!("ETA: {:<5}", eta_str);
                     let size_col = format!(
-                        "{:>9} / {:<9}",
+                        "{:>10} / {:<10}",
                         format_file_size(upload.bytes_sent),
                         format_file_size(upload.total_size),
                     );
@@ -5766,6 +5767,64 @@ mod tests {
 
         assert!(text2.contains("ETA: 10s"));
         assert!(text2.contains("Total:"));
+
+        // 3. Expanded view: changing ETA/file index/folder size does not shift filenames horizontally
+        tui.client_section = ClientSection::Downloads;
+        tui.download_queue[1].entry.is_dir = true;
+        tui.download_queue[1].total_bytes = Some(250 * 1024 * 1024 * 1024);
+        tui.active_progress.as_mut().unwrap().current_file = 1;
+        tui.active_progress.as_mut().unwrap().total_files = 120;
+        tui.active_progress.as_mut().unwrap().speed_mbps = 5.0;
+        let mut buf_a = ScreenBuffer::new(140, 30);
+        tui.render(&mut buf_a);
+        let text_a = buf_a.to_plain_text();
+
+        tui.active_progress.as_mut().unwrap().current_file = 115;
+        tui.active_progress.as_mut().unwrap().speed_mbps = 120.0;
+        let mut buf_b = ScreenBuffer::new(140, 30);
+        tui.render(&mut buf_b);
+        let text_b = buf_b.to_plain_text();
+
+        let pending_line_a = text_a
+            .lines()
+            .find(|l| l.contains("big_data.tar"))
+            .expect("Pending row missing in frame A");
+        let pending_line_b = text_b
+            .lines()
+            .find(|l| l.contains("big_data.tar"))
+            .expect("Pending row missing in frame B");
+        let done_line_a = text_a
+            .lines()
+            .find(|l| l.contains("finished_docs.pdf"))
+            .expect("Done row missing in frame A");
+        let char_col = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|byte_idx| line[..byte_idx].chars().count())
+        };
+        assert_eq!(
+            char_col(pending_line_a, "big_data.tar"),
+            char_col(pending_line_b, "big_data.tar"),
+            "Large folder queue filename column must stay aligned when ETA changes: '{pending_line_a}' vs '{pending_line_b}'"
+        );
+        assert_eq!(
+            char_col(pending_line_a, "|"),
+            char_col(done_line_a, "|"),
+            "Pending and Done queue '|' separator must stay aligned: '{pending_line_a}' vs '{done_line_a}'"
+        );
+
+        let active_line_a = text_a
+            .lines()
+            .find(|l| l.contains("File ("))
+            .expect("Active line missing in frame A");
+        let active_line_b = text_b
+            .lines()
+            .find(|l| l.contains("File ("))
+            .expect("Active line missing in frame B");
+        assert_eq!(
+            char_col(active_line_a, "— test.iso"),
+            char_col(active_line_b, "— test.iso"),
+            "Active download filename position must not shift when speed/ETA/file-index change: '{active_line_a}' vs '{active_line_b}'"
+        );
     }
 
     #[test]
