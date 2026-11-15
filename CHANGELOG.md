@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-15
+
 ### Added
 - Support discovering and selecting multiple LanShare instances running on the same computer.
 - New **Uploads** section in **Share Folders** (always-visible and resizable in GUI, collapsible with `u` in TUI) showing active uploads, per-folder upload counts, progress bars, speed, ETA, and total upload ETA.
@@ -41,5 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direct IP Connect support for Tailscale (`100.64.0.0/10`) and private LAN/ULA subnets, plus offline `--test` simulated multi-peer mode.
 - Read-only path validation, symlink/`O_NOFOLLOW` protection, `--secret-env` / `--secret-stdin` secret loading, and bounded OS-standard log rotation.
 
-[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jokkeheikkila/LanShare/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jokkeheikkila/LanShare/releases/tag/v1.0.0
