@@ -116,21 +116,36 @@ pub async fn scan_lan_for_hosts(
     let svc = crate::discovery::service();
 
     // Send active UDP DiscoveryProbe to broadcast + ARP neighbor targets to open stateful firewall holes
-    if let (Some(s), Some(secret)) = (svc, clean_secret) {
-        let probe = DiscoveryProbe::new(secret);
-        if let Ok(probe_bytes) = serde_json::to_vec(&probe) {
-            for binding in get_broadcast_bindings(DEFAULT_UDP_PORT) {
-                for target in binding.targets {
-                    s.send_to(&probe_bytes, target);
+    let mut probed_udp_targets = std::collections::HashSet::<SocketAddr>::new();
+    let probe_bytes_opt =
+        clean_secret.and_then(|secret| serde_json::to_vec(&DiscoveryProbe::new(secret)).ok());
+    if let (Some(s), Some(probe_bytes)) = (svc, probe_bytes_opt.as_ref()) {
+        for binding in get_broadcast_bindings(DEFAULT_UDP_PORT) {
+            for target in binding.targets {
+                s.send_from_both(probe_bytes, target);
+                probed_udp_targets.insert(target);
+            }
+        }
+        for ip in crate::network::get_lan_arp_neighbors() {
+            let target = SocketAddr::V4(SocketAddrV4::new(ip, DEFAULT_UDP_PORT));
+            s.send_from_both(probe_bytes, target);
+            probed_udp_targets.insert(target);
+        }
+        for ip in s.recent_peer_ips(Duration::from_secs(60)) {
+            let target = SocketAddr::new(ip, DEFAULT_UDP_PORT);
+            s.send_from_both(probe_bytes, target);
+            probed_udp_targets.insert(target);
+        }
+        for target in s.recent_peer_addrs(Duration::from_secs(60)) {
+            if probed_udp_targets.insert(target) {
+                s.send_from_both(probe_bytes, target);
+            }
+        }
+        if let Some(secret) = clean_secret {
+            for target in s.recent_beacon_udp_targets_for_secret(Duration::from_secs(60), secret) {
+                if probed_udp_targets.insert(target) {
+                    s.send_from_both(probe_bytes, target);
                 }
-            }
-            for ip in crate::network::get_lan_arp_neighbors() {
-                let target = SocketAddr::V4(SocketAddrV4::new(ip, DEFAULT_UDP_PORT));
-                s.send_to(&probe_bytes, target);
-            }
-            for ip in s.recent_peer_ips(Duration::from_secs(60)) {
-                let target = SocketAddr::new(ip, DEFAULT_UDP_PORT);
-                s.send_to(&probe_bytes, target);
             }
         }
     }
@@ -206,6 +221,14 @@ pub async fn scan_lan_for_hosts(
                             continue;
                         }
                         s.record_authenticated_peer_ip(b.src);
+                        if b.src_port != 0 && b.src_port != DEFAULT_UDP_PORT {
+                            let peer_udp_target = SocketAddr::new(b.src, b.src_port);
+                            if probed_udp_targets.insert(peer_udp_target) {
+                                if let Some(ref probe_bytes) = probe_bytes_opt {
+                                    s.send_from_both(probe_bytes, peer_udp_target);
+                                }
+                            }
+                        }
                     } else if !b.beacon.ring_tag.is_empty() {
                         continue;
                     }
@@ -382,7 +405,7 @@ async fn connect_via_reverse_tcp_step(
     let send_trigger = async {
         for _ in 0..4 {
             if let Some(s) = svc {
-                s.send_to(&req_bytes, udp_target);
+                s.send_from_both(&req_bytes, udp_target);
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -478,20 +501,25 @@ async fn connect_to_host_step(
             return perform_tls_client_handshake_step(tcp_stream, password).await;
         }
         _ if !policy.reverse_tcp_timeout.is_zero() => {
-            // 2. Direct TCP timed out or was refused (e.g. Linux ufw/firewalld blocking inbound TCP 22222).
+            // 2. Direct TCP timed out or was refused (e.g. Linux ufw/firewalld blocking inbound TCP 22222 or ephemeral server port).
+            // Look up the specific host instance's HMAC-verified UDP control port (or fallback to 22223).
+            let target_udp_port = crate::discovery::service()
+                .map(|s| s.peer_udp_port_for_secret(addr.ip(), addr.port(), password))
+                .unwrap_or(DEFAULT_UDP_PORT);
+
             // First send a DiscoveryProbe to punch/refresh stateful conntrack pinhole on host
             if let Some(s) = crate::discovery::service() {
                 let probe = DiscoveryProbe::new(password);
                 if let Ok(bytes) = serde_json::to_vec(&probe) {
-                    s.send_to(&bytes, SocketAddr::new(addr.ip(), DEFAULT_UDP_PORT));
+                    s.send_from_both(&bytes, SocketAddr::new(addr.ip(), target_udp_port));
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Automatically attempt Reverse TCP traversal via UDP :22223!
+            // Automatically attempt Reverse TCP traversal via the host's UDP control endpoint!
             match connect_via_reverse_tcp_step(
                 addr.ip(),
-                DEFAULT_UDP_PORT,
+                target_udp_port,
                 password,
                 policy.reverse_tcp_timeout,
             )
@@ -508,7 +536,7 @@ async fn connect_to_host_step(
     Err(TransferError::Recoverable(format!(
         "Connection timed out to {}. If the host has a strict firewall enabled, allow TCP port {} / UDP port {}.",
         addr.ip(),
-        port,
+        addr.port(),
         DEFAULT_UDP_PORT
     )))
 }
@@ -2136,5 +2164,80 @@ mod tests {
         assert!(find_matching_peer_in_list(&peers, "Studio-PC", "192.168.1.99").is_none());
         assert!(find_matching_peer_in_list(&peers, "192.168.1.42", "192.168.1.42").is_none());
         assert!(find_matching_peer_in_list(&peers, "", "192.168.1.42").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_host_routes_reverse_tcp_to_peer_udp_control_port() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (certs, key) = generate_ephemeral_tls().unwrap();
+        let server_cfg = Arc::new(make_server_tls_config(certs, key).unwrap());
+        let secret = "multi-instance-diff-key";
+
+        // Pick an unbound ephemeral TCP port (simulating an instance blocked by firewall)
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked_tcp_port = probe_listener.local_addr().unwrap().port();
+        drop(probe_listener);
+
+        // Bind a dedicated per-instance UDP control socket (different from 22223)
+        let host_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let host_udp_port = host_udp.local_addr().unwrap().port();
+
+        // Send a DiscoveryBeacon from host_udp to the local DiscoveryService so it records host_udp_port
+        let svc = crate::discovery::service().expect("discovery service should start");
+        let beacon = DiscoveryBeacon::new("SecondInstance".to_string(), blocked_tcp_port, secret);
+        let beacon_bytes = serde_json::to_vec(&beacon).unwrap();
+        let target_ctrl = SocketAddr::new("127.0.0.1".parse().unwrap(), svc.control_port());
+        host_udp.send_to(&beacon_bytes, target_ctrl).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            svc.peer_udp_port("127.0.0.1".parse().unwrap(), blocked_tcp_port),
+            host_udp_port
+        );
+
+        let sec_owned = secret.to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (rev, src) = loop {
+                let (len, src) = host_udp.recv_from(&mut buf).await.unwrap();
+                if let Ok(rev) = serde_json::from_slice::<ReverseConnectRequest>(&buf[..len]) {
+                    if rev.verify(&sec_owned) {
+                        break (rev, src);
+                    }
+                }
+            };
+
+            let tcp = TcpStream::connect(SocketAddr::new(src.ip(), rev.tcp_port))
+                .await
+                .unwrap();
+            let acceptor = TlsAcceptor::from(server_cfg);
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let req_bytes = read_frame(&mut tls).await.unwrap();
+            let req: HandshakeRequest = serde_json::from_slice(&req_bytes).unwrap();
+            assert!(crate::network::verify_tls_auth_token(
+                tls.get_ref().1,
+                &sec_owned,
+                &req.auth_token
+            ));
+            let srv_tok =
+                crate::network::compute_tls_server_auth_token(tls.get_ref().1, &sec_owned).unwrap();
+            let resp = HandshakeResponse {
+                authenticated: true,
+                server_name: "SecondInstance".to_string(),
+                message: "Connected".to_string(),
+                server_auth_token: srv_tok,
+            };
+            let _ = write_frame(&mut tls, &serde_json::to_vec(&resp).unwrap()).await;
+        });
+
+        let policy = ReconnectPolicy {
+            tcp_connect_timeout: Duration::from_millis(80),
+            reverse_tcp_timeout: Duration::from_millis(2000),
+            ..Default::default()
+        };
+        let (_, resp) = connect_to_host_step("127.0.0.1", blocked_tcp_port, secret, policy)
+            .await
+            .map_err(TransferError::into_message)
+            .expect("Reverse TCP must reach per-instance UDP control port");
+        assert_eq!(resp.server_name, "SecondInstance");
     }
 }

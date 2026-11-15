@@ -1,17 +1,18 @@
 use crate::client::{self, ClientTlsStream, ConnectionContext, TransferProgress};
 use crate::core::{
-    complete_queued_download, default_mock_peers, dirs_fallback, estimate_folder_remaining_seconds,
+    complete_queued_download, compute_queue_etas, default_mock_peers, dirs_fallback,
     estimate_remaining_seconds, format_completed_timestamp, format_file_size,
     format_remaining_time, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
-    open_url, queue_status_sort_rank, sort_peers_alphabetically, spawn_next_queued_download,
-    test_downloads_dir, ClientActionResult, EtaStabilizer, QueueItemStatus, QueuedDownloadItem,
-    GITHUB_RELEASES_URL, GITHUB_REPO_URL,
+    mock_folder_total_bytes, open_url, parse_host_and_port, queue_status_sort_rank,
+    resolve_remote_folder_total_bytes, sort_peers_alphabetically, spawn_next_queued_download,
+    test_downloads_dir, ClientActionResult, EtaStabilizer, QueueEtaSummary, QueueItemStatus,
+    QueuedDownloadItem, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
 };
-use crate::security::{clean_display_path, validate_shared_folder};
+use crate::security::{clean_display_path, clean_path, validate_shared_folder};
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
 use chrono::{Local, TimeZone};
@@ -22,7 +23,18 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const TUI_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn current_tui_spinner_frame() -> &'static str {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let idx = ((millis / 90) % TUI_SPINNER_FRAMES.len() as u128) as usize;
+    TUI_SPINNER_FRAMES[idx]
+}
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum TuiTab {
@@ -972,18 +984,31 @@ impl LanShareTui {
 
         while let Ok(res) = self.client_action_rx.try_recv() {
             match res {
-                ClientActionResult::Connected(stream, resp, ip) => {
+                ClientActionResult::Connected(mut stream, resp, ip, port) => {
+                    if !self.client_ip.trim().is_empty()
+                        && (ip != self.client_ip.trim() || port != self.client_port)
+                    {
+                        self.tokio_rt.spawn(async move {
+                            let _ = stream.shutdown().await;
+                        });
+                        continue;
+                    }
                     self.client_loading = false;
                     self.client_connected = true;
                     self.client_connection_lost = false;
                     self.mock_session = false;
                     self.client_ip = ip.clone();
+                    self.client_port = port;
                     self.selected_peer_name = resp.server_name.clone();
-                    if !self.discovered_peers.iter().any(|p| p.ip == ip) {
+                    if !self
+                        .discovered_peers
+                        .iter()
+                        .any(|p| p.ip == ip && p.port == port)
+                    {
                         self.discovered_peers.push(DiscoveredPeer {
                             host_name: resp.server_name.clone(),
                             ip: ip.clone(),
-                            port: self.client_port,
+                            port,
                             last_seen: Instant::now(),
                         });
                         sort_peers_alphabetically(&mut self.discovered_peers);
@@ -1039,6 +1064,12 @@ impl LanShareTui {
                     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     self.push_client_log(format!("[{}] Directory error: {}", ts, err));
                 }
+                ClientActionResult::FolderSizeResolved { id, total_bytes } => {
+                    if let Some(item) = self.download_queue.iter_mut().find(|i| i.id == id) {
+                        item.total_bytes = Some(total_bytes);
+                        self.total_eta_stabilizer.reset();
+                    }
+                }
                 ClientActionResult::QueueItemFinished { id, result } => {
                     let outcome = complete_queued_download(
                         &mut self.download_queue,
@@ -1061,6 +1092,7 @@ impl LanShareTui {
                         self.progress_finished_at = Some(Instant::now());
                         self.set_flash(format!("Finished downloading '{}'", outcome.item_name));
                     }
+                    self.total_eta_stabilizer.reset();
 
                     self.start_next_queued_download();
                 }
@@ -1118,13 +1150,18 @@ impl LanShareTui {
     }
 
     pub fn connect_mock_session(&mut self, host_label: &str, mock_ip: &str) {
+        if let Some(mut old_stream) = self.client_stream.take() {
+            self.tokio_rt.spawn(async move {
+                let _ = old_stream.shutdown().await;
+            });
+        }
         self.client_connected = true;
         self.client_connection_lost = false;
+        self.client_loading = false;
         self.connected_via_direct_ip = false;
         self.mock_session = true;
         self.client_ip = mock_ip.to_string();
         self.selected_peer_name = host_label.to_string();
-        self.client_stream = None;
         self.client_current_path.clear();
         self.selected_file_idx = 0;
         self.file_scroll_offset = 0;
@@ -1163,6 +1200,20 @@ impl LanShareTui {
             return;
         }
 
+        if let Some(mut old_stream) = self.client_stream.take() {
+            self.tokio_rt.spawn(async move {
+                let _ = old_stream.shutdown().await;
+            });
+        }
+        self.client_connected = false;
+        self.client_connection_lost = false;
+        self.mock_session = false;
+        self.client_handshake = None;
+        self.client_current_path.clear();
+        self.client_file_list.clear();
+        self.selected_file_idx = 0;
+        self.file_scroll_offset = 0;
+
         let pwd = self.ring_secret.trim().to_string();
         let port = self.client_port;
         let tx = self.client_action_tx.clone();
@@ -1171,7 +1222,7 @@ impl LanShareTui {
         self.tokio_rt.spawn(async move {
             match client::connect_to_host(&ip, port, &pwd).await {
                 Ok((stream, resp)) => {
-                    let _ = tx.send(ClientActionResult::Connected(stream, resp, ip));
+                    let _ = tx.send(ClientActionResult::Connected(stream, resp, ip, port));
                 }
                 Err(e) => {
                     let _ = tx.send(ClientActionResult::ConnectFailed(e));
@@ -1208,6 +1259,10 @@ impl LanShareTui {
 
         if let Some(mut stream) = self.client_stream.take() {
             let tx = self.client_action_tx.clone();
+            self.client_current_path = target_path.clone();
+            self.client_file_list.clear();
+            self.selected_file_idx = 0;
+            self.file_scroll_offset = 0;
             self.client_loading = true;
 
             self.tokio_rt.spawn(async move {
@@ -1292,6 +1347,7 @@ impl LanShareTui {
         }
         self.active_progress = None;
         self.active_eta_stabilizer.reset();
+        self.total_eta_stabilizer.reset();
         let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.push_client_log(format!("[{}] Transfer cancelled by user.", ts));
         self.set_flash("Cancelled active transfer.");
@@ -1335,20 +1391,30 @@ impl LanShareTui {
             .map(|h| h.server_name.clone())
             .unwrap_or_else(|| self.client_ip.clone());
 
-        let total_bytes = if entry.is_dir { None } else { Some(entry.size) };
+        let total_bytes = if entry.is_dir {
+            if self.mock_session {
+                Some(mock_folder_total_bytes(&self.client_ip, &remote_subpath))
+            } else {
+                None
+            }
+        } else {
+            Some(entry.size)
+        };
+
+        let conn_ctx = ConnectionContext {
+            ip: self.client_ip.clone(),
+            port: self.client_port,
+            password: self.ring_secret.trim().to_string(),
+            peer_name: Some(peer_name.clone()),
+        };
 
         let item = QueuedDownloadItem {
             id,
             peer_name: peer_name.clone(),
-            conn_ctx: ConnectionContext {
-                ip: self.client_ip.clone(),
-                port: self.client_port,
-                password: self.ring_secret.trim().to_string(),
-                peer_name: Some(peer_name.clone()),
-            },
+            conn_ctx: conn_ctx.clone(),
             is_mock: self.mock_session,
             entry: entry.clone(),
-            remote_subpath,
+            remote_subpath: remote_subpath.clone(),
             local_dest_dir: self.client_dest_folder.clone(),
             status: QueueItemStatus::Pending,
             started_at: None,
@@ -1358,6 +1424,19 @@ impl LanShareTui {
         };
 
         self.download_queue.push_back(item);
+        self.total_eta_stabilizer.reset();
+
+        if entry.is_dir && !self.mock_session {
+            let tx = self.client_action_tx.clone();
+            self.tokio_rt.spawn(async move {
+                if let Some(total_bytes) =
+                    resolve_remote_folder_total_bytes(conn_ctx, remote_subpath).await
+                {
+                    let _ = tx.send(ClientActionResult::FolderSizeResolved { id, total_bytes });
+                }
+            });
+        }
+
         let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let kind = if entry.is_dir { "folder" } else { "file" };
         self.push_client_log(format!(
@@ -1389,7 +1468,10 @@ impl LanShareTui {
         }
         let len = self.discovered_peers.len();
         let next_idx = match self.discovered_peers.iter().position(|p| {
-            self.client_connected && !self.client_connection_lost && p.ip == self.client_ip
+            self.client_connected
+                && !self.client_connection_lost
+                && p.ip == self.client_ip
+                && p.port == self.client_port
         }) {
             Some(cur_idx) => {
                 if forward {
@@ -1696,7 +1778,8 @@ impl LanShareTui {
                                 return;
                             }
                             let trimmed = val.trim();
-                            if trimmed.parse::<std::net::IpAddr>().is_err()
+                            let (host, port) = parse_host_and_port(trimmed, DEFAULT_TCP_PORT);
+                            if host.parse::<std::net::IpAddr>().is_err()
                                 && !trimmed.starts_with("mock://")
                             {
                                 prompt.error = Some("Invalid IP address format.".to_string());
@@ -1704,8 +1787,8 @@ impl LanShareTui {
                                 return;
                             }
                             self.connected_via_direct_ip = true;
-                            self.client_ip = trimmed.to_string();
-                            self.client_port = DEFAULT_TCP_PORT;
+                            self.client_ip = host;
+                            self.client_port = port;
                             self.selected_peer_name = trimmed.to_string();
                             self.trigger_connect();
                         }
@@ -2216,6 +2299,7 @@ impl LanShareTui {
                         if *target_status == QueueItemStatus::Pending {
                             let tid = *target_id;
                             self.download_queue.retain(|i| i.id != tid);
+                            self.total_eta_stabilizer.reset();
                             self.set_flash(format!("Removed '{}' from queue.", target_name));
                             if self.selected_queue_idx >= self.download_queue.len()
                                 && !self.download_queue.is_empty()
@@ -2232,6 +2316,7 @@ impl LanShareTui {
                     .rposition(|i| i.status == QueueItemStatus::Pending)
                 {
                     if let Some(removed) = self.download_queue.remove(pos) {
+                        self.total_eta_stabilizer.reset();
                         self.set_flash(format!("Removed '{}' from queue.", removed.entry.name));
                     }
                 }
@@ -2429,32 +2514,47 @@ impl LanShareTui {
         };
         let b_len = buf.draw_text(0, 0, w, brand, Color::LightCyan, Color::DarkBlue, true);
 
-        let tab1 = " [1] Browse LAN ";
-        let tab2 = " [2] Share Folders ";
-        let t1_x = b_len + 1;
-        let t2_x = t1_x + tab1.len() + 1;
-        if self.current_tab == TuiTab::Client {
-            buf.draw_text(t1_x, 0, tab1.len(), tab1, Color::White, Color::Cyan, true);
-            buf.draw_text(
-                t2_x,
-                0,
-                tab2.len(),
-                tab2,
-                Color::Gray,
-                Color::DarkBlue,
-                false,
-            );
+        let active_dl_count = self
+            .download_queue
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.status,
+                    QueueItemStatus::Downloading | QueueItemStatus::Pending
+                )
+            })
+            .count();
+        let dl_count = if active_dl_count > 0 {
+            active_dl_count
+        } else if self.has_active_client_downloads() {
+            1
         } else {
-            buf.draw_text(
-                t1_x,
-                0,
-                tab1.len(),
-                tab1,
-                Color::Gray,
-                Color::DarkBlue,
-                false,
-            );
-            buf.draw_text(t2_x, 0, tab2.len(), tab2, Color::White, Color::Cyan, true);
+            0
+        };
+        let hosting_active = self.is_hosting_active();
+        let upload_count = self.active_server_downloads();
+        let tab1 = if dl_count > 0 {
+            format!(" [1] Browse LAN ● ↓{} ", dl_count)
+        } else {
+            " [1] Browse LAN ".to_string()
+        };
+        let tab2 = if upload_count > 0 {
+            format!(" [2] Share Folders ● ↑{} ", upload_count)
+        } else if hosting_active {
+            " [2] Share Folders ● ".to_string()
+        } else {
+            " [2] Share Folders ".to_string()
+        };
+        let tab1_w = UnicodeWidthStr::width(tab1.as_str());
+        let tab2_w = UnicodeWidthStr::width(tab2.as_str());
+        let t1_x = b_len + 1;
+        let t2_x = t1_x + tab1_w + 1;
+        if self.current_tab == TuiTab::Client {
+            buf.draw_text(t1_x, 0, tab1_w, &tab1, Color::White, Color::Cyan, true);
+            buf.draw_text(t2_x, 0, tab2_w, &tab2, Color::Gray, Color::DarkBlue, false);
+        } else {
+            buf.draw_text(t1_x, 0, tab1_w, &tab1, Color::Gray, Color::DarkBlue, false);
+            buf.draw_text(t2_x, 0, tab2_w, &tab2, Color::White, Color::Cyan, true);
         }
 
         let right_help = if w >= 124 {
@@ -2462,11 +2562,12 @@ impl LanShareTui {
         } else {
             "[?] About  [q] Quit "
         };
-        if w > t2_x + tab2.len() + right_help.len() {
+        let right_help_w = UnicodeWidthStr::width(right_help);
+        if w > t2_x + tab2_w + right_help_w {
             buf.draw_text(
-                w - right_help.len(),
+                w - right_help_w,
                 0,
-                right_help.len(),
+                right_help_w,
                 right_help,
                 Color::Yellow,
                 Color::DarkBlue,
@@ -2610,12 +2711,25 @@ impl LanShareTui {
             );
         } else {
             for (idx, p) in self.discovered_peers.iter().take(peer_rows).enumerate() {
-                let is_sel =
-                    self.client_connected && !self.client_connection_lost && self.client_ip == p.ip;
+                let is_sel = self.client_connected
+                    && !self.client_connection_lost
+                    && self.client_ip == p.ip
+                    && self.client_port == p.port;
                 let own_tag = if self.is_own_peer(p) {
                     " (This PC)"
                 } else {
                     ""
+                };
+                let has_duplicate_ip = self
+                    .discovered_peers
+                    .iter()
+                    .filter(|o| o.ip == p.ip)
+                    .count()
+                    > 1;
+                let addr_label = if has_duplicate_ip || p.port != DEFAULT_TCP_PORT {
+                    format!("{}:{}", p.ip, p.port)
+                } else {
+                    p.ip.clone()
                 };
                 let marker = if is_sel { "[*]" } else { "[ ]" };
                 let row_str = format!(
@@ -2624,7 +2738,7 @@ impl LanShareTui {
                     idx + 1,
                     p.host_name,
                     own_tag,
-                    p.ip
+                    addr_label
                 );
                 let fg = if is_sel {
                     Color::Green
@@ -2707,22 +2821,34 @@ impl LanShareTui {
             );
 
             if !has_browser_view {
-                let msg = if self.client_loading {
-                    "Connecting to LAN host..."
-                } else if !self.discovered_peers.is_empty() {
-                    "Press [p] (or ←/→) to select a computer above, [s] to Scan LAN, or [i] for Direct IP."
+                if self.client_loading {
+                    let spin_y = cur_y + (expanded_h / 2).max(1);
+                    let spin_x = x + (w / 2).saturating_sub(1);
+                    buf.draw_text(
+                        spin_x,
+                        spin_y,
+                        w.saturating_sub(4),
+                        current_tui_spinner_frame(),
+                        Color::Cyan,
+                        Color::Reset,
+                        true,
+                    );
                 } else {
-                    "Press [s] to Scan LAN or [i] to connect via Direct IP."
-                };
-                buf.draw_text(
-                    x + 2,
-                    cur_y + 1,
-                    w.saturating_sub(4),
-                    msg,
-                    Color::Yellow,
-                    Color::Reset,
-                    false,
-                );
+                    let msg = if !self.discovered_peers.is_empty() {
+                        "Press [p] (or ←/→) to select a computer above, [s] to Scan LAN, or [i] for Direct IP."
+                    } else {
+                        "Press [s] to Scan LAN or [i] to connect via Direct IP."
+                    };
+                    buf.draw_text(
+                        x + 2,
+                        cur_y + 1,
+                        w.saturating_sub(4),
+                        msg,
+                        Color::Yellow,
+                        Color::Reset,
+                        false,
+                    );
+                }
             } else {
                 let hdr_y = cur_y + 1;
                 let nav_info = if self.client_connection_lost {
@@ -2776,7 +2902,19 @@ impl LanShareTui {
                     self.file_scroll_offset = self.selected_file_idx + 1 - visible_rows;
                 }
 
-                if self.client_file_list.is_empty() {
+                if self.client_loading && self.client_file_list.is_empty() {
+                    let spin_y = list_start_y + visible_rows.saturating_sub(1) / 3;
+                    let spin_x = x + (w / 2).saturating_sub(1);
+                    buf.draw_text(
+                        spin_x,
+                        spin_y,
+                        w.saturating_sub(4),
+                        current_tui_spinner_frame(),
+                        Color::Cyan,
+                        Color::Reset,
+                        true,
+                    );
+                } else if self.client_file_list.is_empty() {
                     buf.draw_text(
                         x + 2,
                         list_start_y,
@@ -2904,71 +3042,20 @@ impl LanShareTui {
             .filter(|i| i.status == QueueItemStatus::Completed)
             .count();
 
-        let active_speed = self
-            .active_progress
-            .as_ref()
-            .map(|p| p.speed_mbps)
-            .filter(|&s| s > 0.0);
-        let active_remaining = self
-            .active_progress
-            .as_ref()
-            .map(|p| p.bytes_total.saturating_sub(p.bytes_done))
-            .unwrap_or(0);
-        let queued_pending_bytes: u64 = self
-            .download_queue
-            .iter()
-            .filter(|i| i.status == QueueItemStatus::Pending)
-            .map(|i| i.entry.size)
-            .sum();
-        let total_remaining_bytes = active_remaining + queued_pending_bytes;
-
-        let active_item = self
-            .download_queue
-            .iter()
-            .find(|i| i.status == QueueItemStatus::Downloading);
-        let active_elapsed = active_item.and_then(|i| i.started_at.map(|t| t.elapsed()));
-
-        let active_key = self.active_queue_id.map(|id| id.to_string()).or_else(|| {
-            self.active_progress
-                .as_ref()
-                .map(|p| p.selected_target.clone())
-        });
-
-        let raw_active_eta = if let Some(ref prog) = self.active_progress {
-            if prog.is_finished {
-                Some(0)
-            } else {
-                estimate_folder_remaining_seconds(
-                    active_remaining,
-                    prog.speed_mbps,
-                    prog.current_file,
-                    prog.total_files,
-                    active_elapsed,
-                )
-            }
-        } else {
-            active_speed.and_then(|spd| estimate_remaining_seconds(active_remaining, spd))
-        };
-        let active_eta = self
-            .active_eta_stabilizer
-            .update(active_key.as_deref(), raw_active_eta);
-
-        let raw_total_eta = match (active_eta, active_speed) {
-            (Some(act_s), Some(spd)) if queued_pending_bytes > 0 => {
-                let pending_secs =
-                    estimate_remaining_seconds(queued_pending_bytes, spd).unwrap_or(0);
-                Some(act_s + pending_secs)
-            }
-            (Some(act_s), _) => Some(act_s),
-            (None, Some(spd)) => estimate_remaining_seconds(total_remaining_bytes, spd),
-            _ => None,
-        };
-        let total_key = if active_key.is_some() || queued_pending_bytes > 0 {
-            Some("total_queue")
-        } else {
-            None
-        };
-        let total_eta = self.total_eta_stabilizer.update(total_key, raw_total_eta);
+        let QueueEtaSummary {
+            active_remaining,
+            total_remaining_bytes,
+            active_speed,
+            active_eta,
+            total_eta,
+            ..
+        } = compute_queue_etas(
+            &self.download_queue,
+            self.active_queue_id,
+            self.active_progress.as_ref(),
+            &mut self.active_eta_stabilizer,
+            &mut self.total_eta_stabilizer,
+        );
 
         if self.client_section == ClientSection::Downloads {
             self.last_downloads_header_y = Some(cur_y);
@@ -3137,25 +3224,31 @@ impl LanShareTui {
                             String::new()
                         }
                         QueueItemStatus::Pending => {
-                            if item.entry.is_dir {
-                                " — Folder".to_string()
-                            } else if item.entry.size > 0 {
-                                let sz_str = format_file_size(item.entry.size);
+                            let item_bytes = item.total_bytes.unwrap_or(item.entry.size);
+                            if item_bytes > 0 {
+                                let sz_str = format_file_size(item_bytes);
+                                let prefix = if item.entry.is_dir {
+                                    format!("Folder ({})", sz_str)
+                                } else {
+                                    sz_str
+                                };
                                 if let Some(spd) = active_speed {
                                     if let Some(item_s) =
-                                        estimate_remaining_seconds(item.entry.size, spd)
+                                        estimate_remaining_seconds(item_bytes, spd)
                                     {
                                         format!(
                                             " — {} (ETA: {})",
-                                            sz_str,
+                                            prefix,
                                             format_remaining_time(item_s)
                                         )
                                     } else {
-                                        format!(" — {}", sz_str)
+                                        format!(" — {}", prefix)
                                     }
                                 } else {
-                                    format!(" — {}", sz_str)
+                                    format!(" — {}", prefix)
                                 }
+                            } else if item.entry.is_dir {
+                                " — Folder (sizing...)".to_string()
                             } else {
                                 String::new()
                             }
@@ -3468,15 +3561,30 @@ impl LanShareTui {
         let expanded_h = body_h.saturating_sub(collapsed_h).max(4);
         let log_full_path = clean_display_path(&crate::core::get_log_file_path());
 
+        let active_uploads = self
+            .server_handle
+            .as_ref()
+            .map(|h| h.active_uploads_snapshot())
+            .unwrap_or_default();
+
         if !self.show_server_logs {
-            // 1. Folders expanded
+            // 1. Folders expanded (always paired with Uploads section when height allows)
+            let uploads_box_h = if !active_uploads.is_empty() && expanded_h >= 7 {
+                (active_uploads.len() * 2 + 2).min(expanded_h / 2).max(4)
+            } else if expanded_h >= 8 {
+                3
+            } else {
+                0
+            };
+            let folders_box_h = expanded_h.saturating_sub(uploads_box_h);
+
             self.last_host_folders_header_range =
-                Some((folders_y, folders_y + expanded_h.saturating_sub(1)));
+                Some((folders_y, folders_y + folders_box_h.saturating_sub(1)));
             buf.draw_box(
                 x,
                 folders_y,
                 w,
-                expanded_h,
+                folders_box_h,
                 "▼ Folders to Share on LAN ([a] Add Folder  [Del/d] Remove  [C] Clear All)",
                 Color::Cyan,
                 Color::Reset,
@@ -3493,7 +3601,7 @@ impl LanShareTui {
                     false,
                 );
             } else {
-                let max_rows = expanded_h.saturating_sub(2);
+                let max_rows = folders_box_h.saturating_sub(2);
                 for (idx, folder) in self.host_folders.iter().take(max_rows).enumerate() {
                     let is_sel = idx == self.selected_host_folder_idx;
                     let (fg, bg) = if is_sel {
@@ -3503,8 +3611,96 @@ impl LanShareTui {
                     };
                     let row_y = folders_y + 1 + idx;
                     buf.fill_rect(x + 1, row_y, w.saturating_sub(2), 1, fg, bg);
-                    let label = format!("  {}. {}", idx + 1, clean_display_path(folder));
+                    let clean_folder = clean_path(
+                        &std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone()),
+                    );
+                    let up_cnt = active_uploads
+                        .iter()
+                        .filter(|u| {
+                            clean_path(
+                                &std::fs::canonicalize(&u.folder_root)
+                                    .unwrap_or_else(|_| u.folder_root.clone()),
+                            ) == clean_folder
+                        })
+                        .count();
+                    let suffix = if up_cnt > 0 {
+                        format!("  [↑ {} uploading]", up_cnt)
+                    } else {
+                        String::new()
+                    };
+                    let label = format!("  {}. {}{}", idx + 1, clean_display_path(folder), suffix);
                     buf.draw_text(x + 2, row_y, w.saturating_sub(4), &label, fg, bg, is_sel);
+                }
+            }
+
+            if uploads_box_h > 0 {
+                let uy = folders_y + folders_box_h;
+                let utitle = format!("Uploads — Active: {}", active_uploads.len());
+                buf.draw_box(x, uy, w, uploads_box_h, &utitle, Color::Green, Color::Reset);
+                let inner_h = uploads_box_h.saturating_sub(2);
+                if active_uploads.is_empty() && inner_h > 0 {
+                    buf.draw_text(
+                        x + 2,
+                        uy + 1,
+                        w.saturating_sub(4),
+                        "No active uploads.",
+                        Color::DarkGray,
+                        Color::Reset,
+                        false,
+                    );
+                }
+                let mut row_off = 0usize;
+                for upload in &active_uploads {
+                    if row_off >= inner_h {
+                        break;
+                    }
+                    let pct = if upload.total_size > 0 {
+                        (upload.bytes_sent as f64 / upload.total_size as f64).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let rem_bytes = upload.total_size.saturating_sub(upload.bytes_sent);
+                    let eta_str = if upload.bytes_sent >= upload.total_size && upload.total_size > 0
+                    {
+                        "0s".to_string()
+                    } else if let Some(s) = estimate_remaining_seconds(rem_bytes, upload.speed_mbps)
+                    {
+                        format_remaining_time(s)
+                    } else {
+                        "--".to_string()
+                    };
+                    let line = format!(
+                        "↑ {} -> {} | {:.1} MB/s | ETA: {} | {} / {}",
+                        upload.file_name,
+                        upload.peer,
+                        upload.speed_mbps,
+                        eta_str,
+                        format_file_size(upload.bytes_sent),
+                        format_file_size(upload.total_size),
+                    );
+                    buf.draw_text(
+                        x + 2,
+                        uy + 1 + row_off,
+                        w.saturating_sub(4),
+                        &line,
+                        Color::White,
+                        Color::Reset,
+                        false,
+                    );
+                    row_off += 1;
+                    if row_off < inner_h {
+                        let gauge_label = format!("{:.0}%", pct * 100.0);
+                        buf.draw_gauge(
+                            x + 2,
+                            uy + 1 + row_off,
+                            w.saturating_sub(4),
+                            pct as f32,
+                            &gauge_label,
+                            Color::Green,
+                            Color::Reset,
+                        );
+                        row_off += 1;
+                    }
                 }
             }
 
@@ -4868,6 +5064,7 @@ mod tests {
             active_folder_downloads: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         };
         tui.server_handle = Some(handle);
@@ -4992,6 +5189,7 @@ mod tests {
             active_folder_downloads: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         };
         tui.server_handle = Some(handle);
@@ -5569,5 +5767,231 @@ mod tests {
             err_pos < remote_pos,
             "connection error must appear inside Computers on LAN above Remote Files"
         );
+    }
+
+    #[test]
+    fn test_tui_active_uploads_nav_badges_and_large_gb_formatting() {
+        use crate::server::SharedFolderRegistry;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+
+        let mut tui = LanShareTui::new(true, Some("party-ring-42".to_string()), Vec::new(), false);
+        tui.secret_confirmed = true;
+        tui.current_tab = TuiTab::Host;
+
+        let folder = std::env::temp_dir().join("lanshare_tui_upload_test_dir");
+        let _ = std::fs::create_dir_all(&folder);
+        tui.host_folders = vec![folder.clone()];
+
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+        let (log_tx, _log_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_downloads = Arc::new(AtomicUsize::new(1));
+        let active_uploads = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        // 1.50 GiB sent of 2.00 GiB total (distinct decimal GB values, not "2 GB / 2 GB")
+        let sent_bytes: u64 = 1610612736;
+        let total_bytes: u64 = 2147483648;
+        active_uploads.write().unwrap().insert(
+            1,
+            crate::server::ActiveUploadInfo {
+                id: 1,
+                peer: "192.168.1.77".to_string(),
+                folder_root: folder.clone(),
+                file_name: "backup.tar".to_string(),
+                bytes_sent: sent_bytes,
+                total_size: total_bytes,
+                speed_mbps: 100.0,
+                started_at: Instant::now(),
+            },
+        );
+        tui.server_handle = Some(ServerHandle {
+            is_running: Arc::new(AtomicBool::new(true)),
+            local_ip: "192.168.1.10".to_string(),
+            all_ips: vec!["192.168.1.10".to_string()],
+            port: 4433,
+            password: "party-ring-42".to_string(),
+            stop_sender: stop_tx,
+            shared_folders: Arc::new(std::sync::RwLock::new(vec![folder.clone()])),
+            duration_hours: None,
+            registry: Arc::new(std::sync::RwLock::new(SharedFolderRegistry::new(vec![
+                folder.clone(),
+            ]))),
+            log_tx,
+            active_downloads,
+            active_folder_downloads: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            active_uploads,
+            registry_notify_tx: tokio::sync::watch::channel(0u64).0,
+        });
+
+        // Also add an active client download to exercise both tab indicators
+        tui.download_queue.push_back(QueuedDownloadItem {
+            id: 10,
+            peer_name: "Peer-1".to_string(),
+            conn_ctx: ConnectionContext {
+                ip: "192.168.1.20".to_string(),
+                port: 4433,
+                password: "party-ring-42".to_string(),
+                peer_name: Some("Peer-1".to_string()),
+            },
+            is_mock: true,
+            entry: FileEntry {
+                name: "vm.img".to_string(),
+                is_dir: false,
+                size: 1_500_000_000,
+                modified_timestamp: 0,
+            },
+            remote_subpath: "vm.img".to_string(),
+            local_dest_dir: folder.clone(),
+            status: QueueItemStatus::Downloading,
+            started_at: Some(Instant::now() - Duration::from_secs(4)),
+            elapsed_duration: None,
+            completed_at: None,
+            total_bytes: Some(1_500_000_000),
+        });
+        tui.active_queue_id = Some(10);
+        tui.active_progress = Some(TransferProgress {
+            selected_target: "vm.img".to_string(),
+            file_name: "vm.img".to_string(),
+            bytes_done: 1_000_000_000,
+            bytes_total: 1_500_000_000,
+            speed_mbps: 10.0,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+            is_finished: false,
+        });
+
+        let mut buf = ScreenBuffer::new(120, 30);
+        tui.render(&mut buf);
+        let host_text = buf.to_plain_text();
+        assert!(host_text.contains("[1] Browse LAN ● ↓1"));
+        assert!(host_text.contains("[2] Share Folders ● ↑1"));
+        assert!(host_text.contains("[↑ 1 uploading]"));
+        assert!(host_text.contains("Uploads — Active: 1"));
+        assert!(host_text.contains("backup.tar"));
+        assert!(host_text.contains("1.50 GB / 2.00 GB"));
+
+        // Switch to Client Downloads panel and verify Total ETA consistency & immediate enqueue update
+        tui.current_tab = TuiTab::Client;
+        tui.client_section = ClientSection::Downloads;
+        let mut cbuf1 = ScreenBuffer::new(120, 30);
+        tui.render(&mut cbuf1);
+        let ctext1 = cbuf1.to_plain_text();
+        let active_eta_val = ctext1
+            .split("ETA:")
+            .nth(1)
+            .and_then(|s| s.split(['—', '|', '\n']).next())
+            .map(|s| s.trim().to_string())
+            .expect("Active ETA should render");
+        assert!(!active_eta_val.is_empty());
+        let total_eta_line_1 = ctext1
+            .lines()
+            .find(|l| l.contains("Total ETA:"))
+            .expect("Total ETA should render")
+            .to_string();
+        assert!(
+            total_eta_line_1.contains(&format!("Total ETA: {}", active_eta_val)),
+            "Total ETA ({}) should match active ETA ({})",
+            total_eta_line_1,
+            active_eta_val
+        );
+
+        tui.enqueue_download(FileEntry {
+            name: "extra_pack.bin".to_string(),
+            is_dir: false,
+            size: 100_000_000,
+            modified_timestamp: 0,
+        });
+        let mut cbuf2 = ScreenBuffer::new(120, 30);
+        tui.render(&mut cbuf2);
+        let ctext2 = cbuf2.to_plain_text();
+        let total_eta_line_2 = ctext2
+            .lines()
+            .find(|l| l.contains("Total ETA:"))
+            .expect("Updated Total ETA should render")
+            .to_string();
+        assert_ne!(
+            total_eta_line_1, total_eta_line_2,
+            "Total ETA must update immediately after enqueue"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn test_tui_host_switch_and_folder_loading_clear_list_and_show_populating() {
+        let mut tui = LanShareTui::new(true, Some("party-ring-42".to_string()), Vec::new(), false);
+        tui.secret_confirmed = true;
+
+        // Seed previous host session and files
+        tui.client_connected = true;
+        tui.client_ip = "192.168.1.10".to_string();
+        tui.client_port = 4433;
+        tui.selected_peer_name = "Old-Host".to_string();
+        tui.client_current_path = "OldDir/Nested".to_string();
+        tui.client_file_list = vec![FileEntry {
+            name: "stale_prev_host.bin".to_string(),
+            is_dir: false,
+            size: 2048,
+            modified_timestamp: 0,
+        }];
+
+        // Switching to a new host clears stale host files immediately and renders a loading spinner icon
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+        tui.discovered_peers = vec![
+            DiscoveredPeer {
+                host_name: "Old-Host".to_string(),
+                ip: "192.168.1.10".to_string(),
+                port: 4433,
+                last_seen: Instant::now(),
+            },
+            DiscoveredPeer {
+                host_name: "New-Host".to_string(),
+                ip: "127.0.0.1".to_string(),
+                port: busy_port,
+                last_seen: Instant::now(),
+            },
+        ];
+        tui.cycle_peer(true);
+        assert!(tui.client_loading);
+        assert!(!tui.client_connected);
+        assert!(tui.client_current_path.is_empty());
+        assert!(tui.client_file_list.is_empty());
+
+        let mut buf1 = ScreenBuffer::new(120, 30);
+        tui.render(&mut buf1);
+        let text1 = buf1.to_plain_text();
+        assert!(TUI_SPINNER_FRAMES.iter().any(|f| text1.contains(f)));
+        assert!(!text1.contains("Populating list"));
+        assert!(!text1.contains("stale_prev_host.bin"));
+
+        // Navigating/refreshing while connected also renders the spinner animation rather than "(This folder is empty)"
+        tui.client_connected = true;
+        tui.client_loading = true;
+        tui.client_current_path = "Docs".to_string();
+        tui.client_file_list.clear();
+        let mut buf2 = ScreenBuffer::new(120, 30);
+        tui.render(&mut buf2);
+        let text2 = buf2.to_plain_text();
+        assert!(TUI_SPINNER_FRAMES.iter().any(|f| text2.contains(f)));
+        assert!(!text2.contains("Populating list"));
+        assert!(!text2.contains("(This folder is empty)"));
+        drop(listener);
+    }
+
+    #[test]
+    fn test_tui_host_uploads_section_always_visible_when_idle() {
+        let mut tui = LanShareTui::new(true, Some("party-ring-42".to_string()), Vec::new(), false);
+        tui.secret_confirmed = true;
+        tui.current_tab = TuiTab::Host;
+        tui.show_server_logs = false;
+
+        let mut buf = ScreenBuffer::new(120, 30);
+        tui.render(&mut buf);
+        let plain = buf.to_plain_text();
+        assert!(plain.contains("Uploads — Active: 0"), "{}", plain);
+        assert!(plain.contains("No active uploads."), "{}", plain);
     }
 }

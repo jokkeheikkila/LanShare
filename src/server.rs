@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::fs::File;
@@ -65,6 +65,20 @@ pub struct ServerLogEvent {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveUploadInfo {
+    pub id: u64,
+    pub peer: String,
+    pub folder_root: PathBuf,
+    pub file_name: String,
+    pub bytes_sent: u64,
+    pub total_size: u64,
+    pub speed_mbps: f32,
+    pub started_at: Instant,
+}
+
+static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct ServerHandle {
     pub is_running: Arc<AtomicBool>,
     pub local_ip: String,
@@ -78,30 +92,66 @@ pub struct ServerHandle {
     pub log_tx: UnboundedSender<ServerLogEvent>,
     pub active_downloads: Arc<AtomicUsize>,
     pub active_folder_downloads: Arc<std::sync::RwLock<HashMap<PathBuf, usize>>>,
+    pub active_uploads: Arc<std::sync::RwLock<HashMap<u64, ActiveUploadInfo>>>,
     pub registry_notify_tx: tokio::sync::watch::Sender<u64>,
 }
 
-struct ActiveDownloadGuard {
+pub struct ActiveDownloadGuard {
+    id: u64,
     total: Arc<AtomicUsize>,
     by_folder: Arc<std::sync::RwLock<HashMap<PathBuf, usize>>>,
+    uploads: Arc<std::sync::RwLock<HashMap<u64, ActiveUploadInfo>>>,
     root: PathBuf,
 }
 
 impl ActiveDownloadGuard {
-    fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
         total: Arc<AtomicUsize>,
         by_folder: Arc<std::sync::RwLock<HashMap<PathBuf, usize>>>,
+        uploads: Arc<std::sync::RwLock<HashMap<u64, ActiveUploadInfo>>>,
         root: PathBuf,
+        peer: String,
+        file_name: String,
+        bytes_sent: u64,
+        total_size: u64,
     ) -> Self {
+        let id = NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed);
         total.fetch_add(1, Ordering::SeqCst);
         {
             let mut map = rw_write(&by_folder);
             *map.entry(root.clone()).or_insert(0) += 1;
         }
+        {
+            let mut map = rw_write(&uploads);
+            map.insert(
+                id,
+                ActiveUploadInfo {
+                    id,
+                    peer,
+                    folder_root: root.clone(),
+                    file_name,
+                    bytes_sent,
+                    total_size,
+                    speed_mbps: 0.0,
+                    started_at: Instant::now(),
+                },
+            );
+        }
         Self {
+            id,
             total,
             by_folder,
+            uploads,
             root,
+        }
+    }
+
+    pub fn update_progress(&self, bytes_sent: u64, speed_mbps: f32) {
+        let mut map = rw_write(&self.uploads);
+        if let Some(info) = map.get_mut(&self.id) {
+            info.bytes_sent = bytes_sent;
+            info.speed_mbps = speed_mbps;
         }
     }
 }
@@ -109,14 +159,18 @@ impl ActiveDownloadGuard {
 impl Drop for ActiveDownloadGuard {
     fn drop(&mut self) {
         self.total.fetch_sub(1, Ordering::SeqCst);
-        let mut map = rw_write(&self.by_folder);
-        if let Some(count) = map.get_mut(&self.root) {
-            if *count <= 1 {
-                map.remove(&self.root);
-            } else {
-                *count -= 1;
+        {
+            let mut map = rw_write(&self.by_folder);
+            if let Some(count) = map.get_mut(&self.root) {
+                if *count <= 1 {
+                    map.remove(&self.root);
+                } else {
+                    *count -= 1;
+                }
             }
         }
+        let mut uploads = rw_write(&self.uploads);
+        uploads.remove(&self.id);
     }
 }
 
@@ -170,6 +224,14 @@ impl ServerHandle {
             return count;
         }
         map.get(folder).copied().unwrap_or(0)
+    }
+
+    /// Returns a snapshot of currently active peer uploads sorted by start order.
+    pub fn active_uploads_snapshot(&self) -> Vec<ActiveUploadInfo> {
+        let map = rw_read(&self.active_uploads);
+        let mut list: Vec<ActiveUploadInfo> = map.values().cloned().collect();
+        list.sort_by_key(|u| u.id);
+        list
     }
 }
 
@@ -304,6 +366,9 @@ pub async fn start_server(
     let active_downloads = Arc::new(AtomicUsize::new(0));
     let active_folder_downloads =
         Arc::new(std::sync::RwLock::new(HashMap::<PathBuf, usize>::new()));
+    let active_uploads = Arc::new(std::sync::RwLock::new(
+        HashMap::<u64, ActiveUploadInfo>::new(),
+    ));
 
     // Spawn multi-adapter UDP Discovery Beacon + Active Probe / Reverse-TCP Control task
     let (control_tx, mut control_rx) =
@@ -324,6 +389,7 @@ pub async fn start_server(
     let udp_registry_rx = registry_notify_rx.clone();
     let udp_active_downloads = active_downloads.clone();
     let udp_active_folder_downloads = active_folder_downloads.clone();
+    let udp_active_uploads = active_uploads.clone();
 
     tokio::spawn(async move {
         let mut seen_rev_nonces: VecDeque<[u8; 16]> = VecDeque::with_capacity(32);
@@ -338,14 +404,22 @@ pub async fn start_server(
                         let bindings = crate::network::get_broadcast_bindings(DEFAULT_UDP_PORT);
                         for binding in &bindings {
                             for target in &binding.targets {
-                                svc.send_to(&beacon_bytes, *target);
+                                svc.send_from_control(&beacon_bytes, *target);
                             }
                         }
                         for peer_ip in svc.recent_peer_ips(Duration::from_secs(60)) {
-                            svc.send_to(&beacon_bytes, SocketAddr::new(peer_ip, DEFAULT_UDP_PORT));
+                            svc.send_from_control(
+                                &beacon_bytes,
+                                SocketAddr::new(peer_ip, DEFAULT_UDP_PORT),
+                            );
+                        }
+                        for peer_addr in svc.recent_peer_addrs(Duration::from_secs(60)) {
+                            if peer_addr.port() != DEFAULT_UDP_PORT {
+                                svc.send_from_control(&beacon_bytes, peer_addr);
+                            }
                         }
                         for arp_ip in crate::network::get_lan_arp_neighbors() {
-                            svc.send_to(
+                            svc.send_from_control(
                                 &beacon_bytes,
                                 SocketAddr::new(arp_ip.into(), DEFAULT_UDP_PORT),
                             );
@@ -372,11 +446,14 @@ pub async fn start_server(
                                     &beacon_secret,
                                 );
                                 if let Some(svc) = crate::discovery::service() {
-                                    svc.record_authenticated_peer_ip(src.ip());
+                                    svc.record_authenticated_peer_addr(src);
                                     if let Ok(reply_bytes) = serde_json::to_vec(&reply) {
-                                        svc.send_to(&reply_bytes, src);
+                                        svc.send_from_control(&reply_bytes, src);
                                         if src.port() != DEFAULT_UDP_PORT {
-                                            svc.send_to(&reply_bytes, SocketAddr::new(src.ip(), DEFAULT_UDP_PORT));
+                                            svc.send_from_control(
+                                                &reply_bytes,
+                                                SocketAddr::new(src.ip(), DEFAULT_UDP_PORT),
+                                            );
                                         }
                                     }
                                 }
@@ -402,7 +479,7 @@ pub async fn start_server(
                             }
 
                             if let Some(svc) = crate::discovery::service() {
-                                svc.record_authenticated_peer_ip(peer_ip);
+                                svc.record_authenticated_peer_addr(src);
                             }
 
                             // Deduplicate retries of the same ReverseConnectRequest nonce
@@ -428,6 +505,7 @@ pub async fn start_server(
                             let r_rx = udp_registry_rx.clone();
                             let act_dl = udp_active_downloads.clone();
                             let act_folder_dl = udp_active_folder_downloads.clone();
+                            let act_uploads = udp_active_uploads.clone();
 
                             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                             let _ = l_tx.send(ServerLogEvent {
@@ -456,6 +534,7 @@ pub async fn start_server(
                                             r_rx,
                                             act_dl,
                                             act_folder_dl,
+                                            act_uploads,
                                             permit,
                                         )
                                         .await;
@@ -496,6 +575,7 @@ pub async fn start_server(
     let loop_registry = registry.clone();
     let loop_active_downloads = active_downloads.clone();
     let loop_active_folder_downloads = active_folder_downloads.clone();
+    let loop_active_uploads = active_uploads.clone();
     let loop_registry_notify_rx = registry_notify_rx.clone();
 
     tokio::spawn(async move {
@@ -598,6 +678,7 @@ pub async fn start_server(
                         let client_registry_rx = loop_registry_notify_rx.clone();
                         let client_active_downloads = loop_active_downloads.clone();
                         let client_active_folder_downloads = loop_active_folder_downloads.clone();
+                        let client_active_uploads = loop_active_uploads.clone();
 
                         tokio::spawn(async move {
                             run_client_session(
@@ -612,6 +693,7 @@ pub async fn start_server(
                                 client_registry_rx,
                                 client_active_downloads,
                                 client_active_folder_downloads,
+                                client_active_uploads,
                                 permit,
                             )
                             .await;
@@ -640,6 +722,7 @@ pub async fn start_server(
         log_tx,
         active_downloads,
         active_folder_downloads,
+        active_uploads,
         registry_notify_tx,
     })
 }
@@ -657,6 +740,7 @@ async fn run_client_session(
     client_registry_rx: tokio::sync::watch::Receiver<u64>,
     active_downloads: Arc<AtomicUsize>,
     active_folder_downloads: Arc<std::sync::RwLock<HashMap<PathBuf, usize>>>,
+    active_uploads: Arc<std::sync::RwLock<HashMap<u64, ActiveUploadInfo>>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let peer_ip = peer_addr.ip();
@@ -780,6 +864,7 @@ async fn run_client_session(
         client_registry_rx,
         &active_downloads,
         &active_folder_downloads,
+        &active_uploads,
     )
     .await;
 
@@ -796,6 +881,7 @@ async fn handle_client_commands<S>(
     mut registry_rx: tokio::sync::watch::Receiver<u64>,
     active_downloads: &Arc<AtomicUsize>,
     active_folder_downloads: &Arc<std::sync::RwLock<HashMap<PathBuf, usize>>>,
+    active_uploads: &Arc<std::sync::RwLock<HashMap<u64, ActiveUploadInfo>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -1075,7 +1161,12 @@ where
                         let _download_guard = ActiveDownloadGuard::new(
                             active_downloads.clone(),
                             active_folder_downloads.clone(),
+                            active_uploads.clone(),
                             shared_root.clone(),
+                            peer_addr.ip().to_string(),
+                            file_name.clone(),
+                            start_offset,
+                            total_size,
                         );
 
                         if start_offset > 0 {
@@ -1109,6 +1200,10 @@ where
                         let mut buffer = vec![0u8; 64 * 1024];
                         let mut remaining = remaining_size;
                         let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+                        let mut last_progress_update = Instant::now();
+                        let mut last_sample_time = Instant::now();
+                        let mut last_sample_bytes = 0u64;
+                        let mut smoothed_speed_mbps = 0.0f32;
 
                         while remaining > 0 {
                             if *shutdown_rx.borrow() {
@@ -1192,6 +1287,43 @@ where
                                             Ok(Ok(w)) => {
                                                 written += w;
                                                 remaining -= w as u64;
+                                                if remaining == 0
+                                                    || last_progress_update.elapsed()
+                                                        >= Duration::from_millis(100)
+                                                {
+                                                    let sent_now = total_size - remaining;
+                                                    let session_sent =
+                                                        sent_now.saturating_sub(start_offset);
+                                                    let dt =
+                                                        last_sample_time.elapsed().as_secs_f64();
+                                                    if dt >= 0.2 {
+                                                        let delta_bytes = session_sent
+                                                            .saturating_sub(last_sample_bytes);
+                                                        let inst_mbps = (delta_bytes as f64
+                                                            / (1024.0 * 1024.0 * dt))
+                                                            as f32;
+                                                        smoothed_speed_mbps =
+                                                            if smoothed_speed_mbps <= 0.0 {
+                                                                inst_mbps
+                                                            } else {
+                                                                smoothed_speed_mbps * 0.5
+                                                                    + inst_mbps * 0.5
+                                                            };
+                                                        last_sample_bytes = session_sent;
+                                                        last_sample_time = Instant::now();
+                                                    } else if smoothed_speed_mbps <= 0.0
+                                                        && dt >= 0.05
+                                                    {
+                                                        smoothed_speed_mbps = (session_sent as f64
+                                                            / (1024.0 * 1024.0 * dt))
+                                                            as f32;
+                                                    }
+                                                    _download_guard.update_progress(
+                                                        sent_now,
+                                                        smoothed_speed_mbps,
+                                                    );
+                                                    last_progress_update = Instant::now();
+                                                }
                                             }
                                         }
                                     }
@@ -1300,16 +1432,35 @@ mod tests {
     fn test_server_active_downloads_guard() {
         let counter = Arc::new(AtomicUsize::new(0));
         let by_folder = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let uploads = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let folder_a = PathBuf::from("/tmp/share_a");
         let folder_b = PathBuf::from("/tmp/share_b");
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         {
-            let _guard_a =
-                ActiveDownloadGuard::new(counter.clone(), by_folder.clone(), folder_a.clone());
-            let _guard_b =
-                ActiveDownloadGuard::new(counter.clone(), by_folder.clone(), folder_b.clone());
+            let guard_a = ActiveDownloadGuard::new(
+                counter.clone(),
+                by_folder.clone(),
+                uploads.clone(),
+                folder_a.clone(),
+                "192.168.1.50".to_string(),
+                "movie.mkv".to_string(),
+                0,
+                1000,
+            );
+            let _guard_b = ActiveDownloadGuard::new(
+                counter.clone(),
+                by_folder.clone(),
+                uploads.clone(),
+                folder_b.clone(),
+                "192.168.1.51".to_string(),
+                "archive.zip".to_string(),
+                0,
+                2000,
+            );
+            guard_a.update_progress(500, 12.5);
             assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(uploads.read().unwrap().len(), 2);
             assert_eq!(
                 by_folder
                     .read()
@@ -1332,6 +1483,7 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(by_folder.read().unwrap().is_empty());
+        assert!(uploads.read().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1364,6 +1516,7 @@ mod tests {
         ])));
         let active_downloads = Arc::new(AtomicUsize::new(0));
         let active_folder_downloads = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let active_uploads = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (registry_notify_tx, registry_notify_rx) = tokio::sync::watch::channel(0u64);
 
@@ -1380,6 +1533,7 @@ mod tests {
             log_tx,
             active_downloads: active_downloads.clone(),
             active_folder_downloads: active_folder_downloads.clone(),
+            active_uploads: active_uploads.clone(),
             registry_notify_tx,
         };
 
@@ -1392,6 +1546,7 @@ mod tests {
         let r_rx_a = registry_notify_rx.clone();
         let act_a = active_downloads.clone();
         let folder_act_a = active_folder_downloads.clone();
+        let uploads_a = active_uploads.clone();
         let srv_a_task = tokio::spawn(async move {
             let noop = |_: String, _: bool| {};
             let _ = handle_client_commands(
@@ -1403,6 +1558,7 @@ mod tests {
                 r_rx_a,
                 &act_a,
                 &folder_act_a,
+                &uploads_a,
             )
             .await;
         });
@@ -1426,6 +1582,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(handle.active_downloads_for_folder(&dir_a), 1);
         assert_eq!(handle.active_downloads_for_folder(&dir_b), 0);
+        let uploads_snap = handle.active_uploads_snapshot();
+        assert_eq!(uploads_snap.len(), 1);
+        assert_eq!(uploads_snap[0].file_name, "big_a.bin");
+        assert_eq!(uploads_snap[0].peer, "127.0.0.1");
 
         // Remove folder A while B stays shared
         handle.update_shared_folders(vec![dir_b.clone()]).unwrap();
@@ -1451,6 +1611,7 @@ mod tests {
         let r_rx_b = registry_notify_rx.clone();
         let act_b = active_downloads.clone();
         let folder_act_b = active_folder_downloads.clone();
+        let uploads_b = active_uploads.clone();
         let srv_b_task = tokio::spawn(async move {
             let noop = |_: String, _: bool| {};
             let _ = handle_client_commands(
@@ -1462,6 +1623,7 @@ mod tests {
                 r_rx_b,
                 &act_b,
                 &folder_act_b,
+                &uploads_b,
             )
             .await;
         });

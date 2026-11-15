@@ -107,6 +107,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport,
+        centered: true,
         ..Default::default()
     };
 

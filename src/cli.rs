@@ -11,7 +11,7 @@ use crate::server::{self, ServerLogEvent};
 use chrono::{Local, TimeZone};
 use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -765,6 +765,29 @@ fn resolve_remote_entry_mock(
     ))
 }
 
+/// Validates local `--dest` directory and remote path syntax for `download`.
+pub fn validate_cli_download_inputs(
+    dest_dir: Option<&Path>,
+    remote_paths: &[String],
+    test_mode: bool,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if remote_paths.is_empty() {
+        return Err("At least one remote file or folder path is required.".to_string());
+    }
+    let mut validated_paths = Vec::with_capacity(remote_paths.len());
+    for raw in remote_paths {
+        validated_paths.push(validate_remote_cli_path(raw, false)?);
+    }
+
+    let resolved_dest = match dest_dir {
+        Some(d) => d.to_path_buf(),
+        None if test_mode => test_downloads_dir(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    ensure_safe_client_dir(&resolved_dest)?;
+    Ok((resolved_dest, validated_paths))
+}
+
 /// Runs the `download` / `get` CLI command: resolves all requested remote files/folders on the peer,
 /// downloads them sequentially to `dest_dir` while printing live logs to `out`, and finishes.
 pub async fn run_cli_download<W: Write>(
@@ -778,20 +801,8 @@ pub async fn run_cli_download<W: Write>(
 ) -> Result<(), String> {
     install_signal_handlers();
 
-    if remote_paths.is_empty() {
-        return Err("At least one remote file or folder path is required.".to_string());
-    }
-    let mut validated_paths = Vec::with_capacity(remote_paths.len());
-    for raw in remote_paths {
-        validated_paths.push(validate_remote_cli_path(raw, false)?);
-    }
-
-    let resolved_dest = match dest_dir {
-        Some(d) => d,
-        None if test_mode => test_downloads_dir(),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
-    ensure_safe_client_dir(&resolved_dest)?;
+    let (resolved_dest, validated_paths) =
+        validate_cli_download_inputs(dest_dir.as_deref(), remote_paths, test_mode)?;
 
     let target = resolve_peer_target(peer_arg, port, secret, test_mode, out).await?;
 
@@ -1019,17 +1030,8 @@ fn log_transfer_progress<W: Write>(
     }
 }
 
-/// Runs the `host` / `share` CLI command in the foreground, printing all server logs directly
-/// to `out` until interrupted (or until `max_duration` elapses in tests).
-pub async fn run_cli_host<W: Write>(
-    secret: &str,
-    folders: &[PathBuf],
-    test_mode: bool,
-    max_duration: Option<Duration>,
-    out: &mut W,
-) -> Result<(), String> {
-    install_signal_handlers();
-
+/// Validates local folder paths to share before starting hosting or prompting for secrets.
+pub fn validate_cli_host_folders(folders: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     if folders.is_empty() {
         return Err("At least one folder path is required to start hosting.".to_string());
     }
@@ -1041,6 +1043,21 @@ pub async fn run_cli_host<W: Write>(
             validated.push(safe);
         }
     }
+    Ok(validated)
+}
+
+/// Runs the `host` / `share` CLI command in the foreground, printing all server logs directly
+/// to `out` until interrupted (or until `max_duration` elapses in tests).
+pub async fn run_cli_host<W: Write>(
+    secret: &str,
+    folders: &[PathBuf],
+    test_mode: bool,
+    max_duration: Option<Duration>,
+    out: &mut W,
+) -> Result<(), String> {
+    install_signal_handlers();
+
+    let validated = validate_cli_host_folders(folders)?;
 
     let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<ServerLogEvent>();
     let handle = server::start_server(validated.clone(), secret.to_string(), None, log_tx)
@@ -1391,5 +1408,22 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&share_dir);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn test_validate_cli_host_folders_and_download_inputs_fail_fast() {
+        assert!(validate_cli_host_folders(&[]).is_err());
+        let missing = std::env::temp_dir().join("lanshare_definitely_missing_folder_12345");
+        let err = validate_cli_host_folders(std::slice::from_ref(&missing)).unwrap_err();
+        assert!(!err.is_empty());
+
+        let valid_dir =
+            std::env::temp_dir().join(format!("lanshare_cli_validate_dir_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&valid_dir);
+        let deduped = validate_cli_host_folders(&[valid_dir.clone(), valid_dir.clone()]).unwrap();
+        assert_eq!(deduped.len(), 1);
+        let _ = std::fs::remove_dir_all(&valid_dir);
+
+        assert!(validate_cli_download_inputs(None, &[], false).is_err());
     }
 }

@@ -1,17 +1,19 @@
 use crate::client::{self, ClientTlsStream, ConnectionContext, TransferProgress};
 use crate::core::{
-    complete_queued_download, default_mock_peers, dirs_fallback, estimate_folder_remaining_seconds,
+    complete_queued_download, compute_queue_etas, default_mock_peers, dirs_fallback,
     estimate_remaining_seconds, format_completed_timestamp, format_file_size,
     format_remaining_time, format_secret_display, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
-    open_file_in_default_app, open_folder_in_explorer, open_url, queue_status_sort_rank,
+    mock_folder_total_bytes, open_file_in_default_app, open_folder_in_explorer, open_url,
+    parse_host_and_port, queue_status_sort_rank, resolve_remote_folder_total_bytes,
     sort_peers_alphabetically, spawn_next_queued_download, test_downloads_dir, ClientActionResult,
-    EtaStabilizer, QueueItemStatus, QueuedDownloadItem, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
+    EtaStabilizer, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem, GITHUB_RELEASES_URL,
+    GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
 };
-use crate::security::{clean_display_path, validate_shared_folder};
+use crate::security::{clean_display_path, clean_path, validate_shared_folder};
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
 use chrono::{Local, TimeZone};
@@ -159,6 +161,7 @@ pub struct LanShareApp {
     // About Modal
     show_about: bool,
     focus_about_window: bool,
+    about_window_pos: Option<egui::Pos2>,
 
     // Shared LAN Secret (used for both discovering computers and sharing folders)
     ring_secret: String,
@@ -201,7 +204,6 @@ pub struct LanShareApp {
     // Multi-Item Download Queue & Active Transfer Progress
     next_queue_id: u64,
     download_queue: VecDeque<QueuedDownloadItem>,
-    keep_downloads_panel_visible: bool,
     active_queue_id: Option<u64>,
     active_progress: Option<TransferProgress>,
     progress_finished_at: Option<Instant>,
@@ -217,6 +219,7 @@ pub struct LanShareApp {
     // Dedicated Activity Log Window
     show_log_window: bool,
     focus_log_window: bool,
+    log_window_pos: Option<egui::Pos2>,
     log_auto_scroll: bool,
     log_source_filter: LogSourceFilter,
 
@@ -232,8 +235,9 @@ pub struct LanShareApp {
     show_stop_server_confirm_dialog: bool,
     pending_remove_host_folder_idx: Option<usize>,
 
-    // Adjustable Download Queue Section Height
+    // Adjustable Transfer Queue Section Heights
     download_section_height: f32,
+    upload_section_height: f32,
 
     // Resizable Browse Table Name Column Width
     browse_col_name_w: f32,
@@ -504,6 +508,7 @@ impl LanShareApp {
             current_tab: AppTab::Client,
             show_about: false,
             focus_about_window: false,
+            about_window_pos: None,
 
             ring_secret,
             show_secret_plain: false,
@@ -540,7 +545,6 @@ impl LanShareApp {
 
             next_queue_id: 1,
             download_queue: VecDeque::new(),
-            keep_downloads_panel_visible: false,
             active_queue_id: None,
             active_progress: None,
             progress_finished_at: None,
@@ -553,6 +557,7 @@ impl LanShareApp {
             client_logs,
             show_log_window: false,
             focus_log_window: false,
+            log_window_pos: None,
             log_auto_scroll: true,
             log_source_filter: LogSourceFilter::All,
 
@@ -564,7 +569,8 @@ impl LanShareApp {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 220.0,
+            download_section_height: 92.0,
+            upload_section_height: 92.0,
 
             browse_col_name_w: 260.0,
 
@@ -875,7 +881,10 @@ impl LanShareApp {
                 // Ensure local server is present if hosting (Fixes Issue 2)
                 if let Some(ref handle) = self.server_handle {
                     let my_name = crate::network::get_computer_name();
-                    if !peers.iter().any(|p| self.is_local_peer(p)) {
+                    if !peers
+                        .iter()
+                        .any(|p| self.is_local_peer(p) && p.port == handle.port)
+                    {
                         peers.push(DiscoveredPeer {
                             host_name: my_name,
                             ip: handle.local_ip.clone(),
@@ -889,7 +898,9 @@ impl LanShareApp {
                 let connected_peer_missing = self.client_connected
                     && !self.mock_session
                     && !self.connected_via_direct_ip
-                    && !peers.iter().any(|p| p.ip == self.client_ip);
+                    && !peers
+                        .iter()
+                        .any(|p| p.ip == self.client_ip && p.port == self.client_port);
                 self.discovered_peers = peers;
                 self.is_scanning = false;
                 self.scan_rx = None;
@@ -903,18 +914,31 @@ impl LanShareApp {
     fn poll_client_action_results(&mut self) {
         while let Ok(action) = self.client_action_rx.try_recv() {
             match action {
-                ClientActionResult::Connected(stream, resp, ip) => {
+                ClientActionResult::Connected(mut stream, resp, ip, port) => {
+                    if !self.client_ip.trim().is_empty()
+                        && (ip != self.client_ip.trim() || port != self.client_port)
+                    {
+                        self.tokio_rt.spawn(async move {
+                            let _ = stream.shutdown().await;
+                        });
+                        continue;
+                    }
                     self.client_loading = false;
                     self.client_connected = true;
                     self.client_connection_lost = false;
                     self.mock_session = false;
                     self.client_ip = ip.clone();
+                    self.client_port = port;
                     self.selected_peer_name = resp.server_name.clone();
-                    if !self.discovered_peers.iter().any(|p| p.ip == ip) {
+                    if !self
+                        .discovered_peers
+                        .iter()
+                        .any(|p| p.ip == ip && p.port == port)
+                    {
                         self.discovered_peers.push(DiscoveredPeer {
                             host_name: resp.server_name.clone(),
                             ip: ip.clone(),
-                            port: DEFAULT_TCP_PORT,
+                            port,
                             last_seen: Instant::now(),
                         });
                         sort_peers_alphabetically(&mut self.discovered_peers);
@@ -967,7 +991,18 @@ impl LanShareApp {
                     if let Some(err) = outcome.error {
                         self.client_error = Some(err);
                     }
+                    self.total_eta_stabilizer.reset();
                     self.start_next_queued_download();
+                }
+                ClientActionResult::FolderSizeResolved { id, total_bytes } => {
+                    if let Some(item) = self
+                        .download_queue
+                        .iter_mut()
+                        .find(|i| i.id == id && i.status == QueueItemStatus::Pending)
+                    {
+                        item.total_bytes = Some(total_bytes);
+                        self.total_eta_stabilizer.reset();
+                    }
                 }
             }
         }
@@ -998,6 +1033,7 @@ impl eframe::App for LanShareApp {
 
         if self.active_progress.is_some()
             || self.active_queue_id.is_some()
+            || self.active_server_downloads() > 0
             || self.client_loading
             || self.clipboard_flash.is_some()
         {
@@ -1016,9 +1052,12 @@ impl eframe::App for LanShareApp {
             if !handle.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 let local_ips = self.local_ips.clone();
                 let s_ip = handle.local_ip.clone();
+                let s_port = handle.port;
                 self.server_handle = None;
-                self.discovered_peers
-                    .retain(|p| !local_ips.contains(&p.ip) && p.ip != s_ip && p.ip != "127.0.0.1");
+                self.discovered_peers.retain(|p| {
+                    !((local_ips.contains(&p.ip) || p.ip == s_ip || p.ip == "127.0.0.1")
+                        && p.port == s_port)
+                });
             }
         }
 
@@ -1353,34 +1392,45 @@ impl LanShareApp {
 
                 // Navigation Selection 1: Browse LAN
                 let is_client = self.current_tab == AppTab::Client;
-                let client_fill = if is_client {
-                    p.tab_active_bg
+                let dl_queue_count = self
+                    .download_queue
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i.status,
+                            QueueItemStatus::Downloading | QueueItemStatus::Pending
+                        )
+                    })
+                    .count();
+                let dl_count = if dl_queue_count > 0 {
+                    dl_queue_count
+                } else if self.has_active_client_downloads() {
+                    1
                 } else {
-                    p.tab_inactive_bg
+                    0
                 };
-                let client_stroke = if is_client {
-                    Stroke::NONE
+                let client_badge = if dl_count > 0 {
+                    Some((
+                        format!("● ↓ {}", dl_count),
+                        p.accent_blue,
+                        format!(
+                            "{} active/queued download{}",
+                            dl_count,
+                            if dl_count == 1 { "" } else { "s" }
+                        ),
+                    ))
                 } else {
-                    Stroke::new(1.0_f32, border_color)
+                    None
                 };
-                let client_text_color = if is_client {
-                    p.tab_active_text
-                } else {
-                    p.tab_inactive_text
-                };
-
-                let client_btn = egui::Button::new(
-                    RichText::new("Browse LAN")
-                        .size(14.5)
-                        .strong()
-                        .color(client_text_color),
-                )
-                .fill(client_fill)
-                .stroke(client_stroke)
-                .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(ui.available_width(), 42.0));
-
-                if ui.add(client_btn).clicked() {
+                if Self::render_nav_tab_button(
+                    ui,
+                    &p,
+                    "Browse LAN",
+                    is_client,
+                    client_badge
+                        .as_ref()
+                        .map(|(t, c, tip)| (t.as_str(), *c, tip.as_str())),
+                ) {
                     self.switch_tab(AppTab::Client);
                 }
 
@@ -1388,39 +1438,35 @@ impl LanShareApp {
 
                 // Navigation Selection 2: Share Folders
                 let is_host = self.current_tab == AppTab::Host;
-                let host_fill = if is_host {
-                    p.tab_active_bg
+                let ul_count = self.active_server_downloads();
+                let host_badge = if ul_count > 0 {
+                    Some((
+                        format!("● ↑ {}", ul_count),
+                        p.accent_green,
+                        format!(
+                            "Sharing active • {} active upload{}",
+                            ul_count,
+                            if ul_count == 1 { "" } else { "s" }
+                        ),
+                    ))
+                } else if is_hosting {
+                    Some((
+                        "●".to_string(),
+                        p.accent_green,
+                        "Sharing active on LAN".to_string(),
+                    ))
                 } else {
-                    p.tab_inactive_bg
+                    None
                 };
-                let host_stroke = if is_host {
-                    Stroke::NONE
-                } else {
-                    Stroke::new(1.0_f32, border_color)
-                };
-                let host_text_color = if is_host {
-                    p.tab_active_text
-                } else {
-                    p.tab_inactive_text
-                };
-                let host_label = if is_hosting {
-                    "Share Folders  ●"
-                } else {
-                    "Share Folders"
-                };
-
-                let host_btn = egui::Button::new(
-                    RichText::new(host_label)
-                        .size(14.5)
-                        .strong()
-                        .color(host_text_color),
-                )
-                .fill(host_fill)
-                .stroke(host_stroke)
-                .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(ui.available_width(), 42.0));
-
-                if ui.add(host_btn).clicked() {
+                if Self::render_nav_tab_button(
+                    ui,
+                    &p,
+                    "Share Folders",
+                    is_host,
+                    host_badge
+                        .as_ref()
+                        .map(|(t, c, tip)| (t.as_str(), *c, tip.as_str())),
+                ) {
                     self.switch_tab(AppTab::Host);
                 }
 
@@ -1599,6 +1645,86 @@ impl LanShareApp {
             });
     }
 
+    fn render_nav_tab_button(
+        ui: &mut egui::Ui,
+        p: &AppPalette,
+        label: &str,
+        is_selected: bool,
+        badge: Option<(&str, Color32, &str)>,
+    ) -> bool {
+        let fill = if is_selected {
+            p.tab_active_bg
+        } else {
+            p.tab_inactive_bg
+        };
+        let stroke = if is_selected {
+            Stroke::NONE
+        } else {
+            Stroke::new(1.0_f32, p.border)
+        };
+        let text_color = if is_selected {
+            p.tab_active_text
+        } else {
+            p.tab_inactive_text
+        };
+
+        let btn_size = Vec2::new(ui.available_width(), 42.0);
+        let (rect, mut resp) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+        if let Some((_, _, tip)) = badge {
+            resp = resp.on_hover_text(tip);
+        }
+
+        let visual_fill = if !is_selected && resp.is_pointer_button_down_on() {
+            p.card_secondary_bg
+        } else if !is_selected && resp.hovered() {
+            p.card_bg
+        } else {
+            fill
+        };
+
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(8),
+            visual_fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        let pad_x = ui.spacing().button_padding.x;
+        let label_galley =
+            egui::WidgetText::from(RichText::new(label).size(14.5).strong().color(text_color))
+                .into_galley(
+                    ui,
+                    None,
+                    (rect.width() - pad_x * 2.0).max(40.0),
+                    TextStyle::Button,
+                );
+
+        let label_pos = egui::pos2(
+            rect.min.x + pad_x,
+            rect.center().y - label_galley.size().y * 0.5,
+        );
+        ui.painter().galley(label_pos, label_galley, text_color);
+
+        if let Some((badge_text, badge_color, _)) = badge {
+            let fg = if is_selected {
+                p.tab_active_text
+            } else {
+                badge_color
+            };
+            let badge_galley =
+                egui::WidgetText::from(RichText::new(badge_text).size(12.5).strong().color(fg))
+                    .into_galley(ui, None, (rect.width() * 0.45).max(24.0), TextStyle::Button);
+            let badge_pos = egui::pos2(
+                rect.max.x - pad_x - badge_galley.size().x,
+                rect.center().y - badge_galley.size().y * 0.5,
+            );
+            ui.painter().galley(badge_pos, badge_galley, fg);
+        }
+
+        resp.clicked()
+    }
+
     fn render_about_link(
         ui: &mut egui::Ui,
         p: &AppPalette,
@@ -1628,6 +1754,34 @@ impl LanShareApp {
         resp
     }
 
+    /// Computes a centered initial outer position for secondary viewport windows so Windows
+    /// does not place them at OS cascade defaults instead of the center of the screen/active monitor.
+    fn centered_viewport_position(ctx: &egui::Context, inner_size: Vec2) -> Option<egui::Pos2> {
+        ctx.input(|i| {
+            let mon = i.viewport().monitor_size;
+            let outer = i.viewport().outer_rect;
+            match (outer, mon) {
+                (Some(outer_rect), Some(mon_size)) => {
+                    let c = outer_rect.center();
+                    if c.x >= 0.0 && c.x <= mon_size.x && c.y >= 0.0 && c.y <= mon_size.y {
+                        Some(egui::pos2(
+                            ((mon_size.x - inner_size.x) * 0.5).max(0.0),
+                            ((mon_size.y - inner_size.y) * 0.5).max(0.0),
+                        ))
+                    } else {
+                        Some(outer_rect.center() - inner_size * 0.5)
+                    }
+                }
+                (None, Some(mon_size)) => Some(egui::pos2(
+                    ((mon_size.x - inner_size.x) * 0.5).max(0.0),
+                    ((mon_size.y - inner_size.y) * 0.5).max(0.0),
+                )),
+                (Some(outer_rect), None) => Some(outer_rect.center() - inner_size * 0.5),
+                (None, None) => None,
+            }
+        })
+    }
+
     fn render_about_modal(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             return;
@@ -1636,13 +1790,22 @@ impl LanShareApp {
         let should_focus = self.focus_about_window;
         self.focus_about_window = false;
 
+        let inner_size = Vec2::new(540.0, 535.0);
+        if self.about_window_pos.is_none() {
+            self.about_window_pos = Self::centered_viewport_position(ctx, inner_size);
+        }
+
         let mut close_requested = false;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("About LanShare")
-            .with_inner_size([540.0, 535.0])
+            .with_inner_size(inner_size)
             .with_min_inner_size([460.0, 360.0])
             .with_active(true)
             .with_resizable(true);
+
+        if let Some(pos) = self.about_window_pos {
+            builder = builder.with_position(pos);
+        }
 
         if let Some(icon) = app_icon() {
             builder = builder.with_icon(icon);
@@ -1748,6 +1911,7 @@ impl LanShareApp {
 
         if close_requested {
             self.show_about = false;
+            self.about_window_pos = None;
         }
     }
 
@@ -1769,12 +1933,21 @@ impl LanShareApp {
         let client_logs_clone = self.client_logs.clone();
         let server_logs_clone = self.server_logs.clone();
 
+        let inner_size = Vec2::new(960.0, 520.0);
+        if self.log_window_pos.is_none() {
+            self.log_window_pos = Self::centered_viewport_position(ctx, inner_size);
+        }
+
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Activity & Transfer Logs")
-            .with_inner_size([960.0, 520.0])
+            .with_inner_size(inner_size)
             .with_min_inner_size([900.0, 340.0])
             .with_active(true)
             .with_resizable(true);
+
+        if let Some(pos) = self.log_window_pos {
+            builder = builder.with_position(pos);
+        }
 
         if let Some(icon) = app_icon() {
             builder = builder.with_icon(icon);
@@ -2040,6 +2213,7 @@ impl LanShareApp {
 
         if close_requested {
             self.show_log_window = false;
+            self.log_window_pos = None;
         }
     }
 
@@ -2333,7 +2507,11 @@ impl LanShareApp {
                 self.server_handle = Some(handle);
                 self.host_error = None;
                 let my_name = crate::network::get_computer_name();
-                if !self.discovered_peers.iter().any(|p| self.is_local_peer(p)) {
+                if !self
+                    .discovered_peers
+                    .iter()
+                    .any(|p| self.is_local_peer(p) && p.port == my_port)
+                {
                     self.discovered_peers.push(DiscoveredPeer {
                         host_name: my_name,
                         ip: my_ip,
@@ -2397,11 +2575,13 @@ impl LanShareApp {
         self.clear_errors();
         let local_ips = self.local_ips.clone();
         let s_ip = self.server_handle.as_ref().map(|h| h.local_ip.clone());
+        let s_port = self.server_handle.as_ref().map(|h| h.port);
         if let Some(handle) = self.server_handle.take() {
             let _ = handle.stop_sender.send(());
         }
         self.discovered_peers.retain(|p| {
-            !local_ips.contains(&p.ip) && s_ip.as_deref() != Some(&p.ip) && p.ip != "127.0.0.1"
+            !((local_ips.contains(&p.ip) || s_ip.as_deref() == Some(&p.ip) || p.ip == "127.0.0.1")
+                && s_port == Some(p.port))
         });
     }
 
@@ -2755,8 +2935,10 @@ impl LanShareApp {
                             if (ui.add(connect_btn).clicked() || enter_pressed)
                                 && !self.direct_ip_input.trim().is_empty()
                             {
-                                self.client_ip = self.direct_ip_input.trim().to_string();
-                                self.client_port = DEFAULT_TCP_PORT;
+                                let (host, port) =
+                                    parse_host_and_port(&self.direct_ip_input, DEFAULT_TCP_PORT);
+                                self.client_ip = host;
+                                self.client_port = port;
                                 self.connected_via_direct_ip = true;
                                 self.trigger_connect();
                             }
@@ -2791,11 +2973,18 @@ impl LanShareApp {
                                 } else {
                                     let mut peers = self.discovered_peers.clone();
                                     sort_peers_alphabetically(&mut peers);
-                                    for peer in peers {
+                                    for idx in 0..peers.len() {
+                                        let peer = peers[idx].clone();
                                         let is_selected = self.client_connected
                                             && !self.client_connection_lost
-                                            && self.client_ip == peer.ip;
+                                            && self.client_ip == peer.ip
+                                            && self.client_port == peer.port;
                                         let is_local = self.is_local_peer(&peer);
+                                        let has_duplicate_ip = peers
+                                            .iter()
+                                            .filter(|other| other.ip == peer.ip)
+                                            .count()
+                                            > 1;
 
                                         let title = if is_local {
                                             format!("{} (This PC)", peer.host_name)
@@ -2804,109 +2993,117 @@ impl LanShareApp {
                                         };
                                         let subtitle = if peer.ip.starts_with("mock://") {
                                             "Simulated Host".to_string()
+                                        } else if has_duplicate_ip || peer.port != DEFAULT_TCP_PORT {
+                                            format!("{}:{}", peer.ip, peer.port)
                                         } else {
                                             peer.ip.clone()
                                         };
 
-                                        let row_w = ui.available_width().max(120.0);
-                                        let (card_rect, resp) = ui.allocate_exact_size(
-                                            Vec2::new(row_w, 48.0),
-                                            egui::Sense::click(),
-                                        );
-                                        if resp.hovered() {
-                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                        }
-
-                                        let (fill, stroke) = if is_selected {
-                                            (p.tab_active_bg, Stroke::NONE)
-                                        } else if resp.hovered() || resp.is_pointer_button_down_on()
-                                        {
-                                            let visuals = ui.style().interact(&resp);
-                                            (visuals.bg_fill, visuals.bg_stroke)
-                                        } else {
-                                            (p.card_bg, Stroke::new(1.0_f32, border_color))
-                                        };
-
-                                        let title_color = if is_selected {
-                                            p.tab_active_text
-                                        } else {
-                                            text_dark
-                                        };
-                                        let subtitle_color = if is_selected {
-                                            p.tab_active_text.gamma_multiply(0.85)
-                                        } else {
-                                            text_muted
-                                        };
-                                        let icon_color = if is_selected {
-                                            p.tab_active_text
-                                        } else {
-                                            text_dark
-                                        };
-
-                                        if ui.is_rect_visible(card_rect) {
-                                            ui.painter().rect(
-                                                card_rect,
-                                                CornerRadius::same(8),
-                                                fill,
-                                                stroke,
-                                                egui::StrokeKind::Inside,
+                                        let mut clicked_peer = false;
+                                        ui.push_id((&peer.ip, peer.port), |ui| {
+                                            let row_w = ui.available_width().max(120.0);
+                                            let (card_rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(row_w, 48.0),
+                                                egui::Sense::click(),
                                             );
+                                            if resp.hovered() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                            }
 
-                                            let icon_rect = egui::Rect::from_center_size(
-                                                egui::pos2(
-                                                    card_rect.left() + 20.0,
-                                                    card_rect.center().y,
-                                                ),
-                                                egui::vec2(20.0, 18.0),
-                                            );
-                                            Self::draw_mini_computer_icon_in_rect(
-                                                ui, icon_rect, icon_color,
-                                            );
+                                            let (fill, stroke) = if is_selected {
+                                                (p.tab_active_bg, Stroke::NONE)
+                                            } else if resp.hovered() || resp.is_pointer_button_down_on()
+                                            {
+                                                let visuals = ui.style().interact(&resp);
+                                                (visuals.bg_fill, visuals.bg_stroke)
+                                            } else {
+                                                (p.card_bg, Stroke::new(1.0_f32, border_color))
+                                            };
 
-                                            let text_left = icon_rect.right() + 10.0;
-                                            let max_text_w =
-                                                (card_rect.right() - 10.0 - text_left).max(40.0);
-                                            let title_galley = egui::WidgetText::from(
-                                                RichText::new(&title)
-                                                    .size(13.5)
-                                                    .strong()
-                                                    .color(title_color),
-                                            )
-                                            .into_galley(
-                                                ui,
-                                                Some(egui::TextWrapMode::Truncate),
-                                                max_text_w,
-                                                egui::TextStyle::Body,
-                                            );
-                                            let subtitle_galley = egui::WidgetText::from(
-                                                RichText::new(&subtitle)
-                                                    .size(12.0)
-                                                    .color(subtitle_color),
-                                            )
-                                            .into_galley(
-                                                ui,
-                                                Some(egui::TextWrapMode::Truncate),
-                                                max_text_w,
-                                                egui::TextStyle::Body,
-                                            );
+                                            let title_color = if is_selected {
+                                                p.tab_active_text
+                                            } else {
+                                                text_dark
+                                            };
+                                            let subtitle_color = if is_selected {
+                                                p.tab_active_text.gamma_multiply(0.85)
+                                            } else {
+                                                text_muted
+                                            };
+                                            let icon_color = if is_selected {
+                                                p.tab_active_text
+                                            } else {
+                                                text_dark
+                                            };
 
-                                            let title_h = title_galley.size().y;
-                                            let total_h =
-                                                title_h + 2.0 + subtitle_galley.size().y;
-                                            let top_y = card_rect.center().y - total_h * 0.5;
-                                            ui.painter().galley(
-                                                egui::pos2(text_left, top_y),
-                                                title_galley,
-                                                title_color,
-                                            );
-                                            ui.painter().galley(
-                                                egui::pos2(text_left, top_y + title_h + 2.0),
-                                                subtitle_galley,
-                                                subtitle_color,
-                                            );
-                                        }
+                                            if ui.is_rect_visible(card_rect) {
+                                                ui.painter().rect(
+                                                    card_rect,
+                                                    CornerRadius::same(8),
+                                                    fill,
+                                                    stroke,
+                                                    egui::StrokeKind::Inside,
+                                                );
 
-                                        if resp.clicked() {
+                                                let icon_rect = egui::Rect::from_center_size(
+                                                    egui::pos2(
+                                                        card_rect.left() + 20.0,
+                                                        card_rect.center().y,
+                                                    ),
+                                                    egui::vec2(20.0, 18.0),
+                                                );
+                                                Self::draw_mini_computer_icon_in_rect(
+                                                    ui, icon_rect, icon_color,
+                                                );
+
+                                                let text_left = icon_rect.right() + 10.0;
+                                                let max_text_w =
+                                                    (card_rect.right() - 10.0 - text_left).max(40.0);
+                                                let title_galley = egui::WidgetText::from(
+                                                    RichText::new(&title)
+                                                        .size(13.5)
+                                                        .strong()
+                                                        .color(title_color),
+                                                )
+                                                .into_galley(
+                                                    ui,
+                                                    Some(egui::TextWrapMode::Truncate),
+                                                    max_text_w,
+                                                    egui::TextStyle::Body,
+                                                );
+                                                let subtitle_galley = egui::WidgetText::from(
+                                                    RichText::new(&subtitle)
+                                                        .size(12.0)
+                                                        .color(subtitle_color),
+                                                )
+                                                .into_galley(
+                                                    ui,
+                                                    Some(egui::TextWrapMode::Truncate),
+                                                    max_text_w,
+                                                    egui::TextStyle::Body,
+                                                );
+
+                                                let title_h = title_galley.size().y;
+                                                let total_h =
+                                                    title_h + 2.0 + subtitle_galley.size().y;
+                                                let top_y = card_rect.center().y - total_h * 0.5;
+                                                ui.painter().galley(
+                                                    egui::pos2(text_left, top_y),
+                                                    title_galley,
+                                                    title_color,
+                                                );
+                                                ui.painter().galley(
+                                                    egui::pos2(text_left, top_y + title_h + 2.0),
+                                                    subtitle_galley,
+                                                    subtitle_color,
+                                                );
+                                            }
+
+                                            if resp.clicked() {
+                                                clicked_peer = true;
+                                            }
+                                        });
+                                        if clicked_peer {
                                             self.select_and_connect_peer(&peer);
                                         }
                                         ui.add_space(4.0);
@@ -3170,6 +3367,66 @@ impl LanShareApp {
         );
     }
 
+    fn draw_mini_up_arrow_icon_in_rect(ui: &egui::Ui, rect: egui::Rect, color: Color32) {
+        let painter = ui.painter();
+        let stroke = Stroke::new(1.6_f32, color);
+        let c = rect.center();
+
+        // Vertical arrow shaft
+        painter.line_segment(
+            [egui::pos2(c.x, c.y + 5.5), egui::pos2(c.x, c.y - 5.5)],
+            stroke,
+        );
+        // Upward chevron head
+        painter.add(egui::epaint::PathShape::line(
+            vec![
+                egui::pos2(c.x - 4.5, c.y - 1.0),
+                egui::pos2(c.x, c.y - 5.5),
+                egui::pos2(c.x + 4.5, c.y - 1.0),
+            ],
+            stroke,
+        ));
+    }
+
+    fn draw_mini_refresh_icon_in_rect(ui: &egui::Ui, rect: egui::Rect, color: Color32) {
+        let painter = ui.painter();
+        let stroke = Stroke::new(1.5_f32, color);
+        let c = rect.center();
+        let r = 5.5_f32;
+        let start = 0.25_f32;
+        let end = 5.45_f32;
+        let steps = 18usize;
+        let arc_pts: Vec<egui::Pos2> = (0..=steps)
+            .map(|i| {
+                let t = start + (end - start) * (i as f32 / steps as f32);
+                egui::pos2(c.x + r * t.cos(), c.y + r * t.sin())
+            })
+            .collect();
+        painter.add(egui::epaint::PathShape::line(arc_pts, stroke));
+
+        let tip = egui::pos2(c.x + r * end.cos(), c.y + r * end.sin());
+        let tangent = egui::vec2(-end.sin(), end.cos());
+        let radial = egui::vec2(end.cos(), end.sin());
+        painter.add(egui::epaint::PathShape::line(
+            vec![
+                tip - tangent * 3.6 + radial * 2.2,
+                tip,
+                tip - tangent * 3.6 - radial * 2.2,
+            ],
+            stroke,
+        ));
+    }
+
+    fn draw_enabled_icon_button(
+        ui: &mut egui::Ui,
+        enabled: bool,
+        tooltip: &str,
+        draw_fn: impl FnOnce(&egui::Ui, egui::Rect, Color32),
+    ) -> egui::Response {
+        ui.add_enabled_ui(enabled, |ui| Self::draw_icon_button(ui, tooltip, draw_fn))
+            .inner
+    }
+
     fn draw_icon_button(
         ui: &mut egui::Ui,
         tooltip: &str,
@@ -3200,7 +3457,9 @@ impl LanShareApp {
                     egui::StrokeKind::Inside,
                 );
             }
-            let icon_color = if resp.hovered() {
+            let icon_color = if !ui.is_enabled() {
+                ui.visuals().widgets.noninteractive.fg_stroke.color
+            } else if resp.hovered() {
                 ui.visuals().widgets.hovered.fg_stroke.color
             } else {
                 ui.visuals().widgets.inactive.fg_stroke.color
@@ -3386,15 +3645,25 @@ impl LanShareApp {
         let has_browser_view = self.client_connected || !self.client_file_list.is_empty();
         ui.horizontal(|ui| {
             if has_browser_view {
-                if ui
-                    .add_enabled(!self.client_connection_lost, egui::Button::new("⬆ Up"))
-                    .clicked()
+                if Self::draw_enabled_icon_button(
+                    ui,
+                    !self.client_connection_lost
+                        && !self.client_loading
+                        && !self.client_current_path.is_empty(),
+                    "Parent folder (Up)",
+                    Self::draw_mini_up_arrow_icon_in_rect,
+                )
+                .clicked()
                 {
                     self.navigate_up();
                 }
-                if ui
-                    .add_enabled(!self.client_connection_lost, egui::Button::new("Refresh"))
-                    .clicked()
+                if Self::draw_enabled_icon_button(
+                    ui,
+                    !self.client_connection_lost && !self.client_loading,
+                    "Refresh folder listing",
+                    Self::draw_mini_refresh_icon_in_rect,
+                )
+                .clicked()
                 {
                     self.refresh_client_listing();
                 }
@@ -3428,29 +3697,22 @@ impl LanShareApp {
                 });
             } else if self.client_loading {
                 ui.spinner();
-                ui.label("Connecting to peer...");
+                ui.label("Connecting to host...");
             }
         });
 
-        // Dynamic Directory Browser Area & Adjustable Downloads Panel
-        let has_queue_panel = self.active_progress.is_some()
-            || !self.download_queue.is_empty()
-            || self.keep_downloads_panel_visible;
+        // Dynamic Directory Browser Area & Always-Visible Adjustable Downloads Panel
         let total_avail = ui.available_height();
-
-        let (browser_height, queue_height) = if has_queue_panel {
-            let max_queue = (total_avail - 180.0).max(100.0);
-            let queue_h = self.download_section_height.clamp(100.0, max_queue);
-            let browse_h = (total_avail - queue_h - 48.0).max(80.0);
-            (browse_h, Some(queue_h))
-        } else {
-            ((total_avail - 12.0).max(180.0), None)
-        };
+        let min_queue_h = 76.0_f32;
+        let max_queue = (total_avail - 180.0).max(min_queue_h);
+        let queue_h = self.download_section_height.clamp(min_queue_h, max_queue);
+        let browser_height = (total_avail - queue_h - 48.0).max(80.0);
 
         ui.add_space(4.0);
         ui.group(|ui| {
             ui.spacing_mut().scroll = Self::visible_scroll_style();
-            let browse_scroll_visibility = if has_browser_view {
+            let show_populating = self.client_loading && self.client_file_list.is_empty();
+            let browse_scroll_visibility = if has_browser_view && !show_populating {
                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible
             } else {
                 egui::scroll_area::ScrollBarVisibility::AlwaysHidden
@@ -3462,17 +3724,24 @@ impl LanShareApp {
                 .min_scrolled_height(browser_height)
                 .max_height(browser_height)
                 .show(ui, |ui| {
+                    if show_populating {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space((browser_height * 0.35).max(32.0));
+                            ui.add(egui::Spinner::new().size(28.0));
+                        });
+                        return;
+                    }
                     if !has_browser_view {
-                        if !self.client_loading {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(40.0);
-                                ui.label(
-                                    RichText::new("Select a computer from the list on the left to browse shares")
-                                        .size(13.5)
-                                        .color(p.text_muted),
-                                );
-                            });
-                        }
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(
+                                RichText::new(
+                                    "Select a computer from the list on the left to browse shares",
+                                )
+                                .size(13.5)
+                                .color(p.text_muted),
+                            );
+                        });
                         return;
                     }
 
@@ -3492,271 +3761,326 @@ impl LanShareApp {
                             .min_col_width(50.0)
                             .spacing([16.0, 8.0])
                             .show(ui, |ui| {
-                            // Column 0: Name with drag resize handle
-                            ui.horizontal(|ui| {
-                                ui.set_width(self.browse_col_name_w);
-                                ui.set_max_width(self.browse_col_name_w);
-                                ui.add_space(8.0);
-                                ui.label(RichText::new("Name").strong());
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let (res_id, res_rect) = ui.allocate_space(egui::vec2(10.0, 18.0));
-                                    let res_resp = ui.interact(res_rect, res_id, egui::Sense::drag());
-                                    if res_resp.hovered() || res_resp.dragged() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                        ui.painter().vline(
-                                            res_rect.center().x,
-                                            res_rect.y_range(),
-                                            Stroke::new(2.0_f32, p.accent_blue),
-                                        );
-                                    } else {
-                                        ui.painter().vline(
-                                            res_rect.center().x,
-                                            res_rect.y_range(),
-                                            Stroke::new(1.0_f32, p.border),
-                                        );
-                                    }
-                                    if res_resp.dragged() {
-                                        self.browse_col_name_w = (self.browse_col_name_w + res_resp.drag_delta().x).clamp(80.0, 1200.0);
-                                    }
-                                });
-                            });
-
-                            // Column 1: Size (fixed width, centered)
-                            ui.horizontal(|ui| {
-                                ui.set_width(BROWSE_COL_SIZE_W);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(RichText::new("Size").strong());
-                                });
-                            });
-
-                            // Column 2: Modified (fixed width, centered)
-                            ui.horizontal(|ui| {
-                                ui.set_width(BROWSE_COL_DATE_W);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(RichText::new("Modified").strong());
-                                });
-                            });
-
-                            // Column 3: Action (fixed width, centered)
-                            ui.horizontal(|ui| {
-                                ui.set_width(BROWSE_COL_ACTION_W);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(RichText::new("Action").strong());
-                                });
-                            });
-                            ui.end_row();
-
-                            let files = self.client_file_list.clone();
-                            if files.is_empty() {
+                                // Column 0: Name with drag resize handle
                                 ui.horizontal(|ui| {
+                                    ui.set_width(self.browse_col_name_w);
+                                    ui.set_max_width(self.browse_col_name_w);
                                     ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new("(Folder is empty)")
-                                            .italics()
-                                            .color(p.text_muted),
+                                    ui.label(RichText::new("Name").strong());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let (res_id, res_rect) =
+                                                ui.allocate_space(egui::vec2(10.0, 18.0));
+                                            let res_resp =
+                                                ui.interact(res_rect, res_id, egui::Sense::drag());
+                                            if res_resp.hovered() || res_resp.dragged() {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::ResizeColumn,
+                                                );
+                                                ui.painter().vline(
+                                                    res_rect.center().x,
+                                                    res_rect.y_range(),
+                                                    Stroke::new(2.0_f32, p.accent_blue),
+                                                );
+                                            } else {
+                                                ui.painter().vline(
+                                                    res_rect.center().x,
+                                                    res_rect.y_range(),
+                                                    Stroke::new(1.0_f32, p.border),
+                                                );
+                                            }
+                                            if res_resp.dragged() {
+                                                self.browse_col_name_w = (self.browse_col_name_w
+                                                    + res_resp.drag_delta().x)
+                                                    .clamp(80.0, 1200.0);
+                                            }
+                                        },
                                     );
                                 });
-                                ui.label("");
-                                ui.label("");
-                                ui.label("");
+
+                                // Column 1: Size (fixed width, centered)
+                                ui.horizontal(|ui| {
+                                    ui.set_width(BROWSE_COL_SIZE_W);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(RichText::new("Size").strong());
+                                    });
+                                });
+
+                                // Column 2: Modified (fixed width, centered)
+                                ui.horizontal(|ui| {
+                                    ui.set_width(BROWSE_COL_DATE_W);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(RichText::new("Modified").strong());
+                                    });
+                                });
+
+                                // Column 3: Action (fixed width, centered)
+                                ui.horizontal(|ui| {
+                                    ui.set_width(BROWSE_COL_ACTION_W);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(RichText::new("Action").strong());
+                                    });
+                                });
                                 ui.end_row();
-                            } else {
-                                for (idx, entry) in files.into_iter().enumerate() {
-                                    let is_highlighted = self.hovered_browse_download_idx == Some(idx);
-                                    let row_start = ui.cursor().min;
-                                    let row_rect = egui::Rect::from_min_size(row_start, egui::vec2(row_w, 24.0));
 
-                                    // Viewport virtualization for massive folders (tens of thousands of files)
-                                    if !ui.is_rect_visible(row_rect) && !is_highlighted {
-                                        ui.allocate_space(egui::vec2(self.browse_col_name_w, 24.0));
-                                        ui.allocate_space(egui::vec2(BROWSE_COL_SIZE_W, 24.0));
-                                        ui.allocate_space(egui::vec2(BROWSE_COL_DATE_W, 24.0));
-                                        ui.allocate_space(egui::vec2(BROWSE_COL_ACTION_W, 24.0));
-                                        ui.end_row();
-                                        continue;
-                                    }
-
-                                    if is_highlighted {
-                                        ui.painter().rect_filled(
-                                            row_rect,
-                                            CornerRadius::same(4),
-                                            p.browse_row_hover_bg,
+                                let files = self.client_file_list.clone();
+                                if files.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new("(Folder is empty)")
+                                                .italics()
+                                                .color(p.text_muted),
                                         );
-                                    }
+                                    });
+                                    ui.label("");
+                                    ui.label("");
+                                    ui.label("");
+                                    ui.end_row();
+                                } else {
+                                    for (idx, entry) in files.into_iter().enumerate() {
+                                        let is_highlighted =
+                                            self.hovered_browse_download_idx == Some(idx);
+                                        let row_start = ui.cursor().min;
+                                        let row_rect = egui::Rect::from_min_size(
+                                            row_start,
+                                            egui::vec2(row_w, 24.0),
+                                        );
 
-                                    if entry.is_dir {
-                                        let mut clicked = false;
-                                        let dir_color = if self.client_connection_lost {
-                                            p.text_muted
+                                        // Viewport virtualization for massive folders (tens of thousands of files)
+                                        if !ui.is_rect_visible(row_rect) && !is_highlighted {
+                                            ui.allocate_space(egui::vec2(
+                                                self.browse_col_name_w,
+                                                24.0,
+                                            ));
+                                            ui.allocate_space(egui::vec2(BROWSE_COL_SIZE_W, 24.0));
+                                            ui.allocate_space(egui::vec2(BROWSE_COL_DATE_W, 24.0));
+                                            ui.allocate_space(egui::vec2(
+                                                BROWSE_COL_ACTION_W,
+                                                24.0,
+                                            ));
+                                            ui.end_row();
+                                            continue;
+                                        }
+
+                                        if is_highlighted {
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                CornerRadius::same(4),
+                                                p.browse_row_hover_bg,
+                                            );
+                                        }
+
+                                        if entry.is_dir {
+                                            let mut clicked = false;
+                                            let dir_color = if self.client_connection_lost {
+                                                p.text_muted
+                                            } else {
+                                                p.accent_blue
+                                            };
+                                            ui.horizontal(|ui| {
+                                                ui.set_width(self.browse_col_name_w);
+                                                ui.set_max_width(self.browse_col_name_w);
+                                                ui.add_space(8.0);
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                let icon_resp =
+                                                    Self::draw_mini_folder_icon(ui, dir_color);
+                                                let label = egui::Label::new(
+                                                    RichText::new(&entry.name)
+                                                        .strong()
+                                                        .color(dir_color),
+                                                )
+                                                .sense(egui::Sense::click())
+                                                .truncate();
+                                                let (galley_pos, galley, text_resp) =
+                                                    label.layout_in_ui(ui);
+
+                                                let is_hovered = icon_resp.hovered()
+                                                    || text_resp.hovered()
+                                                    || is_highlighted;
+                                                if is_hovered {
+                                                    ui.ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+
+                                                if ui.is_rect_visible(text_resp.rect) {
+                                                    let underline = if is_hovered
+                                                        && !self.client_connection_lost
+                                                    {
+                                                        Stroke::new(1.0_f32, dir_color)
+                                                    } else {
+                                                        Stroke::NONE
+                                                    };
+                                                    ui.painter().add(
+                                                        egui::epaint::TextShape::new(
+                                                            galley_pos, galley, dir_color,
+                                                        )
+                                                        .with_underline(underline),
+                                                    );
+                                                }
+
+                                                if icon_resp.clicked() || text_resp.clicked() {
+                                                    clicked = true;
+                                                }
+                                                text_resp.on_hover_text(&entry.name);
+                                            });
+                                            if clicked {
+                                                self.navigate_into(&entry.name);
+                                            }
                                         } else {
-                                            p.accent_blue
+                                            ui.horizontal(|ui| {
+                                                ui.set_width(self.browse_col_name_w);
+                                                ui.set_max_width(self.browse_col_name_w);
+                                                ui.add_space(8.0);
+                                                let label_text = RichText::new(&entry.name)
+                                                    .strong()
+                                                    .color(if is_highlighted {
+                                                        p.accent_blue
+                                                    } else {
+                                                        p.text_primary
+                                                    });
+                                                let file_resp = ui.add(
+                                                    egui::Label::new(label_text)
+                                                        .selectable(false)
+                                                        .truncate(),
+                                                );
+                                                if file_resp.hovered() {
+                                                    ui.ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+                                                file_resp.on_hover_text(&entry.name);
+                                            });
+                                        }
+
+                                        let size_str = if entry.is_dir {
+                                            "-".to_string()
+                                        } else {
+                                            format_file_size(entry.size)
                                         };
                                         ui.horizontal(|ui| {
-                                            ui.set_width(self.browse_col_name_w);
-                                            ui.set_max_width(self.browse_col_name_w);
-                                            ui.add_space(8.0);
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                            let icon_resp = Self::draw_mini_folder_icon(ui, dir_color);
-                                            let label = egui::Label::new(
-                                                RichText::new(&entry.name)
-                                                    .strong()
-                                                    .color(dir_color),
-                                            )
-                                            .sense(egui::Sense::click())
-                                            .truncate();
-                                            let (galley_pos, galley, text_resp) = label.layout_in_ui(ui);
-
-                                            let is_hovered = icon_resp.hovered() || text_resp.hovered() || is_highlighted;
-                                            if is_hovered {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                            }
-
-                                            if ui.is_rect_visible(text_resp.rect) {
-                                                let underline = if is_hovered && !self.client_connection_lost {
-                                                    Stroke::new(1.0_f32, dir_color)
-                                                } else {
-                                                    Stroke::NONE
-                                                };
-                                                ui.painter().add(
-                                                    egui::epaint::TextShape::new(galley_pos, galley, dir_color)
-                                                        .with_underline(underline),
-                                                );
-                                            }
-
-                                            if icon_resp.clicked() || text_resp.clicked() {
-                                                clicked = true;
-                                            }
-                                            text_resp.on_hover_text(&entry.name);
+                                            ui.set_width(BROWSE_COL_SIZE_W);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add_space(6.0);
+                                                    let size_resp = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(size_str).monospace(),
+                                                        )
+                                                        .selectable(false),
+                                                    );
+                                                    if size_resp.hovered() {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Default,
+                                                        );
+                                                    }
+                                                },
+                                            );
                                         });
-                                        if clicked {
-                                            self.navigate_into(&entry.name);
-                                        }
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            ui.set_width(self.browse_col_name_w);
-                                            ui.set_max_width(self.browse_col_name_w);
-                                            ui.add_space(8.0);
-                                            let label_text = RichText::new(&entry.name).strong().color(if is_highlighted {
-                                                p.accent_blue
+
+                                        let date_str = if entry.modified_timestamp > 0 {
+                                            if let Some(dt) = Local
+                                                .timestamp_opt(entry.modified_timestamp as i64, 0)
+                                                .single()
+                                            {
+                                                dt.format("%Y-%m-%d %H:%M").to_string()
                                             } else {
-                                                p.text_primary
-                                            });
-                                            let file_resp = ui.add(
-                                                egui::Label::new(label_text)
-                                                    .selectable(false)
-                                                    .truncate(),
-                                            );
-                                            if file_resp.hovered() {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                                "-".to_string()
                                             }
-                                            file_resp.on_hover_text(&entry.name);
-                                        });
-                                    }
-
-                                    let size_str = if entry.is_dir {
-                                        "-".to_string()
-                                    } else {
-                                        format_file_size(entry.size)
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.set_width(BROWSE_COL_SIZE_W);
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.add_space(6.0);
-                                            let size_resp = ui.add(
-                                                egui::Label::new(RichText::new(size_str).monospace())
-                                                    .selectable(false),
-                                            );
-                                            if size_resp.hovered() {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                            }
-                                        });
-                                    });
-
-                                    let date_str = if entry.modified_timestamp > 0 {
-                                        if let Some(dt) = Local
-                                            .timestamp_opt(entry.modified_timestamp as i64, 0)
-                                            .single()
-                                        {
-                                            dt.format("%Y-%m-%d %H:%M").to_string()
                                         } else {
                                             "-".to_string()
-                                        }
-                                    } else {
-                                        "-".to_string()
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.set_width(BROWSE_COL_DATE_W);
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.add_space(6.0);
-                                            let date_resp = ui.add(
-                                                egui::Label::new(date_str).selectable(false),
+                                        };
+                                        ui.horizontal(|ui| {
+                                            ui.set_width(BROWSE_COL_DATE_W);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add_space(6.0);
+                                                    let date_resp = ui.add(
+                                                        egui::Label::new(date_str)
+                                                            .selectable(false),
+                                                    );
+                                                    if date_resp.hovered() {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Default,
+                                                        );
+                                                    }
+                                                },
                                             );
-                                            if date_resp.hovered() {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                            }
                                         });
-                                    });
 
-                                    let row_subpath = if self.client_current_path.is_empty() {
-                                        entry.name.clone()
-                                    } else {
-                                        format!("{}/{}", self.client_current_path, entry.name)
-                                    };
-                                    let existing_status = self
-                                        .download_queue
-                                        .iter()
-                                        .find(|i| {
-                                             i.conn_ctx.ip == self.client_ip
-                                                 && i.remote_subpath == row_subpath
-                                                 && matches!(
-                                                     i.status,
-                                                     QueueItemStatus::Pending
-                                                         | QueueItemStatus::Downloading
-                                                 )
-                                         })
-                                         .map(|i| i.status.clone());
+                                        let row_subpath = if self.client_current_path.is_empty() {
+                                            entry.name.clone()
+                                        } else {
+                                            format!("{}/{}", self.client_current_path, entry.name)
+                                        };
+                                        let existing_status = self
+                                            .download_queue
+                                            .iter()
+                                            .find(|i| {
+                                                i.conn_ctx.ip == self.client_ip
+                                                    && i.remote_subpath == row_subpath
+                                                    && matches!(
+                                                        i.status,
+                                                        QueueItemStatus::Pending
+                                                            | QueueItemStatus::Downloading
+                                                    )
+                                            })
+                                            .map(|i| i.status.clone());
 
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.set_min_width(76.0);
-                                        ui.add_space(6.0);
-                                        match existing_status {
-                                            Some(QueueItemStatus::Downloading) => {
-                                                let btn_resp = ui.add_enabled(false, egui::Button::new("Active"));
-                                                if btn_resp.hovered() {
-                                                    next_hovered_browse_idx = Some(idx);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_min_width(76.0);
+                                                ui.add_space(6.0);
+                                                match existing_status {
+                                                    Some(QueueItemStatus::Downloading) => {
+                                                        let btn_resp = ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new("Active"),
+                                                        );
+                                                        if btn_resp.hovered() {
+                                                            next_hovered_browse_idx = Some(idx);
+                                                        }
+                                                    }
+                                                    Some(QueueItemStatus::Pending) => {
+                                                        let btn_resp = ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new("Queued"),
+                                                        );
+                                                        if btn_resp.hovered() {
+                                                            next_hovered_browse_idx = Some(idx);
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        let is_busy =
+                                                            self.active_queue_id.is_some();
+                                                        let dl_label = if is_busy {
+                                                            "Queue"
+                                                        } else {
+                                                            "Download"
+                                                        };
+                                                        let can_download =
+                                                            !self.client_connection_lost;
+                                                        let btn_resp = ui.add_enabled(
+                                                            can_download,
+                                                            egui::Button::new(dl_label),
+                                                        );
+                                                        if btn_resp.hovered() && can_download {
+                                                            next_hovered_browse_idx = Some(idx);
+                                                        }
+                                                        if btn_resp.clicked() && can_download {
+                                                            self.enqueue_download(entry);
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                            Some(QueueItemStatus::Pending) => {
-                                                let btn_resp = ui.add_enabled(false, egui::Button::new("Queued"));
-                                                if btn_resp.hovered() {
-                                                    next_hovered_browse_idx = Some(idx);
-                                                }
-                                            }
-                                            _ => {
-                                                let is_busy = self.active_queue_id.is_some();
-                                                let dl_label = if is_busy {
-                                                    "Queue"
-                                                } else {
-                                                    "Download"
-                                                };
-                                                let can_download = !self.client_connection_lost;
-                                                let btn_resp = ui.add_enabled(
-                                                    can_download,
-                                                    egui::Button::new(dl_label),
-                                                );
-                                                if btn_resp.hovered() && can_download {
-                                                    next_hovered_browse_idx = Some(idx);
-                                                }
-                                                if btn_resp.clicked() && can_download {
-                                                    self.enqueue_download(entry);
-                                                }
-                                            }
-                                        }
-                                    });
-                                    ui.end_row();
+                                            },
+                                        );
+                                        ui.end_row();
+                                    }
                                 }
-                            }
-                        });
+                            });
                     });
 
                     if self.hovered_browse_download_idx != next_hovered_browse_idx {
@@ -3766,55 +4090,63 @@ impl LanShareApp {
                 });
         });
 
-        // Multi-Item Download Queue & Live Progress Panel (Resizable Splitter)
-        if let Some(queue_h) = queue_height {
-            ui.add_space(2.0);
+        // Multi-Item Download Queue & Live Progress Panel (Always-Visible Resizable Splitter)
+        ui.add_space(2.0);
+        let max_queue_drag = (total_avail - 140.0).max(min_queue_h);
+        Self::draw_vertical_splitter(
+            ui,
+            &p,
+            &mut self.download_section_height,
+            min_queue_h,
+            max_queue_drag,
+        );
+        ui.add_space(2.0);
+        self.render_download_queue_panel(ui, queue_h);
+    }
 
-            // Interactive Resizable Splitter Handle
-            let (splitter_rect, splitter_resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 10.0),
-                egui::Sense::click_and_drag(),
-            );
+    /// Renders a horizontal drag-splitter that adjusts `height_state` vertically within bounds.
+    fn draw_vertical_splitter(
+        ui: &mut egui::Ui,
+        p: &AppPalette,
+        height_state: &mut f32,
+        min_height: f32,
+        max_height: f32,
+    ) {
+        let (splitter_rect, splitter_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 10.0),
+            egui::Sense::click_and_drag(),
+        );
 
+        if splitter_resp.hovered() || splitter_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+
+        if splitter_resp.dragged() {
+            let delta_y = splitter_resp.drag_delta().y;
+            *height_state = (*height_state - delta_y).clamp(min_height, max_height);
+        }
+
+        let line_color = if splitter_resp.dragged() || splitter_resp.hovered() {
+            p.accent_blue
+        } else {
+            p.border
+        };
+        ui.painter().hline(
+            splitter_rect.x_range(),
+            splitter_rect.center().y,
+            Stroke::new(1.0_f32, line_color),
+        );
+
+        let grip_rect = egui::Rect::from_center_size(splitter_rect.center(), egui::vec2(40.0, 4.0));
+        ui.painter().rect_filled(
+            grip_rect,
+            2.0,
             if splitter_resp.hovered() || splitter_resp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            }
-
-            if splitter_resp.dragged() {
-                let delta_y = splitter_resp.drag_delta().y;
-                let max_queue = (total_avail - 140.0).max(100.0);
-                self.download_section_height =
-                    (self.download_section_height - delta_y).clamp(100.0, max_queue);
-            }
-
-            // Draw visual separator / resize handle
-            let line_color = if splitter_resp.dragged() || splitter_resp.hovered() {
                 p.accent_blue
             } else {
-                p.border
-            };
-            ui.painter().hline(
-                splitter_rect.x_range(),
-                splitter_rect.center().y,
-                Stroke::new(1.0_f32, line_color),
-            );
-
-            // Subtle center grip indicator
-            let grip_rect =
-                egui::Rect::from_center_size(splitter_rect.center(), egui::vec2(40.0, 4.0));
-            ui.painter().rect_filled(
-                grip_rect,
-                2.0,
-                if splitter_resp.hovered() || splitter_resp.dragged() {
-                    p.accent_blue
-                } else {
-                    p.text_subtle
-                },
-            );
-
-            ui.add_space(2.0);
-            self.render_download_queue_panel(ui, queue_h);
-        }
+                p.text_subtle
+            },
+        );
     }
 
     fn render_download_queue_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
@@ -3835,71 +4167,20 @@ impl LanShareApp {
             .filter(|i| matches!(i.status, QueueItemStatus::Completed))
             .count();
 
-        let active_speed = self
-            .active_progress
-            .as_ref()
-            .map(|p| p.speed_mbps)
-            .filter(|&s| s > 0.0);
-        let active_remaining = self
-            .active_progress
-            .as_ref()
-            .map(|p| p.bytes_total.saturating_sub(p.bytes_done))
-            .unwrap_or(0);
-        let queued_pending_bytes: u64 = self
-            .download_queue
-            .iter()
-            .filter(|i| i.status == QueueItemStatus::Pending)
-            .map(|i| i.entry.size)
-            .sum();
-        let total_remaining_bytes = active_remaining + queued_pending_bytes;
-
-        let active_item = self
-            .download_queue
-            .iter()
-            .find(|i| i.status == QueueItemStatus::Downloading);
-        let active_elapsed = active_item.and_then(|i| i.started_at.map(|t| t.elapsed()));
-
-        let active_key = self.active_queue_id.map(|id| id.to_string()).or_else(|| {
-            self.active_progress
-                .as_ref()
-                .map(|p| p.selected_target.clone())
-        });
-
-        let raw_active_eta = if let Some(ref prog) = self.active_progress {
-            if prog.is_finished {
-                Some(0)
-            } else {
-                estimate_folder_remaining_seconds(
-                    active_remaining,
-                    prog.speed_mbps,
-                    prog.current_file,
-                    prog.total_files,
-                    active_elapsed,
-                )
-            }
-        } else {
-            active_speed.and_then(|spd| estimate_remaining_seconds(active_remaining, spd))
-        };
-        let active_eta = self
-            .active_eta_stabilizer
-            .update(active_key.as_deref(), raw_active_eta);
-
-        let raw_total_eta = match (active_eta, active_speed) {
-            (Some(act_s), Some(spd)) if queued_pending_bytes > 0 => {
-                let pending_secs =
-                    estimate_remaining_seconds(queued_pending_bytes, spd).unwrap_or(0);
-                Some(act_s + pending_secs)
-            }
-            (Some(act_s), _) => Some(act_s),
-            (None, Some(spd)) => estimate_remaining_seconds(total_remaining_bytes, spd),
-            _ => None,
-        };
-        let total_key = if active_key.is_some() || queued_pending_bytes > 0 {
-            Some("total_queue")
-        } else {
-            None
-        };
-        let total_eta = self.total_eta_stabilizer.update(total_key, raw_total_eta);
+        let QueueEtaSummary {
+            active_remaining,
+            total_remaining_bytes,
+            active_speed,
+            active_eta,
+            total_eta,
+            ..
+        } = compute_queue_etas(
+            &self.download_queue,
+            self.active_queue_id,
+            self.active_progress.as_ref(),
+            &mut self.active_eta_stabilizer,
+            &mut self.total_eta_stabilizer,
+        );
 
         let mut cancel_current = false;
         let mut cancel_all = false;
@@ -4138,18 +4419,47 @@ impl LanShareApp {
                                                 // Active ETA is shown in active download section above, not needed in list
                                             }
                                             QueueItemStatus::Pending => {
+                                                let item_bytes =
+                                                    item.total_bytes.unwrap_or(item.entry.size);
                                                 if item.entry.is_dir {
-                                                    ui.label(
-                                                        RichText::new("• Folder")
-                                                            .color(p.text_muted),
-                                                    );
-                                                } else if item.entry.size > 0 {
-                                                    let sz_str = format_file_size(item.entry.size);
+                                                    if item_bytes > 0 {
+                                                        let sz_str = format_file_size(item_bytes);
+                                                        if let Some(item_s) =
+                                                            active_speed.and_then(|spd| {
+                                                                estimate_remaining_seconds(
+                                                                    item_bytes, spd,
+                                                                )
+                                                            })
+                                                        {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "• Folder • {} • ETA: {}",
+                                                                    sz_str,
+                                                                    format_remaining_time(item_s)
+                                                                ))
+                                                                .color(p.text_muted),
+                                                            );
+                                                        } else {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "• Folder • {}",
+                                                                    sz_str
+                                                                ))
+                                                                .color(p.text_muted),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        ui.label(
+                                                            RichText::new("• Folder")
+                                                                .color(p.text_muted),
+                                                        );
+                                                    }
+                                                } else if item_bytes > 0 {
+                                                    let sz_str = format_file_size(item_bytes);
                                                     if let Some(spd) = active_speed {
                                                         if let Some(item_s) =
                                                             estimate_remaining_seconds(
-                                                                item.entry.size,
-                                                                spd,
+                                                                item_bytes, spd,
                                                             )
                                                         {
                                                             ui.label(
@@ -4216,6 +4526,14 @@ impl LanShareApp {
                                     });
                                 }
                             });
+                    } else if self.active_progress.is_none() {
+                        ui.separator();
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("No active or queued downloads.")
+                                .small()
+                                .color(p.text_muted),
+                        );
                     }
                 });
             },
@@ -4223,6 +4541,7 @@ impl LanShareApp {
 
         if let Some(id) = remove_id {
             self.download_queue.retain(|i| i.id != id);
+            self.total_eta_stabilizer.reset();
         }
         if cancel_all {
             self.cancel_all_downloads();
@@ -4234,9 +4553,6 @@ impl LanShareApp {
                     QueueItemStatus::Pending | QueueItemStatus::Downloading
                 )
             });
-            if self.download_queue.is_empty() && self.active_progress.is_none() {
-                self.keep_downloads_panel_visible = false;
-            }
         }
         if cancel_current {
             self.cancel_active_transfer();
@@ -4399,9 +4715,27 @@ impl LanShareApp {
 
         ui.add_space(10.0);
 
+        let active_uploads = self
+            .server_handle
+            .as_ref()
+            .map(|h| h.active_uploads_snapshot())
+            .unwrap_or_default();
+        let min_uploads_h = 76.0_f32;
+        let host_avail_h = ui.available_height();
+        let max_uploads_h = (host_avail_h - 140.0).max(min_uploads_h);
+        let upload_h = self
+            .upload_section_height
+            .clamp(min_uploads_h, max_uploads_h);
+        let folders_area_h = (host_avail_h - upload_h - 22.0).max(110.0);
+
         // 2. Folders to Share (Middle Card)
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), folders_area_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.group(|ui| {
+                    ui.set_min_height((folders_area_h - 4.0).max(80.0));
+                    ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Folders to Share")
                         .size(16.0)
@@ -4461,7 +4795,8 @@ impl LanShareApp {
                 let mut remove_idx = None;
                 let mut open_folder_target = None;
                 let mut next_hovered_host_remove = None;
-                let scroll_max_h = (ui.available_height() - 85.0).max(120.0);
+                let err_reserve = if self.host_error.is_some() { 24.0 } else { 0.0 };
+                let scroll_max_h = (ui.available_height() - 62.0 - err_reserve).max(48.0);
                 ui.spacing_mut().scroll = Self::visible_scroll_style();
                 ScrollArea::vertical()
                     .id_salt("host_folders_scroll")
@@ -4533,6 +4868,30 @@ impl LanShareApp {
                                 if resp.clicked() {
                                     open_folder_target = Some(folder.clone());
                                 }
+
+                                let canonical_folder = folder
+                                    .canonicalize()
+                                    .ok()
+                                    .map(|p| clean_path(&p));
+                                let folder_ul_count = active_uploads
+                                    .iter()
+                                    .filter(|u| {
+                                        u.folder_root == *folder
+                                            || clean_path(&u.folder_root) == clean_path(folder)
+                                            || canonical_folder
+                                                .as_ref()
+                                                .is_some_and(|c| c == &u.folder_root)
+                                    })
+                                    .count();
+                                if folder_ul_count > 0 {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(format!("↑ {} uploading", folder_ul_count))
+                                            .size(12.5)
+                                            .strong()
+                                            .color(p.accent_green),
+                                    );
+                                }
                             });
                         }
                     });
@@ -4580,7 +4939,121 @@ impl LanShareApp {
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("Error: {}", err)).color(p.accent_red));
             }
-        });
+                });
+            },
+        );
+
+        // 3. Uploads Section (Always-Visible Resizable Splitter & Progress Panel)
+        ui.add_space(2.0);
+        Self::draw_vertical_splitter(
+            ui,
+            &p,
+            &mut self.upload_section_height,
+            min_uploads_h,
+            max_uploads_h,
+        );
+        ui.add_space(2.0);
+        let target_h = (ui.available_height() - 4.0).min(upload_h).max(70.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), target_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.group(|ui| {
+                    ui.set_min_height((target_h - 8.0).max(60.0));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Uploads — Active: {}", active_uploads.len()))
+                                .strong(),
+                        );
+                    });
+                    ui.separator();
+                    if active_uploads.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("No active uploads.")
+                                .small()
+                                .color(p.text_muted),
+                        );
+                    } else {
+                        ui.spacing_mut().scroll = Self::visible_scroll_style();
+                        let scroll_h = (ui.available_height() - 4.0).max(40.0);
+                        ScrollArea::vertical()
+                            .id_salt("host_uploads_scroll")
+                            .max_height(scroll_h)
+                            .auto_shrink([false, true])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .show(ui, |ui| {
+                                for (u_idx, upload) in active_uploads.iter().enumerate() {
+                                    if u_idx > 0 {
+                                        ui.add_space(4.0);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} ({})",
+                                                upload.file_name, upload.peer
+                                            ))
+                                            .strong()
+                                            .color(p.accent_green),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let pct = if upload.total_size > 0 {
+                                            (upload.bytes_sent as f32 / upload.total_size as f32)
+                                                .clamp(0.0, 1.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        ui.add(
+                                            egui::ProgressBar::new(pct)
+                                                .show_percentage()
+                                                .desired_width(280.0),
+                                        );
+                                        if upload.speed_mbps > 0.0 {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:.1} MB/s",
+                                                    upload.speed_mbps
+                                                ))
+                                                .monospace(),
+                                            );
+                                        }
+                                        let remaining =
+                                            upload.total_size.saturating_sub(upload.bytes_sent);
+                                        if remaining > 0 {
+                                            if let Some(eta_s) = estimate_remaining_seconds(
+                                                remaining,
+                                                upload.speed_mbps,
+                                            ) {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "ETA: {}",
+                                                        format_remaining_time(eta_s)
+                                                    ))
+                                                    .strong()
+                                                    .color(p.accent_blue),
+                                                );
+                                            }
+                                        }
+                                        if upload.total_size > 0 {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} / {}",
+                                                    format_file_size(upload.bytes_sent),
+                                                    format_file_size(upload.total_size)
+                                                ))
+                                                .color(p.text_muted),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                });
+            },
+        );
     }
 
     fn trigger_ring_scan(&mut self) {
@@ -4665,14 +5138,20 @@ impl LanShareApp {
     }
 
     fn connect_mock_session(&mut self, host_label: &str, mock_ip: &str) {
+        if let Some(mut old_stream) = self.client_stream.take() {
+            self.tokio_rt.spawn(async move {
+                let _ = old_stream.shutdown().await;
+            });
+        }
         self.client_connected = true;
         self.client_connection_lost = false;
+        self.client_loading = false;
         self.connected_via_direct_ip = false;
         self.mock_session = true;
         self.client_ip = mock_ip.to_string();
         self.selected_peer_name = host_label.to_string();
-        self.client_stream = None;
         self.client_current_path.clear();
+        self.hovered_browse_download_idx = None;
         self.client_handshake = Some(HandshakeResponse {
             authenticated: true,
             server_name: host_label.to_string(),
@@ -4703,6 +5182,19 @@ impl LanShareApp {
             return;
         }
 
+        if let Some(mut old_stream) = self.client_stream.take() {
+            self.tokio_rt.spawn(async move {
+                let _ = old_stream.shutdown().await;
+            });
+        }
+        self.client_connected = false;
+        self.client_connection_lost = false;
+        self.mock_session = false;
+        self.client_handshake = None;
+        self.client_current_path.clear();
+        self.client_file_list.clear();
+        self.hovered_browse_download_idx = None;
+
         let pwd = self.ring_secret.trim().to_string();
         let port = self.client_port;
         let tx = self.client_action_tx.clone();
@@ -4711,7 +5203,7 @@ impl LanShareApp {
         self.tokio_rt.spawn(async move {
             match client::connect_to_host(&ip, port, &pwd).await {
                 Ok((stream, resp)) => {
-                    let _ = tx.send(ClientActionResult::Connected(stream, resp, ip));
+                    let _ = tx.send(ClientActionResult::Connected(stream, resp, ip, port));
                 }
                 Err(e) => {
                     let _ = tx.send(ClientActionResult::ConnectFailed(e));
@@ -4726,6 +5218,7 @@ impl LanShareApp {
             self.client_current_path = target_path;
             self.client_file_list =
                 mock_directory_entries(&self.client_ip, &self.client_current_path);
+            self.hovered_browse_download_idx = None;
             self.client_error = None;
             return;
         }
@@ -4741,6 +5234,9 @@ impl LanShareApp {
 
         if let Some(mut stream) = self.client_stream.take() {
             let tx = self.client_action_tx.clone();
+            self.client_current_path = target_path.clone();
+            self.client_file_list.clear();
+            self.hovered_browse_download_idx = None;
             self.client_loading = true;
 
             self.tokio_rt.spawn(async move {
@@ -4782,6 +5278,14 @@ impl LanShareApp {
     }
 
     fn navigate_up(&mut self) {
+        if self.client_current_path.is_empty() {
+            if self.client_connection_lost {
+                self.client_error = Some(self.host_unavailable_message());
+            } else {
+                self.clear_errors();
+            }
+            return;
+        }
         let target_path = if let Some(idx) = self.client_current_path.rfind('/') {
             self.client_current_path[..idx].to_string()
         } else {
@@ -4800,6 +5304,7 @@ impl LanShareApp {
         }
         self.active_progress = None;
         self.active_eta_stabilizer.reset();
+        self.total_eta_stabilizer.reset();
         let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.push_client_log(format!("[{}] Transfer cancelled by user.", ts));
     }
@@ -4814,7 +5319,6 @@ impl LanShareApp {
                     | QueueItemStatus::Cancelled
             )
         });
-        self.keep_downloads_panel_visible = true;
     }
 
     fn enqueue_download(&mut self, entry: FileEntry) {
@@ -4856,20 +5360,30 @@ impl LanShareApp {
             .map(|h| h.server_name.clone())
             .unwrap_or_else(|| self.client_ip.clone());
 
-        let total_bytes = if entry.is_dir { None } else { Some(entry.size) };
+        let total_bytes = if entry.is_dir {
+            if self.mock_session {
+                Some(mock_folder_total_bytes(&self.client_ip, &remote_subpath))
+            } else {
+                None
+            }
+        } else {
+            Some(entry.size)
+        };
+
+        let conn_ctx = ConnectionContext {
+            ip: self.client_ip.clone(),
+            port: self.client_port,
+            password: self.ring_secret.trim().to_string(),
+            peer_name: Some(peer_name.clone()),
+        };
 
         let item = QueuedDownloadItem {
             id,
             peer_name: peer_name.clone(),
-            conn_ctx: ConnectionContext {
-                ip: self.client_ip.clone(),
-                port: self.client_port,
-                password: self.ring_secret.trim().to_string(),
-                peer_name: Some(peer_name.clone()),
-            },
+            conn_ctx: conn_ctx.clone(),
             is_mock: self.mock_session,
             entry: entry.clone(),
-            remote_subpath,
+            remote_subpath: remote_subpath.clone(),
             local_dest_dir: self.client_dest_folder.clone(),
             status: QueueItemStatus::Pending,
             started_at: None,
@@ -4879,6 +5393,7 @@ impl LanShareApp {
         };
 
         self.download_queue.push_back(item);
+        self.total_eta_stabilizer.reset();
         let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let kind = if entry.is_dir { "folder" } else { "file" };
         self.push_client_log(format!(
@@ -4888,6 +5403,18 @@ impl LanShareApp {
 
         if self.active_queue_id.is_none() {
             self.start_next_queued_download();
+        } else if entry.is_dir && total_bytes.is_none() && !self.mock_session {
+            let tx = self.client_action_tx.clone();
+            self.tokio_rt.spawn(async move {
+                if let Some(bytes) =
+                    resolve_remote_folder_total_bytes(conn_ctx, remote_subpath).await
+                {
+                    let _ = tx.send(ClientActionResult::FolderSizeResolved {
+                        id,
+                        total_bytes: bytes,
+                    });
+                }
+            });
         }
     }
 
@@ -5005,6 +5532,7 @@ mod tests {
             current_tab: AppTab::Host,
             show_about: false,
             focus_about_window: false,
+            about_window_pos: None,
             ring_secret: "secret123".to_string(),
             show_secret_plain: false,
             local_ips: vec!["192.168.1.100".to_string()],
@@ -5035,7 +5563,6 @@ mod tests {
             client_action_tx: _client_action_tx,
             next_queue_id: 1,
             download_queue: VecDeque::new(),
-            keep_downloads_panel_visible: false,
             active_queue_id: None,
             active_progress: None,
             progress_finished_at: None,
@@ -5047,6 +5574,7 @@ mod tests {
             client_logs: VecDeque::new(),
             show_log_window: false,
             focus_log_window: false,
+            log_window_pos: None,
             log_auto_scroll: true,
             log_source_filter: LogSourceFilter::All,
             clipboard: None,
@@ -5056,7 +5584,8 @@ mod tests {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 220.0,
+            download_section_height: 92.0,
+            upload_section_height: 92.0,
 
             browse_col_name_w: 260.0,
 
@@ -5087,6 +5616,7 @@ mod tests {
             active_folder_downloads: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         };
 
@@ -5188,6 +5718,7 @@ mod tests {
             log_tx,
             active_downloads: active_downloads.clone(),
             active_folder_downloads: active_folder_downloads.clone(),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         });
 
@@ -5251,6 +5782,7 @@ mod tests {
             current_tab: AppTab::Host,
             show_about: false,
             focus_about_window: false,
+            about_window_pos: None,
             ring_secret: String::new(),
             show_secret_plain: false,
             local_ips: vec!["192.168.1.100".to_string()],
@@ -5281,7 +5813,6 @@ mod tests {
             client_action_tx: _client_action_tx,
             next_queue_id: 1,
             download_queue: VecDeque::new(),
-            keep_downloads_panel_visible: false,
             active_queue_id: None,
             active_progress: None,
             progress_finished_at: None,
@@ -5293,6 +5824,7 @@ mod tests {
             client_logs: VecDeque::new(),
             show_log_window: false,
             focus_log_window: false,
+            log_window_pos: None,
             log_auto_scroll: true,
             log_source_filter: LogSourceFilter::All,
             clipboard: None,
@@ -5302,7 +5834,8 @@ mod tests {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 220.0,
+            download_section_height: 92.0,
+            upload_section_height: 92.0,
 
             browse_col_name_w: 260.0,
 
@@ -5474,6 +6007,8 @@ mod tests {
                 LanShareApp::draw_mini_copy_icon_in_rect(ui, dummy_rect, Color32::GRAY);
                 LanShareApp::draw_mini_pencil_icon_in_rect(ui, dummy_rect, Color32::GRAY);
                 LanShareApp::draw_mini_open_window_icon_in_rect(ui, dummy_rect, Color32::GRAY);
+                LanShareApp::draw_mini_up_arrow_icon_in_rect(ui, dummy_rect, Color32::GRAY);
+                LanShareApp::draw_mini_refresh_icon_in_rect(ui, dummy_rect, Color32::GRAY);
 
                 let btn_resp =
                     LanShareApp::draw_icon_button(ui, "Test tooltip", |ui, rect, color| {
@@ -5813,7 +6348,6 @@ mod tests {
         assert_eq!(app.download_queue.len(), 1);
         assert_eq!(app.download_queue[0].entry.name, "done.zip");
         assert_eq!(app.download_queue[0].status, QueueItemStatus::Completed);
-        assert!(app.keep_downloads_panel_visible);
 
         let ctx = egui::Context::default();
         let out_with_done = run_test_ui(&ctx, Default::default(), |ui| {
@@ -5859,7 +6393,6 @@ mod tests {
 
         app_empty.cancel_all_downloads();
         assert!(app_empty.download_queue.is_empty());
-        assert!(app_empty.keep_downloads_panel_visible);
 
         let out_empty_panel = run_test_ui(&ctx, Default::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -6298,6 +6831,7 @@ mod tests {
             active_folder_downloads: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         });
         assert!(app.is_hosting_active());
@@ -6801,6 +7335,7 @@ mod tests {
             active_folder_downloads: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             registry_notify_tx: tokio::sync::watch::channel(0u64).0,
         });
 
@@ -6860,5 +7395,500 @@ mod tests {
             });
         });
         assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::Default);
+    }
+
+    #[test]
+    fn test_centered_viewport_position_and_multi_instance_peer_selection() {
+        // 1. Centering helper computes screen center on primary monitor and app center on secondary monitor
+        let inner = Vec2::new(540.0, 535.0);
+        let ctx_primary = egui::Context::default();
+        let mut raw_primary = egui::RawInput::default();
+        raw_primary
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .monitor_size = Some(Vec2::new(1920.0, 1080.0));
+        raw_primary
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(50.0, 40.0),
+            Vec2::new(1220.0, 800.0),
+        ));
+        let _ = run_test_ui(&ctx_primary, raw_primary, |_| {});
+        let pos_primary = LanShareApp::centered_viewport_position(&ctx_primary, inner)
+            .expect("expected centered position");
+        assert!((pos_primary.x - 690.0).abs() < 0.01);
+        assert!((pos_primary.y - 272.5).abs() < 0.01);
+
+        let ctx_secondary = egui::Context::default();
+        let mut raw_secondary = egui::RawInput::default();
+        raw_secondary
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .monitor_size = Some(Vec2::new(1920.0, 1080.0));
+        raw_secondary
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(2100.0, 100.0),
+            Vec2::new(1220.0, 800.0),
+        ));
+        let _ = run_test_ui(&ctx_secondary, raw_secondary, |_| {});
+        let pos_secondary = LanShareApp::centered_viewport_position(&ctx_secondary, inner)
+            .expect("expected secondary monitor centered position");
+        // outer center = (2710, 500) -> minus half inner (270, 267.5) = (2440, 232.5)
+        assert!((pos_secondary.x - 2440.0).abs() < 0.01);
+        assert!((pos_secondary.y - 232.5).abs() < 0.01);
+
+        // 2. Multiple instances sharing the same IP are rendered with distinct ports and selected independently
+        let ui_ctx = egui::Context::default();
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.client_connected = true;
+        app.client_ip = "192.168.0.199".to_string();
+        app.client_port = 43867;
+        app.discovered_peers = vec![
+            DiscoveredPeer {
+                host_name: "SameHost".to_string(),
+                ip: "192.168.0.199".to_string(),
+                port: 22222,
+                last_seen: Instant::now(),
+            },
+            DiscoveredPeer {
+                host_name: "SameHost".to_string(),
+                ip: "192.168.0.199".to_string(),
+                port: 43867,
+                last_seen: Instant::now(),
+            },
+        ];
+
+        let out = run_test_ui(&ui_ctx, Default::default(), |ui| {
+            app.render_client_view(ui);
+        });
+
+        let mut texts = Vec::new();
+        fn collect_texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        collect_texts(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            collect_texts(&c.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|t| t == "192.168.0.199:22222"));
+        assert!(texts.iter().any(|t| t == "192.168.0.199:43867"));
+
+        let p = app.palette(&ui_ctx);
+        let mut active_bg_rects = 0usize;
+        fn count_rect_fill(shape: &egui::epaint::Shape, fill: Color32, count: &mut usize) {
+            match shape {
+                egui::epaint::Shape::Rect(r) => {
+                    if r.fill == fill {
+                        *count += 1;
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        count_rect_fill(s, fill, count);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            count_rect_fill(&c.shape, p.tab_active_bg, &mut active_bg_rects);
+        }
+        assert_eq!(
+            active_bg_rects, 1,
+            "Only the selected (ip, port) instance should be highlighted"
+        );
+    }
+
+    #[test]
+    fn test_gui_active_upload_indicators_nav_badges_and_queue_eta_sync() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let ctx = egui::Context::default();
+        let mut app = create_test_app();
+        let folder = std::env::temp_dir().join("lanshare_gui_upload_test_dir");
+        let _ = std::fs::create_dir_all(&folder);
+        app.host_folders = vec![folder.clone()];
+
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+        let (log_tx, _log_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_downloads = Arc::new(AtomicUsize::new(1));
+        let active_uploads = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        active_uploads.write().unwrap().insert(
+            1,
+            crate::server::ActiveUploadInfo {
+                id: 1,
+                peer: "192.168.1.55".to_string(),
+                folder_root: folder.clone(),
+                file_name: "movie_cut.mkv".to_string(),
+                bytes_sent: 1_500_000_000,
+                total_size: 2_000_000_000,
+                speed_mbps: 100.0,
+                started_at: Instant::now(),
+            },
+        );
+        app.server_handle = Some(ServerHandle {
+            is_running: Arc::new(AtomicBool::new(true)),
+            local_ip: "192.168.1.10".to_string(),
+            all_ips: vec!["192.168.1.10".to_string()],
+            port: 4433,
+            password: "test-secret-ring".to_string(),
+            stop_sender: stop_tx,
+            shared_folders: Arc::new(std::sync::RwLock::new(vec![folder.clone()])),
+            duration_hours: None,
+            registry: Arc::new(std::sync::RwLock::new(
+                crate::server::SharedFolderRegistry::new(vec![folder.clone()]),
+            )),
+            log_tx,
+            active_downloads,
+            active_folder_downloads: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            active_uploads,
+            registry_notify_tx: tokio::sync::watch::channel(0u64).0,
+        });
+
+        let collect_all_text = |shapes: &[egui::epaint::ClippedShape]| -> Vec<String> {
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for c in shapes {
+                walk(&c.shape, &mut out);
+            }
+            out
+        };
+
+        // 1. Host tab shows active upload badge on shared folder + active upload row with GB decimal sizes
+        app.current_tab = AppTab::Host;
+        let host_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_host_tab(ui);
+            });
+        });
+        let host_texts = collect_all_text(&host_out.shapes);
+        assert!(host_texts.iter().any(|t| t.contains("↑ 1 uploading")));
+        assert!(host_texts.iter().any(|t| t.contains("Uploads — Active: 1")));
+        assert!(host_texts.iter().any(|t| t.contains("movie_cut.mkv")));
+        assert!(host_texts
+            .iter()
+            .any(|t| t.contains("1.40 GB / 1.86 GB") || t.contains("GB /")));
+
+        // 2. Left navigation tab buttons render active download and upload badges
+        let p = app.palette(&ctx);
+        let nav_out = run_test_ui(&ctx, Default::default(), |ui| {
+            let _ = LanShareApp::render_nav_tab_button(
+                ui,
+                &p,
+                "Browse LAN",
+                true,
+                Some(("↓ 2", Color32::LIGHT_BLUE, "Active download")),
+            );
+            let _ = LanShareApp::render_nav_tab_button(
+                ui,
+                &p,
+                "Share Folders",
+                false,
+                Some(("↑ 1", Color32::LIGHT_GREEN, "Active upload")),
+            );
+        });
+        let nav_texts = collect_all_text(&nav_out.shapes);
+        assert!(nav_texts.iter().any(|t| t.contains("↓ 2")));
+        assert!(nav_texts.iter().any(|t| t.contains("↑ 1")));
+
+        // 3. Queue ETA matches Active ETA with no pending items, then jumps immediately when pending item added
+        app.download_queue.push_back(QueuedDownloadItem {
+            id: 1,
+            peer_name: "Host-A".to_string(),
+            conn_ctx: ConnectionContext {
+                ip: "192.168.1.20".to_string(),
+                port: 4433,
+                password: "test-secret-ring".to_string(),
+                peer_name: Some("Host-A".to_string()),
+            },
+            is_mock: true,
+            entry: FileEntry {
+                name: "iso_image.iso".to_string(),
+                is_dir: false,
+                size: 1_500_000_000,
+                modified_timestamp: 0,
+            },
+            remote_subpath: "iso_image.iso".to_string(),
+            local_dest_dir: folder.clone(),
+            status: QueueItemStatus::Downloading,
+            started_at: Some(Instant::now() - Duration::from_secs(5)),
+            elapsed_duration: None,
+            completed_at: None,
+            total_bytes: Some(1_500_000_000),
+        });
+        app.active_queue_id = Some(1);
+        app.active_progress = Some(TransferProgress {
+            selected_target: "iso_image.iso".to_string(),
+            file_name: "iso_image.iso".to_string(),
+            bytes_done: 1_000_000_000,
+            bytes_total: 1_500_000_000,
+            speed_mbps: 10.0,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+            is_finished: false,
+        });
+
+        let q1_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_download_queue_panel(ui, 300.0);
+            });
+        });
+        let q1_texts = collect_all_text(&q1_out.shapes);
+        let active_1 = q1_texts
+            .iter()
+            .find(|t| t.contains("ETA:") && !t.contains("Total ETA:"))
+            .expect("Active ETA should render")
+            .clone();
+        let active_eta_val = active_1
+            .split("ETA:")
+            .nth(1)
+            .unwrap_or("")
+            .split('|')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        assert!(!active_eta_val.is_empty());
+        let total_1 = q1_texts
+            .iter()
+            .find(|t| t.contains("Total ETA:"))
+            .expect("Total ETA should render")
+            .clone();
+        assert!(
+            total_1.contains(&format!("Total ETA: {}", active_eta_val)),
+            "Expected Total ETA ({}) to match active ETA ({})",
+            total_1,
+            active_1
+        );
+
+        // Add pending mock folder via enqueue_download -> Total ETA increases immediately on very next render
+        app.mock_session = true;
+        app.client_ip = "192.168.1.20".to_string();
+        app.client_port = 4433;
+        app.enqueue_download(FileEntry {
+            name: "Documents".to_string(),
+            is_dir: true,
+            size: 0,
+            modified_timestamp: 0,
+        });
+        let q2_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_download_queue_panel(ui, 300.0);
+            });
+        });
+        let q2_texts = collect_all_text(&q2_out.shapes);
+        let total_2 = q2_texts
+            .iter()
+            .find(|t| t.contains("Total ETA:"))
+            .expect("Updated Total ETA should render")
+            .clone();
+        assert_ne!(
+            total_1, total_2,
+            "Total ETA must update immediately after enqueue"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn test_gui_host_switch_and_folder_loading_clear_list_and_icon_buttons() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.ring_secret = "party-ring-42".to_string();
+
+        // Populate previous host view
+        app.client_connected = true;
+        app.client_ip = "192.168.1.10".to_string();
+        app.client_port = 4433;
+        app.client_current_path = "OldHostDir/Nested".to_string();
+        app.client_file_list = vec![FileEntry {
+            name: "old_host_file.iso".to_string(),
+            is_dir: false,
+            size: 1024,
+            modified_timestamp: 0,
+        }];
+
+        let collect_all_text = |shapes: &[egui::epaint::ClippedShape]| -> Vec<String> {
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for c in shapes {
+                walk(&c.shape, &mut out);
+            }
+            out
+        };
+
+        // 1. Connected browser toolbar uses pure icon buttons (no "⬆ Up" or "Refresh" text labels)
+        let connected_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let connected_texts = collect_all_text(&connected_out.shapes);
+        assert!(connected_texts.iter().any(|t| t == "old_host_file.iso"));
+        assert!(!connected_texts.iter().any(|t| t.contains("⬆ Up")));
+        assert!(!connected_texts.iter().any(|t| t == "Refresh"));
+
+        // 2. Switching to another host clears old host files immediately and shows loading spinner animation
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+        app.select_and_connect_peer(&DiscoveredPeer {
+            host_name: "New-Host".to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: busy_port,
+            last_seen: Instant::now(),
+        });
+        assert!(app.client_loading);
+        assert!(!app.client_connected);
+        assert!(app.client_current_path.is_empty());
+        assert!(app.client_file_list.is_empty());
+
+        let has_spinner_repaint = |out: &egui::FullOutput| {
+            out.viewport_output
+                .values()
+                .any(|vp| vp.repaint_delay == Duration::ZERO)
+        };
+
+        let switching_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let switching_texts = collect_all_text(&switching_out.shapes);
+        assert!(!switching_texts.iter().any(|t| t == "old_host_file.iso"));
+        assert!(!switching_texts
+            .iter()
+            .any(|t| t.contains("Populating list")));
+        assert!(has_spinner_repaint(&switching_out));
+
+        // 3. Same when already connected and folder navigation (e.g. Up) is in flight
+        app.client_connected = true;
+        app.client_loading = true;
+        app.client_current_path = "SubDir".to_string();
+        app.client_file_list.clear();
+        let nav_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let nav_texts = collect_all_text(&nav_out.shapes);
+        assert!(!nav_texts.iter().any(|t| t.contains("Populating list")));
+        assert!(!nav_texts.iter().any(|t| t.contains("(Folder is empty)")));
+        assert!(has_spinner_repaint(&nav_out));
+        drop(listener);
+    }
+
+    #[test]
+    fn test_downloads_and_uploads_always_visible_with_compact_default_and_resize() {
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        assert!(app.download_section_height <= 100.0);
+        assert!(app.upload_section_height <= 100.0);
+
+        let ctx = egui::Context::default();
+        let browse_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let browse_texts = collect_rendered_texts(&browse_out);
+        assert!(
+            browse_texts
+                .iter()
+                .any(|t| t == "Downloads — Active: 0 | Queued: 0 | Done: 0"),
+            "{:?}",
+            browse_texts
+        );
+        assert!(
+            browse_texts
+                .iter()
+                .any(|t| t == "No active or queued downloads."),
+            "{:?}",
+            browse_texts
+        );
+
+        let host_out_small = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_host_tab(ui);
+            });
+        });
+        let host_texts = collect_rendered_texts(&host_out_small);
+        assert!(
+            host_texts.iter().any(|t| t == "Uploads — Active: 0"),
+            "{:?}",
+            host_texts
+        );
+        assert!(
+            host_texts.iter().any(|t| t == "No active uploads."),
+            "{:?}",
+            host_texts
+        );
+
+        // Verify resizing upload_section_height changes the rendered Uploads panel geometry
+        let find_uploads_header_y = |out: &egui::FullOutput| -> f32 {
+            out.shapes
+                .iter()
+                .find_map(|c| {
+                    if let egui::epaint::Shape::Text(t) = &c.shape {
+                        if t.galley.job.text == "Uploads — Active: 0" {
+                            return Some(t.pos.y);
+                        }
+                    }
+                    None
+                })
+                .expect("Uploads header must be rendered")
+        };
+        let header_y_default = find_uploads_header_y(&host_out_small);
+        app.upload_section_height = 220.0;
+        let host_out_tall = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_host_tab(ui);
+            });
+        });
+        let header_y_resized = find_uploads_header_y(&host_out_tall);
+        assert!(
+            header_y_resized < header_y_default - 60.0,
+            "Growing upload_section_height should move Uploads header upward ({} vs {})",
+            header_y_resized,
+            header_y_default
+        );
     }
 }

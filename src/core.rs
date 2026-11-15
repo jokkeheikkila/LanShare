@@ -1,5 +1,8 @@
 use crate::client::{self, ClientTlsStream, ConnectionContext, TransferProgress};
-use crate::protocol::{DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT};
+use crate::protocol::{
+    ClientCommand, DiscoveredPeer, FileEntry, HandshakeResponse, ServerCommandResponse,
+    DEFAULT_TCP_PORT,
+};
 use crate::security::{ensure_safe_client_dest_path, sanitize_client_relative_path};
 use chrono::{DateTime, Local};
 use std::collections::VecDeque;
@@ -10,11 +13,12 @@ use tokio::io::AsyncWriteExt;
 
 /// Results posted by background client network and download worker tasks to the UI loop.
 pub enum ClientActionResult {
-    Connected(ClientTlsStream, HandshakeResponse, String),
+    Connected(ClientTlsStream, HandshakeResponse, String, u16),
     ConnectFailed(String),
     ListingLoaded(ClientTlsStream, String, Vec<FileEntry>),
     ListingFailed(Option<ClientTlsStream>, String),
     QueueItemFinished { id: u64, result: Result<(), String> },
+    FolderSizeResolved { id: u64, total_bytes: u64 },
 }
 
 /// Outcome summary produced when a queued download finishes or is cancelled.
@@ -25,9 +29,42 @@ pub struct QueueCompletionInfo {
     pub error: Option<String>,
 }
 
-/// Sorts discovered LAN peers in-place case-insensitively by host name.
+/// Sorts discovered LAN peers in-place case-insensitively by host name, then IP and TCP port.
 pub fn sort_peers_alphabetically(peers: &mut [DiscoveredPeer]) {
-    peers.sort_by_key(|p| p.host_name.to_lowercase());
+    peers.sort_by(|a, b| {
+        a.host_name
+            .to_lowercase()
+            .cmp(&b.host_name.to_lowercase())
+            .then_with(|| a.ip.cmp(&b.ip))
+            .then_with(|| a.port.cmp(&b.port))
+    });
+}
+
+/// Parses a user-entered Direct IP/hostname string (supporting `host`, `host:port`, `[ipv6]:port`, or bare `ipv6`).
+pub fn parse_host_and_port(input: &str, default_port: u16) -> (String, u16) {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            if let Some(port_str) = after.strip_prefix(':') {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    if port > 0 {
+                        return (host.to_string(), port);
+                    }
+                }
+            }
+            return (host.to_string(), default_port);
+        }
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                if port > 0 {
+                    return (host.to_string(), port);
+                }
+            }
+        }
+    }
+    (trimmed.to_string(), default_port)
 }
 
 /// Returns display ordering priority for queue entries (`Downloading` -> `Pending` -> `Failed` -> `Completed` -> `Cancelled`).
@@ -980,28 +1017,16 @@ pub fn format_file_size(bytes: u64) -> String {
         return "0 B".to_string();
     }
 
-    let (val, unit) = if bytes >= TB {
-        (bytes as f64 / TB as f64, "TB")
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
     } else if bytes >= GB {
-        (bytes as f64 / GB as f64, "GB")
+        format!("{:.2} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
-        (bytes as f64 / MB as f64, "MB")
+        format!("{:.0} MB", (bytes as f64 / MB as f64).round())
     } else if bytes >= KB {
-        (bytes as f64 / KB as f64, "KB")
+        format!("{:.0} KB", (bytes as f64 / KB as f64).round())
     } else {
-        return format!("{} B", bytes);
-    };
-
-    let rounded = val.round();
-    if rounded == 0.0 {
-        // Show decimals if otherwise zero
-        if val >= 0.095 {
-            format!("{:.1} {}", val, unit)
-        } else {
-            format!("{:.2} {}", val, unit)
-        }
-    } else {
-        format!("{:.0} {}", rounded, unit)
+        format!("{} B", bytes)
     }
 }
 
@@ -1232,6 +1257,158 @@ impl EtaStabilizer {
 
     pub fn current(&self) -> Option<u64> {
         self.cached_eta
+    }
+}
+
+/// Computed remaining-byte and stabilized ETA values for the active download and pending queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct QueueEtaSummary {
+    pub active_remaining: u64,
+    pub queued_pending_bytes: u64,
+    pub total_remaining_bytes: u64,
+    pub active_speed: Option<f32>,
+    pub active_eta: Option<u64>,
+    pub total_eta: Option<u64>,
+}
+
+/// Computes active and total queue ETAs consistently across GUI and TUI.
+/// When no pending items with remaining bytes exist in the queue, `total_eta` matches `active_eta`
+/// directly; when pending items are added/removed/resolved, `total_eta` updates immediately.
+pub fn compute_queue_etas(
+    download_queue: &VecDeque<QueuedDownloadItem>,
+    active_queue_id: Option<u64>,
+    active_progress: Option<&TransferProgress>,
+    active_eta_stabilizer: &mut EtaStabilizer,
+    total_eta_stabilizer: &mut EtaStabilizer,
+) -> QueueEtaSummary {
+    let active_speed = active_progress.map(|p| p.speed_mbps).filter(|&s| s > 0.0);
+    let active_remaining = active_progress
+        .map(|p| p.bytes_total.saturating_sub(p.bytes_done))
+        .unwrap_or(0);
+
+    let mut pending_count = 0usize;
+    let mut queued_pending_bytes = 0u64;
+    for item in download_queue
+        .iter()
+        .filter(|i| i.status == QueueItemStatus::Pending)
+    {
+        pending_count += 1;
+        queued_pending_bytes =
+            queued_pending_bytes.saturating_add(item.total_bytes.unwrap_or(item.entry.size));
+    }
+    let total_remaining_bytes = active_remaining.saturating_add(queued_pending_bytes);
+
+    let active_item = download_queue
+        .iter()
+        .find(|i| i.status == QueueItemStatus::Downloading);
+    let active_elapsed = active_item.and_then(|i| i.started_at.map(|t| t.elapsed()));
+
+    let active_key = active_queue_id
+        .map(|id| id.to_string())
+        .or_else(|| active_progress.map(|p| p.selected_target.clone()));
+
+    let raw_active_eta = if let Some(prog) = active_progress {
+        if prog.is_finished {
+            Some(0)
+        } else {
+            estimate_folder_remaining_seconds(
+                active_remaining,
+                prog.speed_mbps,
+                prog.current_file,
+                prog.total_files,
+                active_elapsed,
+            )
+        }
+    } else {
+        active_speed.and_then(|spd| estimate_remaining_seconds(active_remaining, spd))
+    };
+    let active_eta = active_eta_stabilizer.update(active_key.as_deref(), raw_active_eta);
+
+    let total_eta = if queued_pending_bytes == 0 {
+        total_eta_stabilizer.reset();
+        active_eta
+    } else {
+        let raw_total_eta = match (active_eta, active_speed) {
+            (Some(act_s), Some(spd)) => {
+                let pending_secs =
+                    estimate_remaining_seconds(queued_pending_bytes, spd).unwrap_or(0);
+                Some(act_s + pending_secs)
+            }
+            (Some(act_s), None) => Some(act_s),
+            (None, Some(spd)) => estimate_remaining_seconds(total_remaining_bytes, spd),
+            (None, None) => None,
+        };
+        let total_key = format!(
+            "{}:{}:{}",
+            active_key.as_deref().unwrap_or(""),
+            pending_count,
+            queued_pending_bytes
+        );
+        total_eta_stabilizer.update(Some(&total_key), raw_total_eta)
+    };
+
+    QueueEtaSummary {
+        active_remaining,
+        queued_pending_bytes,
+        total_remaining_bytes,
+        active_speed,
+        active_eta,
+        total_eta,
+    }
+}
+
+/// Computes the total byte size of a simulated mock folder recursively.
+pub fn mock_folder_total_bytes(mock_ip: &str, subpath: &str) -> u64 {
+    let clean = subpath.trim_matches('/');
+    let mut total = 0u64;
+    let mut stack = vec![clean.to_string()];
+    while let Some(dir) = stack.pop() {
+        for entry in mock_directory_entries(mock_ip, &dir) {
+            if entry.is_dir {
+                let child = if dir.is_empty() {
+                    entry.name
+                } else {
+                    format!("{}/{}", dir, entry.name)
+                };
+                stack.push(child);
+            } else {
+                total = total.saturating_add(entry.size);
+            }
+        }
+    }
+    total
+}
+
+/// Fetches the recursive byte size of a queued remote folder over a short-lived manifest query.
+pub async fn resolve_remote_folder_total_bytes(
+    conn_ctx: ConnectionContext,
+    subpath: String,
+) -> Option<u64> {
+    let (mut stream, _) = client::connect_to_host(&conn_ctx.ip, conn_ctx.port, &conn_ctx.password)
+        .await
+        .ok()?;
+    let cmd = ClientCommand::GetDirectoryManifest { subpath };
+    let cmd_bytes = serde_json::to_vec(&cmd).ok()?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::network::write_frame(&mut stream, &cmd_bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let resp_bytes = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::network::read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let _ = stream.shutdown().await;
+    match serde_json::from_slice::<ServerCommandResponse>(&resp_bytes).ok()? {
+        ServerCommandResponse::DirectoryManifest { files, .. } => {
+            Some(files.iter().map(|f| f.file_size).sum())
+        }
+        _ => None,
     }
 }
 
@@ -1518,28 +1695,32 @@ const MOCK_FRIEND_DOWNLOADS: &[(&str, &str, u64)] = &[
     (
         "Alice-Laptop (192.168.1.42)",
         "vacation_highlights.mp4",
-        42_500_000,
+        6_400_000_000,
     ),
-    ("Bob-Deck (192.168.1.77)", "party_playlist.zip", 18_400_000),
+    (
+        "Bob-Deck (192.168.1.77)",
+        "party_playlist.zip",
+        1_450_000_000,
+    ),
     (
         "Charlie-Workstation (192.168.1.105)",
-        "lan_notes_2026.pdf",
-        3_250_000,
+        "4k_raw_footage_bundle.tar.zst",
+        14_800_000_000,
     ),
     (
         "Diana-Mini (192.168.1.63)",
         "retro_pixel_pack.tar.gz",
-        64_100_000,
+        720_000_000,
     ),
     (
         "Eve-MacBook (192.168.1.91)",
-        "boardgame_rules.pdf",
-        5_800_000,
+        "full_studio_backup.iso",
+        9_200_000_000,
     ),
     (
         "Frank-LinuxBox (192.168.1.118)",
         "weekend_photos_raw.zip",
-        128_000_000,
+        3_850_000_000,
     ),
 ];
 
@@ -1548,6 +1729,11 @@ const MOCK_FRIEND_DOWNLOADS: &[(&str, &str, u64)] = &[
 pub struct MockDownloadConfig {
     pub initial_delay: std::time::Duration,
     pub transfer_duration: std::time::Duration,
+    /// When set, derives realistic transfer duration from `size_bytes / (speed * 1 MiB/s)`
+    /// (clamped to 4–120s) instead of using the fixed `transfer_duration`.
+    pub simulated_speed_mbps: Option<f32>,
+    /// Number of concurrent mock friend uploads running in parallel (`>= 1`).
+    pub concurrent_workers: usize,
     pub between_delay: std::time::Duration,
     pub max_events: Option<usize>,
     pub simulate_interruptions: bool,
@@ -1557,9 +1743,11 @@ pub struct MockDownloadConfig {
 impl Default for MockDownloadConfig {
     fn default() -> Self {
         Self {
-            initial_delay: std::time::Duration::from_millis(1200),
-            transfer_duration: std::time::Duration::from_millis(2000),
-            between_delay: std::time::Duration::from_millis(4000),
+            initial_delay: std::time::Duration::from_millis(900),
+            transfer_duration: std::time::Duration::from_secs(12),
+            simulated_speed_mbps: Some(65.0),
+            concurrent_workers: 3,
+            between_delay: std::time::Duration::from_millis(2500),
             max_events: None,
             simulate_interruptions: true,
             interruption_delay: std::time::Duration::from_millis(2500),
@@ -1567,46 +1755,15 @@ impl Default for MockDownloadConfig {
     }
 }
 
-struct MockActiveDownloadGuard {
-    total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    by_folder:
-        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<std::path::PathBuf, usize>>>,
-    root: std::path::PathBuf,
-}
-
-impl MockActiveDownloadGuard {
-    fn new(
-        total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        by_folder: std::sync::Arc<
-            std::sync::RwLock<std::collections::HashMap<std::path::PathBuf, usize>>,
-        >,
-        root: std::path::PathBuf,
-    ) -> Self {
-        total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut map) = by_folder.write() {
-            *map.entry(root.clone()).or_insert(0) += 1;
-        }
-        Self {
-            total,
-            by_folder,
-            root,
-        }
-    }
-}
-
-impl Drop for MockActiveDownloadGuard {
-    fn drop(&mut self) {
-        self.total
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut map) = self.by_folder.write() {
-            if let Some(count) = map.get_mut(&self.root) {
-                if *count <= 1 {
-                    map.remove(&self.root);
-                } else {
-                    *count -= 1;
-                }
-            }
-        }
+fn effective_mock_transfer_duration(
+    size_bytes: u64,
+    config: &MockDownloadConfig,
+) -> std::time::Duration {
+    if let Some(speed_mbps) = config.simulated_speed_mbps.filter(|s| *s > 0.0) {
+        let secs = (size_bytes as f64) / (speed_mbps as f64 * 1024.0 * 1024.0);
+        std::time::Duration::from_secs_f64(secs.clamp(4.0, 120.0))
+    } else {
+        config.transfer_duration
     }
 }
 
@@ -1668,8 +1825,10 @@ async fn wait_mock_transfer(
     shared_folders: &std::sync::RwLock<Vec<std::path::PathBuf>>,
     root: &std::path::Path,
     registry_notify_rx: &mut tokio::sync::watch::Receiver<u64>,
+    progress_range: Option<(&crate::server::ActiveDownloadGuard, u64, u64, f32)>,
 ) -> MockTransferOutcome {
-    let deadline = tokio::time::Instant::now() + duration;
+    let start = tokio::time::Instant::now();
+    let deadline = start + duration;
     let slice = std::time::Duration::from_millis(100);
     loop {
         if !is_running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1683,6 +1842,16 @@ async fn wait_mock_transfer(
             return MockTransferOutcome::ShareRemoved;
         }
         let now = tokio::time::Instant::now();
+        if let Some((guard, from_bytes, to_bytes, speed_mbps)) = progress_range {
+            let frac = if duration.is_zero() {
+                1.0
+            } else {
+                (now.saturating_duration_since(start).as_secs_f64() / duration.as_secs_f64())
+                    .clamp(0.0, 1.0)
+            };
+            let current = from_bytes + ((to_bytes.saturating_sub(from_bytes)) as f64 * frac) as u64;
+            guard.update_progress(current, speed_mbps);
+        }
         if now >= deadline {
             return MockTransferOutcome::Completed;
         }
@@ -1727,6 +1896,8 @@ struct MockServerTransferCtx<'a> {
     peer: &'a str,
     file_label: &'a str,
     size_label: &'a str,
+    size_bytes: u64,
+    guard: &'a crate::server::ActiveDownloadGuard,
     is_running: &'a std::sync::atomic::AtomicBool,
     shared_folders: &'a std::sync::RwLock<Vec<std::path::PathBuf>>,
     root: &'a std::path::Path,
@@ -1735,10 +1906,18 @@ struct MockServerTransferCtx<'a> {
 }
 
 async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool {
+    let transfer_duration = effective_mock_transfer_duration(ctx.size_bytes, &ctx.config);
     let first_phase = if ctx.simulate_drop {
-        ctx.config.transfer_duration / 2
+        transfer_duration / 2
     } else {
-        ctx.config.transfer_duration
+        transfer_duration
+    };
+    let total_secs = transfer_duration.as_secs_f64().max(0.05);
+    let sim_speed = (ctx.size_bytes as f64 / (1024.0 * 1024.0 * total_secs)) as f32;
+    let mid_bytes = if ctx.simulate_drop {
+        ctx.size_bytes / 2
+    } else {
+        ctx.size_bytes
     };
 
     let outcome = wait_mock_transfer(
@@ -1747,6 +1926,7 @@ async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool
         ctx.shared_folders,
         ctx.root,
         ctx.registry_notify_rx,
+        Some((ctx.guard, 0, mid_bytes, sim_speed)),
     )
     .await;
     if outcome != MockTransferOutcome::Completed {
@@ -1754,6 +1934,7 @@ async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool
     }
 
     if ctx.simulate_drop {
+        ctx.guard.update_progress(mid_bytes, 0.0);
         push_mock_server_log(
             ctx.log_tx,
             format!(
@@ -1768,6 +1949,7 @@ async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool
             ctx.shared_folders,
             ctx.root,
             ctx.registry_notify_rx,
+            None,
         )
         .await;
         if outage_outcome != MockTransferOutcome::Completed {
@@ -1780,13 +1962,14 @@ async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool
             false,
         );
 
-        let second_phase = ctx.config.transfer_duration.saturating_sub(first_phase);
+        let second_phase = transfer_duration.saturating_sub(first_phase);
         let resume_outcome = wait_mock_transfer(
             second_phase,
             ctx.is_running,
             ctx.shared_folders,
             ctx.root,
             ctx.registry_notify_rx,
+            Some((ctx.guard, mid_bytes, ctx.size_bytes, sim_speed)),
         )
         .await;
         if resume_outcome != MockTransferOutcome::Completed {
@@ -1805,7 +1988,7 @@ async fn run_single_mock_server_transfer(ctx: MockServerTransferCtx<'_>) -> bool
     false
 }
 
-/// Runs a loop simulating made-up friends downloading dummy files from currently shared folders.
+/// Runs simulated friend downloads from currently shared folders across `concurrent_workers`.
 pub fn run_mock_server_downloads(
     handle: &crate::server::ServerHandle,
     config: MockDownloadConfig,
@@ -1815,110 +1998,132 @@ pub fn run_mock_server_downloads(
     let log_tx = handle.log_tx.clone();
     let active_downloads = handle.active_downloads.clone();
     let active_folder_downloads = handle.active_folder_downloads.clone();
-    let mut registry_notify_rx = handle.registry_notify_tx.subscribe();
+    let active_uploads = handle.active_uploads.clone();
+    let registry_notify_tx = handle.registry_notify_tx.clone();
 
     async move {
-        if !wait_mock_delay(
-            config.initial_delay,
-            &is_running,
-            &mut registry_notify_rx,
-            false,
-        )
-        .await
-        {
-            return;
+        let workers = config.concurrent_workers.max(1);
+        let next_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let emitted_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for worker_id in 0..workers {
+            let is_running = is_running.clone();
+            let shared_folders = shared_folders.clone();
+            let log_tx = log_tx.clone();
+            let active_downloads = active_downloads.clone();
+            let active_folder_downloads = active_folder_downloads.clone();
+            let active_uploads = active_uploads.clone();
+            let mut registry_notify_rx = registry_notify_tx.subscribe();
+            let next_idx = next_idx.clone();
+            let emitted_total = emitted_total.clone();
+
+            join_set.spawn(async move {
+                let stagger = config.initial_delay
+                    + std::time::Duration::from_millis((worker_id as u64) * 900);
+                if !wait_mock_delay(stagger, &is_running, &mut registry_notify_rx, false).await {
+                    return;
+                }
+
+                loop {
+                    if !is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(limit) = config.max_events {
+                        if emitted_total.load(std::sync::atomic::Ordering::Relaxed) >= limit {
+                            break;
+                        }
+                    }
+
+                    let folders = shared_folders.read().map(|g| g.clone()).unwrap_or_default();
+                    if folders.is_empty() {
+                        if !wait_mock_delay(
+                            config.between_delay,
+                            &is_running,
+                            &mut registry_notify_rx,
+                            true,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let root = folders[idx % folders.len()].clone();
+                    let (peer, dummy_file, size_bytes) =
+                        MOCK_FRIEND_DOWNLOADS[idx % MOCK_FRIEND_DOWNLOADS.len()];
+                    let simulate_drop =
+                        config.simulate_interruptions && (idx + 1).is_multiple_of(2);
+
+                    let folder_label = root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("shared");
+                    let file_label = format!("{folder_label}/{dummy_file}");
+                    let size_label = format_file_size(size_bytes);
+
+                    let guard = crate::server::ActiveDownloadGuard::new(
+                        active_downloads.clone(),
+                        active_folder_downloads.clone(),
+                        active_uploads.clone(),
+                        root.clone(),
+                        peer.to_string(),
+                        file_label.clone(),
+                        0,
+                        size_bytes,
+                    );
+                    push_mock_server_log(
+                        &log_tx,
+                        format!("{peer} started downloading '{file_label}' ({size_label})"),
+                        false,
+                    );
+
+                    let should_stop = run_single_mock_server_transfer(MockServerTransferCtx {
+                        config,
+                        simulate_drop,
+                        peer,
+                        file_label: &file_label,
+                        size_label: &size_label,
+                        size_bytes,
+                        guard: &guard,
+                        is_running: &is_running,
+                        shared_folders: &shared_folders,
+                        root: &root,
+                        registry_notify_rx: &mut registry_notify_rx,
+                        log_tx: &log_tx,
+                    })
+                    .await;
+
+                    drop(guard);
+                    if should_stop {
+                        break;
+                    }
+                    let done_events =
+                        emitted_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(limit) = config.max_events {
+                        if done_events >= limit {
+                            break;
+                        }
+                    }
+
+                    if !wait_mock_delay(
+                        config.between_delay,
+                        &is_running,
+                        &mut registry_notify_rx,
+                        false,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            });
         }
 
-        let mut idx: usize = 0;
-        let mut emitted: usize = 0;
-
-        loop {
-            if !is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            if let Some(limit) = config.max_events {
-                if emitted >= limit {
-                    break;
-                }
-            }
-
-            let folders = shared_folders.read().map(|g| g.clone()).unwrap_or_default();
-            if folders.is_empty() {
-                if !wait_mock_delay(
-                    config.between_delay,
-                    &is_running,
-                    &mut registry_notify_rx,
-                    true,
-                )
-                .await
-                {
-                    break;
-                }
-                continue;
-            }
-
-            let root = folders[idx % folders.len()].clone();
-            let (peer, dummy_file, size_bytes) =
-                MOCK_FRIEND_DOWNLOADS[idx % MOCK_FRIEND_DOWNLOADS.len()];
-            idx = idx.wrapping_add(1);
-            let simulate_drop = config.simulate_interruptions && idx.is_multiple_of(2);
-
-            let folder_label = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("shared");
-            let file_label = format!("{folder_label}/{dummy_file}");
-            let size_label = format_file_size(size_bytes);
-
-            let _guard = MockActiveDownloadGuard::new(
-                active_downloads.clone(),
-                active_folder_downloads.clone(),
-                root.clone(),
-            );
-            push_mock_server_log(
-                &log_tx,
-                format!("{peer} started downloading '{file_label}' ({size_label})"),
-                false,
-            );
-
-            let should_stop = run_single_mock_server_transfer(MockServerTransferCtx {
-                config,
-                simulate_drop,
-                peer,
-                file_label: &file_label,
-                size_label: &size_label,
-                is_running: &is_running,
-                shared_folders: &shared_folders,
-                root: &root,
-                registry_notify_rx: &mut registry_notify_rx,
-                log_tx: &log_tx,
-            })
-            .await;
-
-            drop(_guard);
-            if should_stop {
-                break;
-            }
-            emitted += 1;
-
-            if let Some(limit) = config.max_events {
-                if emitted >= limit {
-                    break;
-                }
-            }
-
-            if !wait_mock_delay(
-                config.between_delay,
-                &is_running,
-                &mut registry_notify_rx,
-                false,
-            )
-            .await
-            {
-                break;
-            }
-        }
+        while join_set.join_next().await.is_some() {}
     }
 }
 
@@ -2026,7 +2231,7 @@ mod tests {
             yesterday.format("%Y-%m-%d %H:%M:%S").to_string()
         );
 
-        // File and folder size formatting (rounded, no decimals, decimals only if otherwise zero)
+        // File and folder size formatting (whole integers for B/KB/MB, 2 decimals for GB/TB)
         assert_eq!(format_file_size(0), "0 B");
         assert_eq!(format_file_size(1), "1 B");
         assert_eq!(format_file_size(500), "500 B");
@@ -2036,12 +2241,21 @@ mod tests {
         assert_eq!(format_file_size(1024 * 1024), "1 MB");
         assert_eq!(format_file_size(15 * 1024 * 1024 + 300_000), "15 MB");
         assert_eq!(format_file_size(15 * 1024 * 1024 + 800_000), "16 MB");
-        assert_eq!(format_file_size(1024 * 1024 * 1024), "1 GB");
-        assert_eq!(format_file_size(1024 * 1024 * 1024 + 200_000_000), "1 GB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(
+            format_file_size(1024 * 1024 * 1024 + 200_000_000),
+            "1.19 GB"
+        );
         assert_eq!(
             format_file_size(1024 * 1024 * 1024 * 2 + 700_000_000),
-            "3 GB"
+            "2.65 GB"
         );
+        let gb_total: u64 = 1_503_238_554; // ~1.40 GB
+        let gb_80_pct: u64 = (gb_total * 80) / 100; // ~1.12 GB
+        assert_ne!(format_file_size(gb_80_pct), format_file_size(gb_total));
+        assert_eq!(format_file_size(gb_80_pct), "1.12 GB");
+        assert_eq!(format_file_size(gb_total), "1.40 GB");
+        assert_eq!(format_file_size(1024u64.pow(4)), "1.00 TB");
 
         // ETA Stabilizer: slow polling and smoothing > 2m, fast countdown <= 1m
         let mut stabilizer = EtaStabilizer::new();
@@ -2303,6 +2517,9 @@ mod tests {
             active_folder_downloads: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            active_uploads: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             registry_notify_tx,
         };
         (handle, log_rx, stop_rx)
@@ -2321,6 +2538,8 @@ mod tests {
         let cfg = MockDownloadConfig {
             initial_delay: std::time::Duration::from_millis(5),
             transfer_duration: std::time::Duration::from_millis(40),
+            simulated_speed_mbps: None,
+            concurrent_workers: 1,
             between_delay: std::time::Duration::from_millis(5),
             max_events: Some(2),
             simulate_interruptions: false,
@@ -2380,6 +2599,8 @@ mod tests {
         let cfg = MockDownloadConfig {
             initial_delay: std::time::Duration::from_millis(5),
             transfer_duration: std::time::Duration::from_millis(2000),
+            simulated_speed_mbps: None,
+            concurrent_workers: 1,
             between_delay: std::time::Duration::from_millis(5),
             max_events: None,
             simulate_interruptions: false,
@@ -2418,6 +2639,8 @@ mod tests {
         let cfg = MockDownloadConfig {
             initial_delay: std::time::Duration::from_millis(5),
             transfer_duration: std::time::Duration::from_millis(2000),
+            simulated_speed_mbps: None,
+            concurrent_workers: 1,
             between_delay: std::time::Duration::from_millis(5),
             max_events: Some(1),
             simulate_interruptions: false,
@@ -2548,6 +2771,8 @@ mod tests {
         let cfg = MockDownloadConfig {
             initial_delay: std::time::Duration::from_millis(5),
             transfer_duration: std::time::Duration::from_millis(20),
+            simulated_speed_mbps: None,
+            concurrent_workers: 1,
             between_delay: std::time::Duration::from_millis(5),
             max_events: Some(2),
             simulate_interruptions: true,
@@ -2710,5 +2935,184 @@ mod tests {
         );
         assert!(!already_removed_err.cancelled);
         assert_eq!(already_removed_err.error.as_deref(), Some("Disk full"));
+    }
+
+    #[test]
+    fn test_parse_host_and_port_and_multi_instance_peer_sort() {
+        assert_eq!(
+            parse_host_and_port("192.168.0.199", DEFAULT_TCP_PORT),
+            ("192.168.0.199".to_string(), DEFAULT_TCP_PORT)
+        );
+        assert_eq!(
+            parse_host_and_port(" 192.168.0.199:43867 ", DEFAULT_TCP_PORT),
+            ("192.168.0.199".to_string(), 43867)
+        );
+        assert_eq!(
+            parse_host_and_port("[fe80::1]:45000", DEFAULT_TCP_PORT),
+            ("fe80::1".to_string(), 45000)
+        );
+        assert_eq!(
+            parse_host_and_port("fe80::1", DEFAULT_TCP_PORT),
+            ("fe80::1".to_string(), DEFAULT_TCP_PORT)
+        );
+        assert_eq!(
+            parse_host_and_port("192.168.0.199:0", DEFAULT_TCP_PORT),
+            ("192.168.0.199:0".to_string(), DEFAULT_TCP_PORT)
+        );
+
+        let mut peers = vec![
+            DiscoveredPeer {
+                host_name: "Workstation".to_string(),
+                ip: "192.168.0.199".to_string(),
+                port: 43867,
+                last_seen: Instant::now(),
+            },
+            DiscoveredPeer {
+                host_name: "Workstation".to_string(),
+                ip: "192.168.0.199".to_string(),
+                port: 22222,
+                last_seen: Instant::now(),
+            },
+        ];
+        sort_peers_alphabetically(&mut peers);
+        assert_eq!(peers[0].port, 22222);
+        assert_eq!(peers[1].port, 43867);
+    }
+
+    #[test]
+    fn test_compute_queue_etas_consistency_and_immediate_queue_updates() {
+        let make_item = |id: u64, name: &str, size: u64, is_dir: bool, status: QueueItemStatus| {
+            QueuedDownloadItem {
+                id,
+                peer_name: "Host-A".to_string(),
+                conn_ctx: ConnectionContext {
+                    ip: "192.168.1.10".to_string(),
+                    port: DEFAULT_TCP_PORT,
+                    password: "secret".to_string(),
+                    peer_name: None,
+                },
+                is_mock: false,
+                entry: FileEntry {
+                    name: name.to_string(),
+                    is_dir,
+                    size,
+                    modified_timestamp: 0,
+                },
+                remote_subpath: name.to_string(),
+                local_dest_dir: PathBuf::from("/tmp"),
+                status,
+                started_at: Some(Instant::now()),
+                elapsed_duration: None,
+                completed_at: None,
+                total_bytes: if is_dir { None } else { Some(size) },
+            }
+        };
+
+        let mut queue = VecDeque::new();
+        queue.push_back(make_item(
+            1,
+            "movie.iso",
+            300 * 1024 * 1024,
+            false,
+            QueueItemStatus::Downloading,
+        ));
+        let prog = TransferProgress {
+            selected_target: "movie.iso".to_string(),
+            file_name: "movie.iso".to_string(),
+            bytes_done: 0,
+            bytes_total: 300 * 1024 * 1024,
+            speed_mbps: 1.0, // 300s (> 2m slow-poll window)
+            is_finished: false,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+        };
+        let mut active_stab = EtaStabilizer::new();
+        let mut total_stab = EtaStabilizer::new();
+
+        // 1. Single active item: total_eta must equal active_eta exactly
+        let s1 = compute_queue_etas(
+            &queue,
+            Some(1),
+            Some(&prog),
+            &mut active_stab,
+            &mut total_stab,
+        );
+        assert_eq!(s1.active_eta, Some(300));
+        assert_eq!(s1.total_eta, Some(300));
+
+        // 2. Immediately queue a 120 MB pending file: total_eta jumps immediately without 4s lag
+        queue.push_back(make_item(
+            2,
+            "addon.zip",
+            120 * 1024 * 1024,
+            false,
+            QueueItemStatus::Pending,
+        ));
+        let s2 = compute_queue_etas(
+            &queue,
+            Some(1),
+            Some(&prog),
+            &mut active_stab,
+            &mut total_stab,
+        );
+        assert_eq!(s2.active_eta, Some(300));
+        assert_eq!(s2.total_eta, Some(420));
+
+        // 3. Queue a second pending file: total_eta updates immediately again
+        queue.push_back(make_item(
+            3,
+            "patch.bin",
+            60 * 1024 * 1024,
+            false,
+            QueueItemStatus::Pending,
+        ));
+        let s3 = compute_queue_etas(
+            &queue,
+            Some(1),
+            Some(&prog),
+            &mut active_stab,
+            &mut total_stab,
+        );
+        assert_eq!(s3.total_eta, Some(480));
+
+        // 4. Remove pending items: total_eta drops back to match active_eta immediately
+        queue.retain(|i| i.status == QueueItemStatus::Downloading);
+        let s4 = compute_queue_etas(
+            &queue,
+            Some(1),
+            Some(&prog),
+            &mut active_stab,
+            &mut total_stab,
+        );
+        assert_eq!(s4.active_eta, Some(300));
+        assert_eq!(s4.total_eta, Some(300));
+
+        // 5. Mock folder total bytes sums recursively
+        assert!(mock_folder_total_bytes("mock://bob", "LAN_Party_Photos") > 0);
+        assert!(mock_folder_total_bytes("mock://alice", "Design_Assets") > 0);
+    }
+
+    #[test]
+    fn test_mock_server_upload_sizes_and_realistic_duration() {
+        let cfg = MockDownloadConfig::default();
+        assert!(cfg.simulated_speed_mbps.unwrap_or(0.0) > 0.0);
+        assert!(
+            cfg.concurrent_workers >= 2,
+            "Mock server should run multiple uploads concurrently, got {}",
+            cfg.concurrent_workers
+        );
+        assert!(MOCK_FRIEND_DOWNLOADS
+            .iter()
+            .any(|(_, _, s)| *s >= 5_000_000_000));
+        for (_, _, size_bytes) in MOCK_FRIEND_DOWNLOADS {
+            let dur = effective_mock_transfer_duration(*size_bytes, &cfg);
+            assert!(
+                dur >= std::time::Duration::from_secs(4),
+                "Mock upload {} bytes took only {:?}",
+                size_bytes,
+                dur
+            );
+        }
     }
 }
