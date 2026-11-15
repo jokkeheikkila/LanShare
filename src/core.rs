@@ -1357,6 +1357,38 @@ pub fn compute_queue_etas(
     }
 }
 
+/// Delay before showing the loading spinner on browse/connect so fast local responses do not flash.
+pub const LOADING_SPINNER_DELAY: Duration = Duration::from_millis(250);
+
+/// Returns true once `loading` has been active for at least [`LOADING_SPINNER_DELAY`].
+pub fn should_show_loading_spinner(loading: bool, started_at: Option<Instant>) -> bool {
+    loading && started_at.is_some_and(|t| t.elapsed() >= LOADING_SPINNER_DELAY)
+}
+
+/// Computes a stabilized total ETA (in seconds) across active concurrent server uploads.
+pub fn compute_active_uploads_total_eta(
+    uploads: &[crate::server::ActiveUploadInfo],
+    stabilizer: &mut EtaStabilizer,
+) -> Option<u64> {
+    let raw_max_eta = uploads
+        .iter()
+        .filter_map(|u| {
+            let rem = u.total_size.saturating_sub(u.bytes_sent);
+            if rem > 0 {
+                estimate_remaining_seconds(rem, u.speed_mbps)
+            } else {
+                None
+            }
+        })
+        .max();
+    if uploads.is_empty() || raw_max_eta.is_none() {
+        stabilizer.reset();
+        return None;
+    }
+    let key = format!("uploads:{}", uploads.len());
+    stabilizer.update(Some(&key), raw_max_eta)
+}
+
 /// Computes the total byte size of a simulated mock folder recursively.
 pub fn mock_folder_total_bytes(mock_ip: &str, subpath: &str) -> u64 {
     let clean = subpath.trim_matches('/');

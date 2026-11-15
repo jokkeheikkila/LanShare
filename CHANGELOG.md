@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI dependency audit & PR checks**: added `.github/workflows/audit.yml` for weekly and lockfile-triggered `cargo audit` scans, and enabled pull-request verification in `.github/workflows/build.yml`.
 
 ### Changed
-- **Always-visible, resizable Downloads & Uploads panels**: keep both **Downloads** (Browse LAN) and **Uploads** (Share Folders) visible at compact default height with drag-resizable splitters in GUI and idle status in TUI (`src/app.rs`, `src/tui.rs`).
+- **Resizable Downloads & Uploads panels**: keep both **Downloads** (Browse LAN) and **Uploads** (Share Folders) always visible at compact default height with drag-resizable splitters in GUI, and add a collapsible **Uploads** (`u`) accordion section in the TUI Host tab matching **Downloads** (`d`) (`src/app.rs`, `src/tui.rs`).
 - **Host switch & folder navigation loading feedback**: clear stale file entries immediately on host switch or directory navigation, show a centered loading spinner animation in GUI and TUI, and simplify GUI Up/Refresh toolbar buttons to icon controls (`src/app.rs`, `src/tui.rs`).
 - **CLI fail-fast path validation**: validate `lanshare-cli host` and `lanshare-cli download` paths before prompting for the Ring Secret (`src/cli.rs`, `src/main.rs`).
 - **Concurrent multi-GB `--test` mock uploads**: simulate multiple concurrent uploads with multi-gigabyte test files in offline `--test` mode (`src/core.rs`).

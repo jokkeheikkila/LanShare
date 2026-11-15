@@ -196,6 +196,7 @@ pub struct LanShareApp {
     client_current_path: String,
     client_file_list: Vec<FileEntry>,
     client_loading: bool,
+    client_loading_started_at: Option<Instant>,
 
     // Async Channel for Client actions
     client_action_rx: Receiver<ClientActionResult>,
@@ -209,6 +210,7 @@ pub struct LanShareApp {
     progress_finished_at: Option<Instant>,
     active_eta_stabilizer: EtaStabilizer,
     total_eta_stabilizer: EtaStabilizer,
+    upload_total_eta_stabilizer: EtaStabilizer,
     progress_rx: Receiver<TransferProgress>,
     progress_tx: tokio::sync::mpsc::UnboundedSender<TransferProgress>,
     transfer_cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -539,6 +541,7 @@ impl LanShareApp {
             client_current_path: String::new(),
             client_file_list: Vec::new(),
             client_loading: false,
+            client_loading_started_at: None,
 
             client_action_rx,
             client_action_tx,
@@ -550,6 +553,7 @@ impl LanShareApp {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: EtaStabilizer::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tokio_tx,
             transfer_cancel_tx: None,
@@ -703,7 +707,10 @@ impl LanShareApp {
                 "Scanning local network for computers...".to_string(),
                 p.accent_blue,
             )
-        } else if self.client_loading {
+        } else if crate::core::should_show_loading_spinner(
+            self.client_loading,
+            self.client_loading_started_at,
+        ) {
             ("Loading folder contents...".to_string(), p.accent_blue)
         } else if self.server_handle.is_some() {
             let count = self.host_folders.len();
@@ -950,7 +957,7 @@ impl LanShareApp {
                     self.refresh_client_listing();
                 }
                 ClientActionResult::ConnectFailed(err) => {
-                    self.client_loading = false;
+                    self.set_client_loading(false);
                     self.mock_session = false;
                     self.client_stream = None;
                     if self.client_connected || !self.client_file_list.is_empty() {
@@ -963,7 +970,7 @@ impl LanShareApp {
                     self.client_error = Some(err);
                 }
                 ClientActionResult::ListingLoaded(stream, loaded_path, entries) => {
-                    self.client_loading = false;
+                    self.set_client_loading(false);
                     self.client_connection_lost = false;
                     self.client_stream = Some(stream);
                     self.client_current_path = loaded_path;
@@ -971,7 +978,7 @@ impl LanShareApp {
                     self.client_error = None;
                 }
                 ClientActionResult::ListingFailed(stream, err) => {
-                    self.client_loading = false;
+                    self.set_client_loading(false);
                     let is_transport_loss = stream.is_none();
                     self.client_stream = stream;
                     if is_transport_loss {
@@ -3695,7 +3702,10 @@ impl LanShareApp {
                         }
                     });
                 });
-            } else if self.client_loading {
+            } else if crate::core::should_show_loading_spinner(
+                self.client_loading,
+                self.client_loading_started_at,
+            ) {
                 ui.spinner();
                 ui.label("Connecting to host...");
             }
@@ -3711,8 +3721,12 @@ impl LanShareApp {
         ui.add_space(4.0);
         ui.group(|ui| {
             ui.spacing_mut().scroll = Self::visible_scroll_style();
-            let show_populating = self.client_loading && self.client_file_list.is_empty();
-            let browse_scroll_visibility = if has_browser_view && !show_populating {
+            let is_loading_empty = self.client_loading && self.client_file_list.is_empty();
+            let show_spinner = crate::core::should_show_loading_spinner(
+                self.client_loading,
+                self.client_loading_started_at,
+            ) && self.client_file_list.is_empty();
+            let browse_scroll_visibility = if has_browser_view && !is_loading_empty {
                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible
             } else {
                 egui::scroll_area::ScrollBarVisibility::AlwaysHidden
@@ -3724,11 +3738,13 @@ impl LanShareApp {
                 .min_scrolled_height(browser_height)
                 .max_height(browser_height)
                 .show(ui, |ui| {
-                    if show_populating {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space((browser_height * 0.35).max(32.0));
-                            ui.add(egui::Spinner::new().size(28.0));
-                        });
+                    if is_loading_empty {
+                        if show_spinner {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space((browser_height * 0.35).max(32.0));
+                                ui.add(egui::Spinner::new().size(28.0));
+                            });
+                        }
                         return;
                     }
                     if !has_browser_view {
@@ -4308,44 +4324,71 @@ impl LanShareApp {
                                     .desired_width(280.0),
                             );
 
-                            if prog.speed_mbps > 0.0 {
-                                ui.label(
-                                    RichText::new(format!("{:.1} MB/s", prog.speed_mbps))
-                                        .monospace(),
-                                );
-                            }
+                            let speed_w = 96.0_f32;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(speed_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_size(egui::vec2(speed_w, 18.0));
+                                    if prog.speed_mbps > 0.0 {
+                                        ui.label(
+                                            RichText::new(format!("{:>6.1} MB/s", prog.speed_mbps))
+                                                .monospace(),
+                                        );
+                                    }
+                                },
+                            );
 
-                            if let Some(act_s) = active_eta {
-                                let is_active_in_progress = !prog.is_finished;
-                                if active_remaining > 0 || is_active_in_progress {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "ETA: {}",
-                                            format_remaining_time(act_s)
-                                        ))
-                                        .strong()
-                                        .color(p.accent_blue),
-                                    );
-                                }
-                            }
+                            let eta_w = 88.0_f32;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(eta_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_size(egui::vec2(eta_w, 18.0));
+                                    let is_active_in_progress = !prog.is_finished;
+                                    if let Some(act_s) = active_eta {
+                                        if active_remaining > 0 || is_active_in_progress {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "ETA: {:<5}",
+                                                    format_remaining_time(act_s)
+                                                ))
+                                                .monospace()
+                                                .strong()
+                                                .color(p.accent_blue),
+                                            );
+                                        }
+                                    }
+                                },
+                            );
 
-                            if let Some(tot_s) = total_eta {
-                                if pending_count > 0 {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "(Total: {})",
-                                            format_remaining_time(tot_s)
-                                        ))
-                                        .color(p.text_muted),
-                                    );
-                                }
-                            }
+                            let total_w = 110.0_f32;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(total_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_size(egui::vec2(total_w, 18.0));
+                                    if let Some(tot_s) = total_eta {
+                                        if pending_count > 0 {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "(Total: {:<5})",
+                                                    format_remaining_time(tot_s)
+                                                ))
+                                                .monospace()
+                                                .color(p.text_muted),
+                                            );
+                                        }
+                                    }
+                                },
+                            );
 
                             if prog.bytes_total > 0 {
                                 let done_str = format_file_size(prog.bytes_done);
                                 let total_str = format_file_size(prog.bytes_total);
                                 ui.label(
-                                    RichText::new(format!("{} / {}", done_str, total_str))
+                                    RichText::new(format!("{:>9} / {:<9}", done_str, total_str))
+                                        .monospace()
                                         .color(p.text_muted),
                                 );
                             }
@@ -4953,6 +4996,10 @@ impl LanShareApp {
             max_uploads_h,
         );
         ui.add_space(2.0);
+        let upload_total_eta = crate::core::compute_active_uploads_total_eta(
+            &active_uploads,
+            &mut self.upload_total_eta_stabilizer,
+        );
         let target_h = (ui.available_height() - 4.0).min(upload_h).max(70.0);
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), target_h),
@@ -4961,10 +5008,14 @@ impl LanShareApp {
                 ui.group(|ui| {
                     ui.set_min_height((target_h - 8.0).max(60.0));
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("Uploads — Active: {}", active_uploads.len()))
-                                .strong(),
-                        );
+                        let mut header_text = format!("Uploads — Active: {}", active_uploads.len());
+                        if let Some(tot_s) = upload_total_eta {
+                            header_text.push_str(&format!(
+                                " | Total ETA: {}",
+                                format_remaining_time(tot_s)
+                            ));
+                        }
+                        ui.label(RichText::new(header_text).strong());
                     });
                     ui.separator();
                     if active_uploads.is_empty() {
@@ -4976,11 +5027,11 @@ impl LanShareApp {
                         );
                     } else {
                         ui.spacing_mut().scroll = Self::visible_scroll_style();
-                        let scroll_h = (ui.available_height() - 4.0).max(40.0);
+                        let scroll_h = (ui.available_height() - 8.0).max(35.0);
                         ScrollArea::vertical()
                             .id_salt("host_uploads_scroll")
                             .max_height(scroll_h)
-                            .auto_shrink([false, true])
+                            .auto_shrink([false, false])
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                             )
@@ -4990,13 +5041,16 @@ impl LanShareApp {
                                         ui.add_space(4.0);
                                     }
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{} ({})",
-                                                upload.file_name, upload.peer
-                                            ))
-                                            .strong()
-                                            .color(p.accent_green),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{} ({})",
+                                                    upload.file_name, upload.peer
+                                                ))
+                                                .strong()
+                                                .color(p.accent_green),
+                                            )
+                                            .truncate(),
                                         );
                                     });
                                     ui.horizontal(|ui| {
@@ -5006,47 +5060,119 @@ impl LanShareApp {
                                         } else {
                                             0.0
                                         };
+                                        let avail_w = ui.available_width();
+                                        let right_pad = 12.0_f32;
+                                        let size_col_w = 172.0_f32;
+                                        let eta_col_w = 92.0_f32;
+                                        let speed_col_w = 100.0_f32;
+                                        let gap_w = 8.0_f32;
+                                        let metrics_total_w = right_pad
+                                            + size_col_w
+                                            + eta_col_w
+                                            + speed_col_w
+                                            + gap_w * 3.0;
+                                        let bar_w = (avail_w - metrics_total_w).clamp(90.0, 420.0);
+
                                         ui.add(
                                             egui::ProgressBar::new(pct)
                                                 .show_percentage()
-                                                .desired_width(280.0),
+                                                .desired_width(bar_w),
                                         );
-                                        if upload.speed_mbps > 0.0 {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{:.1} MB/s",
-                                                    upload.speed_mbps
-                                                ))
-                                                .monospace(),
-                                            );
-                                        }
-                                        let remaining =
-                                            upload.total_size.saturating_sub(upload.bytes_sent);
-                                        if remaining > 0 {
-                                            if let Some(eta_s) = estimate_remaining_seconds(
-                                                remaining,
-                                                upload.speed_mbps,
-                                            ) {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "ETA: {}",
-                                                        format_remaining_time(eta_s)
-                                                    ))
-                                                    .strong()
-                                                    .color(p.accent_blue),
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add_space(right_pad);
+
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(size_col_w, 18.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_min_size(egui::vec2(
+                                                            size_col_w, 18.0,
+                                                        ));
+                                                        if upload.total_size > 0 {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "{:>9} / {:<9}",
+                                                                    format_file_size(
+                                                                        upload.bytes_sent
+                                                                    ),
+                                                                    format_file_size(
+                                                                        upload.total_size
+                                                                    )
+                                                                ))
+                                                                .monospace()
+                                                                .color(p.text_muted),
+                                                            );
+                                                        }
+                                                    },
                                                 );
-                                            }
-                                        }
-                                        if upload.total_size > 0 {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} / {}",
-                                                    format_file_size(upload.bytes_sent),
-                                                    format_file_size(upload.total_size)
-                                                ))
-                                                .color(p.text_muted),
-                                            );
-                                        }
+
+                                                ui.add_space(gap_w);
+
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(eta_col_w, 18.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_min_size(egui::vec2(
+                                                            eta_col_w, 18.0,
+                                                        ));
+                                                        let remaining = upload
+                                                            .total_size
+                                                            .saturating_sub(upload.bytes_sent);
+                                                        if remaining > 0 {
+                                                            if let Some(eta_s) =
+                                                                estimate_remaining_seconds(
+                                                                    remaining,
+                                                                    upload.speed_mbps,
+                                                                )
+                                                            {
+                                                                ui.label(
+                                                                    RichText::new(format!(
+                                                                        "ETA: {:<5}",
+                                                                        format_remaining_time(
+                                                                            eta_s
+                                                                        )
+                                                                    ))
+                                                                    .monospace()
+                                                                    .strong()
+                                                                    .color(p.accent_blue),
+                                                                );
+                                                            }
+                                                        }
+                                                    },
+                                                );
+
+                                                ui.add_space(gap_w);
+
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(speed_col_w, 18.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_min_size(egui::vec2(
+                                                            speed_col_w,
+                                                            18.0,
+                                                        ));
+                                                        if upload.speed_mbps > 0.0 {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "{:>6.1} MB/s",
+                                                                    upload.speed_mbps
+                                                                ))
+                                                                .monospace(),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            },
+                                        );
                                     });
                                 }
                             });
@@ -5116,12 +5242,23 @@ impl LanShareApp {
         self.client_stream = None;
         self.client_current_path.clear();
         self.client_file_list.clear();
-        self.client_loading = false;
+        self.set_client_loading(false);
         self.discovered_peers = if self.test_mode {
             default_mock_peers()
         } else {
             Vec::new()
         };
+    }
+
+    fn set_client_loading(&mut self, loading: bool) {
+        if loading {
+            self.client_loading = true;
+            self.client_loading_started_at
+                .get_or_insert_with(Instant::now);
+        } else {
+            self.client_loading = false;
+            self.client_loading_started_at = None;
+        }
     }
 
     fn select_and_connect_peer(&mut self, peer: &DiscoveredPeer) {
@@ -5145,7 +5282,7 @@ impl LanShareApp {
         }
         self.client_connected = true;
         self.client_connection_lost = false;
-        self.client_loading = false;
+        self.set_client_loading(false);
         self.connected_via_direct_ip = false;
         self.mock_session = true;
         self.client_ip = mock_ip.to_string();
@@ -5198,7 +5335,7 @@ impl LanShareApp {
         let pwd = self.ring_secret.trim().to_string();
         let port = self.client_port;
         let tx = self.client_action_tx.clone();
-        self.client_loading = true;
+        self.set_client_loading(true);
 
         self.tokio_rt.spawn(async move {
             match client::connect_to_host(&ip, port, &pwd).await {
@@ -5237,7 +5374,7 @@ impl LanShareApp {
             self.client_current_path = target_path.clone();
             self.client_file_list.clear();
             self.hovered_browse_download_idx = None;
-            self.client_loading = true;
+            self.set_client_loading(true);
 
             self.tokio_rt.spawn(async move {
                 match client::request_directory_listing_checked(&mut stream, &target_path).await {
@@ -5559,6 +5696,7 @@ mod tests {
             client_current_path: String::new(),
             client_file_list: vec![],
             client_loading: false,
+            client_loading_started_at: None,
             client_action_rx,
             client_action_tx: _client_action_tx,
             next_queue_id: 1,
@@ -5568,6 +5706,7 @@ mod tests {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: EtaStabilizer::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tx,
             transfer_cancel_tx: None,
@@ -5809,6 +5948,7 @@ mod tests {
             client_current_path: String::new(),
             client_file_list: vec![],
             client_loading: false,
+            client_loading_started_at: None,
             client_action_rx,
             client_action_tx: _client_action_tx,
             next_queue_id: 1,
@@ -5818,6 +5958,7 @@ mod tests {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: EtaStabilizer::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tx,
             transfer_cancel_tx: None,
@@ -7590,7 +7731,9 @@ mod tests {
         });
         let host_texts = collect_all_text(&host_out.shapes);
         assert!(host_texts.iter().any(|t| t.contains("↑ 1 uploading")));
-        assert!(host_texts.iter().any(|t| t.contains("Uploads — Active: 1")));
+        assert!(host_texts
+            .iter()
+            .any(|t| t.contains("Uploads — Active: 1 | Total ETA:")));
         assert!(host_texts.iter().any(|t| t.contains("movie_cut.mkv")));
         assert!(host_texts
             .iter()
@@ -7781,12 +7924,45 @@ mod tests {
         assert!(app.client_current_path.is_empty());
         assert!(app.client_file_list.is_empty());
 
-        let has_spinner_repaint = |out: &egui::FullOutput| {
-            out.viewport_output
-                .values()
-                .any(|vp| vp.repaint_delay == Duration::ZERO)
+        let count_spinner_arcs = |shapes: &[egui::epaint::ClippedShape]| -> usize {
+            fn walk(shape: &egui::epaint::Shape, count: &mut usize) {
+                match shape {
+                    egui::epaint::Shape::Path(p) if p.points.len() >= 10 => *count += 1,
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, count);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut count = 0usize;
+            for c in shapes {
+                walk(&c.shape, &mut count);
+            }
+            count
         };
 
+        // Immediately after switching hosts (<250ms), stale files are cleared without flashing spinner
+        let immediate_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let immediate_texts = collect_all_text(&immediate_out.shapes);
+        assert!(!immediate_texts.iter().any(|t| t == "old_host_file.iso"));
+        assert!(!immediate_texts
+            .iter()
+            .any(|t| t.contains("Connecting to host")));
+        assert!(!crate::core::should_show_loading_spinner(
+            app.client_loading,
+            app.client_loading_started_at
+        ));
+        assert_eq!(count_spinner_arcs(&immediate_out.shapes), 0);
+
+        // Once loading exceeds the 250ms debounce threshold, spinner animation appears
+        app.client_loading_started_at =
+            Some(Instant::now() - crate::core::LOADING_SPINNER_DELAY - Duration::from_millis(50));
         let switching_out = run_test_ui(&ctx, Default::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_client_browser_panel(ui);
@@ -7797,13 +7973,30 @@ mod tests {
         assert!(!switching_texts
             .iter()
             .any(|t| t.contains("Populating list")));
-        assert!(has_spinner_repaint(&switching_out));
+        assert!(switching_texts
+            .iter()
+            .any(|t| t.contains("Connecting to host")));
+        assert!(count_spinner_arcs(&switching_out.shapes) >= 1);
 
         // 3. Same when already connected and folder navigation (e.g. Up) is in flight
         app.client_connected = true;
-        app.client_loading = true;
+        app.set_client_loading(false);
+        app.set_client_loading(true);
         app.client_current_path = "SubDir".to_string();
         app.client_file_list.clear();
+        let nav_immediate_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let nav_immediate_texts = collect_all_text(&nav_immediate_out.shapes);
+        assert!(!nav_immediate_texts
+            .iter()
+            .any(|t| t.contains("(Folder is empty)")));
+        let nav_baseline_arcs = count_spinner_arcs(&nav_immediate_out.shapes);
+
+        app.client_loading_started_at =
+            Some(Instant::now() - crate::core::LOADING_SPINNER_DELAY - Duration::from_millis(50));
         let nav_out = run_test_ui(&ctx, Default::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_client_browser_panel(ui);
@@ -7812,7 +8005,7 @@ mod tests {
         let nav_texts = collect_all_text(&nav_out.shapes);
         assert!(!nav_texts.iter().any(|t| t.contains("Populating list")));
         assert!(!nav_texts.iter().any(|t| t.contains("(Folder is empty)")));
-        assert!(has_spinner_repaint(&nav_out));
+        assert!(count_spinner_arcs(&nav_out.shapes) > nav_baseline_arcs);
         drop(listener);
     }
 

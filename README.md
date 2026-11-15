@@ -34,8 +34,8 @@ Instead of configuring IP addresses, user accounts, or SMB shares:
 ## Key Features
 
 * **GUI, TUI & Direct CLI from One Core**:
-  * **`lanshare-gui` (GUI)**: Native desktop app with drag-and-drop folder hosting, file browser, and download queue.
-  * **`lanshare-cli` (TUI & CLI)**: Interactive terminal UI with mouse-free navigation and progress bars, plus direct one-shot CLI subcommands (`host`, `peers`, `ls`, `download`)—great over SSH or on headless Linux machines.
+  * **`lanshare-gui` (GUI)**: Native desktop app with drag-and-drop folder hosting, live upload progress, resizable **Downloads** & **Uploads** panels, and multi-instance peer support.
+  * **`lanshare-cli` (TUI & CLI)**: Interactive terminal UI with mouse-free navigation, collapsible **Downloads** (`d`) and **Uploads** (`u`) progress panels, plus direct one-shot CLI subcommands (`host`, `peers`, `ls`, `download`)—great over SSH or on headless Linux machines.
 * **No Installation or Admin Rights Needed**: Single self-contained portable executable with zero external dependencies, installers, or background services.
 * **Zero-Config Discovery**: No servers, accounts, cloud relays, or manual port forwarding needed on a LAN.
 * **Queue Entire Folders with Auto-Resume**: Download single files or full directory trees sequentially with automatic resume on interrupted transfers.
@@ -183,17 +183,19 @@ GENERAL & TUI OPTIONS:
 | `↑` / `↓` / `PgUp` / `PgDn` | Navigate files/folders in the browser or shared folder list |
 | `Enter` | Open highlighted folder in Browse |
 | `Space` | Queue highlighted file **or entire folder** for sequential download |
-| `Backspace` / `u` | Navigate up to parent directory |
+| `Backspace` / `u` / `F5` | (Browse Tab) Navigate up to parent directory (`Backspace`/`u`) or **Refresh** listing (`F5`) |
 | `p` / `←` / `→` | Cycle between discovered Share-Ring peers |
 | `s` / `i` / `o` | **Scan** LAN, connect via **Direct IP**, or change local **Download Folder** |
-| `c` / `Del` / `x` | **Cancel** active transfer, **Remove** pending queue item, or **Clear** finished items |
-| `a` / `S` | (Host Tab) **Add** folder to share, **Start/Stop** sharing |
+| `b` / `d` | (Client Tab) Expand **Browse** (`b`) or expand/collapse **Downloads** (`d`) |
+| `c` / `Del` / `x` | (Downloads) **Cancel** active transfer, **Remove** pending queue item, or **Clear** finished items |
+| `a` / `Del` / `C` / `S` | (Host Tab) **Add** folder (`a`), **Remove** folder (`Del`), **Clear** list (`C`), or **Start/Stop** sharing (`S`) |
+| `u` / `f` | (Host Tab) Expand/collapse **Uploads** panel (`u`) or return to **Folders** (`f`) |
 | `←` / `→` / `Home` / `End` | (Input Dialogs) Move cursor within path or secret |
 | `F2` | (Setup & Input Dialogs) **Copy** field to clipboard (also clickable on login setup) |
 | `Ctrl+V` / `Shift+Ins` | (Setup & Input Dialogs) **Paste** (replace text from clipboard) |
 | `Ctrl+U` / `Del` | (Setup & Input Dialogs) Clear entire input or delete character under cursor |
-| `l` | Show/hide Activity Logs panel |
-| `q` / `Esc` | Quit application (or close active modal dialog) |
+| `l` | Show/hide **Activity Logs** panel (Client or Host tab) |
+| `q` / `Esc` | Collapse expanded panel back to Browse/Folders (`Esc`), or **Quit** application |
 
 </details>
 
