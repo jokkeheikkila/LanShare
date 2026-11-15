@@ -1417,9 +1417,14 @@ mod tests {
         let err = validate_cli_host_folders(std::slice::from_ref(&missing)).unwrap_err();
         assert!(!err.is_empty());
 
-        let valid_dir =
-            std::env::temp_dir().join(format!("lanshare_cli_validate_dir_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&valid_dir);
+        // Avoid std::env::temp_dir() here because on Windows it lives under AppData,
+        // which validate_shared_folder intentionally rejects as a restricted folder.
+        let valid_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("target")
+            .join(format!("lanshare_cli_validate_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&valid_dir);
+        std::fs::create_dir_all(&valid_dir).unwrap();
         let deduped = validate_cli_host_folders(&[valid_dir.clone(), valid_dir.clone()]).unwrap();
         assert_eq!(deduped.len(), 1);
         let _ = std::fs::remove_dir_all(&valid_dir);
