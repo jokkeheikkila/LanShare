@@ -130,6 +130,7 @@ impl AppPalette {
 pub const BROWSE_COL_SIZE_W: f32 = 85.0;
 pub const BROWSE_COL_DATE_W: f32 = 135.0;
 pub const BROWSE_COL_ACTION_W: f32 = 84.0;
+pub const DEFAULT_TRANSFER_SECTION_HEIGHT: f32 = 276.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSourceFilter {
@@ -570,8 +571,8 @@ impl LanShareApp {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 92.0,
-            upload_section_height: 92.0,
+            download_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
+            upload_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
 
             browse_col_name_w: 260.0,
 
@@ -5814,8 +5815,8 @@ mod tests {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 92.0,
-            upload_section_height: 92.0,
+            download_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
+            upload_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
 
             browse_col_name_w: 260.0,
 
@@ -6066,8 +6067,8 @@ mod tests {
             show_stop_server_confirm_dialog: false,
             pending_remove_host_folder_idx: None,
 
-            download_section_height: 92.0,
-            upload_section_height: 92.0,
+            download_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
+            upload_section_height: DEFAULT_TRANSFER_SECTION_HEIGHT,
 
             browse_col_name_w: 260.0,
 
@@ -7976,18 +7977,24 @@ mod tests {
             }
             out
         };
+        let uploads_header_bottom = row_texts
+            .iter()
+            .find(|(t, _)| t.contains("Uploads — Active: 1 | Total ETA:"))
+            .map(|(_, r)| r.bottom())
+            .expect("Missing Uploads section header");
         let find_row_text_rect = |needle: &str| -> egui::Rect {
             row_texts
                 .iter()
-                .find(|(t, r)| t.contains(needle) && r.center().y > 540.0)
+                .find(|(t, r)| t.contains(needle) && r.center().y > uploads_header_bottom)
                 .map(|(_, r)| *r)
                 .unwrap_or_else(|| {
                     panic!(
-                        "Missing text shape matching '{}' in {:?}",
+                        "Missing text shape matching '{}' below {} in {:?}",
                         needle,
+                        uploads_header_bottom,
                         row_texts
                             .iter()
-                            .filter(|(_, r)| r.center().y > 540.0)
+                            .filter(|(_, r)| r.center().y > uploads_header_bottom)
                             .collect::<Vec<_>>()
                     )
                 })
@@ -8325,11 +8332,20 @@ mod tests {
     fn test_downloads_and_uploads_always_visible_with_compact_default_and_resize() {
         let mut app = create_test_app();
         app.secret_confirmed = true;
-        assert!(app.download_section_height <= 100.0);
-        assert!(app.upload_section_height <= 100.0);
+        assert!((app.download_section_height - DEFAULT_TRANSFER_SECTION_HEIGHT).abs() < 0.1);
+        assert!((app.upload_section_height - DEFAULT_TRANSFER_SECTION_HEIGHT).abs() < 0.1);
+        assert!(app.download_section_height >= 260.0);
+        assert!(app.upload_section_height >= 260.0);
 
         let ctx = egui::Context::default();
-        let browse_out = run_test_ui(&ctx, Default::default(), |ui| {
+        let desktop_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1220.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let browse_out = run_test_ui(&ctx, desktop_input.clone(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_client_browser_panel(ui);
             });
@@ -8350,12 +8366,12 @@ mod tests {
             browse_texts
         );
 
-        let host_out_small = run_test_ui(&ctx, Default::default(), |ui| {
+        let host_out_default = run_test_ui(&ctx, desktop_input.clone(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_host_tab(ui);
             });
         });
-        let host_texts = collect_rendered_texts(&host_out_small);
+        let host_texts = collect_rendered_texts(&host_out_default);
         assert!(
             host_texts.iter().any(|t| t == "Uploads — Active: 0"),
             "{:?}",
@@ -8367,7 +8383,7 @@ mod tests {
             host_texts
         );
 
-        // Verify resizing upload_section_height changes the rendered Uploads panel geometry
+        // Verify resizing upload_section_height moves the rendered Uploads panel header both up and down
         let find_uploads_header_y = |out: &egui::FullOutput| -> f32 {
             out.shapes
                 .iter()
@@ -8381,18 +8397,32 @@ mod tests {
                 })
                 .expect("Uploads header must be rendered")
         };
-        let header_y_default = find_uploads_header_y(&host_out_small);
-        app.upload_section_height = 220.0;
-        let host_out_tall = run_test_ui(&ctx, Default::default(), |ui| {
+        let header_y_default = find_uploads_header_y(&host_out_default);
+        app.upload_section_height = 420.0;
+        let host_out_tall = run_test_ui(&ctx, desktop_input.clone(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 app.render_host_tab(ui);
             });
         });
-        let header_y_resized = find_uploads_header_y(&host_out_tall);
+        let header_y_tall = find_uploads_header_y(&host_out_tall);
         assert!(
-            header_y_resized < header_y_default - 60.0,
+            header_y_tall < header_y_default - 60.0,
             "Growing upload_section_height should move Uploads header upward ({} vs {})",
-            header_y_resized,
+            header_y_tall,
+            header_y_default
+        );
+
+        app.upload_section_height = 92.0;
+        let host_out_short = run_test_ui(&ctx, desktop_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_host_tab(ui);
+            });
+        });
+        let header_y_short = find_uploads_header_y(&host_out_short);
+        assert!(
+            header_y_short > header_y_default + 100.0,
+            "Shrinking upload_section_height should move Uploads header downward ({} vs {})",
+            header_y_short,
             header_y_default
         );
     }
