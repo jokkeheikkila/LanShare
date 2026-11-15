@@ -66,7 +66,6 @@ pub struct AppPalette {
     pub accent_blue: Color32,
     pub accent_amber: Color32,
     pub accent_red: Color32,
-    pub browse_row_stripe_bg: Color32,
     pub browse_row_hover_bg: Color32,
 }
 
@@ -96,7 +95,6 @@ impl AppPalette {
                 accent_blue: Color32::from_rgb(96, 165, 250),
                 accent_amber: Color32::from_rgb(251, 191, 36),
                 accent_red: Color32::from_rgb(248, 113, 113),
-                browse_row_stripe_bg: Color32::from_rgb(21, 28, 40),
                 browse_row_hover_bg: Color32::from_rgba_unmultiplied(37, 99, 235, 28),
             }
         } else {
@@ -123,7 +121,6 @@ impl AppPalette {
                 accent_blue: Color32::from_rgb(37, 99, 235),
                 accent_amber: Color32::from_rgb(217, 119, 6),
                 accent_red: Color32::from_rgb(220, 38, 38),
-                browse_row_stripe_bg: Color32::from_rgb(226, 232, 240),
                 browse_row_hover_bg: Color32::from_rgb(203, 224, 253),
             }
         }
@@ -132,7 +129,7 @@ impl AppPalette {
 
 pub const BROWSE_COL_SIZE_W: f32 = 85.0;
 pub const BROWSE_COL_DATE_W: f32 = 135.0;
-pub const BROWSE_COL_ACTION_W: f32 = 76.0;
+pub const BROWSE_COL_ACTION_W: f32 = 84.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSourceFilter {
@@ -3771,9 +3768,8 @@ impl LanShareApp {
 
                     ui.scope(|ui| {
                         ui.style_mut().interaction.selectable_labels = false;
-                        ui.style_mut().visuals.faint_bg_color = p.browse_row_stripe_bg;
                         egui::Grid::new("file_grid")
-                            .striped(true)
+                            .striped(false)
                             .min_col_width(50.0)
                             .spacing([16.0, 8.0])
                             .show(ui, |ui| {
@@ -4048,48 +4044,48 @@ impl LanShareApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                ui.set_min_width(76.0);
+                                                ui.set_min_width(BROWSE_COL_ACTION_W);
                                                 ui.add_space(6.0);
-                                                match existing_status {
-                                                    Some(QueueItemStatus::Downloading) => {
-                                                        let btn_resp = ui.add_enabled(
-                                                            false,
-                                                            egui::Button::new("Active"),
-                                                        );
-                                                        if btn_resp.hovered() {
-                                                            next_hovered_browse_idx = Some(idx);
+                                                let (btn_label, btn_enabled, is_download_action) =
+                                                    match existing_status {
+                                                        Some(QueueItemStatus::Downloading) => {
+                                                            ("Active", false, false)
                                                         }
-                                                    }
-                                                    Some(QueueItemStatus::Pending) => {
-                                                        let btn_resp = ui.add_enabled(
-                                                            false,
-                                                            egui::Button::new("Queued"),
-                                                        );
-                                                        if btn_resp.hovered() {
-                                                            next_hovered_browse_idx = Some(idx);
+                                                        Some(QueueItemStatus::Pending) => {
+                                                            ("Queued", false, false)
                                                         }
-                                                    }
-                                                    _ => {
-                                                        let is_busy =
-                                                            self.active_queue_id.is_some();
-                                                        let dl_label = if is_busy {
-                                                            "Queue"
-                                                        } else {
-                                                            "Download"
-                                                        };
-                                                        let can_download =
-                                                            !self.client_connection_lost;
-                                                        let btn_resp = ui.add_enabled(
-                                                            can_download,
-                                                            egui::Button::new(dl_label),
-                                                        );
-                                                        if btn_resp.hovered() && can_download {
-                                                            next_hovered_browse_idx = Some(idx);
+                                                        _ => {
+                                                            let label =
+                                                                if self.active_queue_id.is_some() {
+                                                                    "Queue"
+                                                                } else {
+                                                                    "Download"
+                                                                };
+                                                            (
+                                                                label,
+                                                                !self.client_connection_lost,
+                                                                true,
+                                                            )
                                                         }
-                                                        if btn_resp.clicked() && can_download {
-                                                            self.enqueue_download(entry);
-                                                        }
-                                                    }
+                                                    };
+                                                let btn_resp = ui
+                                                    .add_enabled_ui(btn_enabled, |ui| {
+                                                        ui.add_sized(
+                                                            egui::vec2(78.0, 22.0),
+                                                            egui::Button::new(btn_label),
+                                                        )
+                                                    })
+                                                    .inner;
+                                                if btn_resp.hovered()
+                                                    && (!is_download_action || btn_enabled)
+                                                {
+                                                    next_hovered_browse_idx = Some(idx);
+                                                }
+                                                if is_download_action
+                                                    && btn_resp.clicked()
+                                                    && btn_enabled
+                                                {
+                                                    self.enqueue_download(entry);
                                                 }
                                             },
                                         );
@@ -4161,6 +4157,23 @@ impl LanShareApp {
                 p.accent_blue
             } else {
                 p.text_subtle
+            },
+        );
+    }
+
+    /// Allocates a fixed-width single-line slot so changing monospace metrics never shift neighbors.
+    fn render_fixed_metric_col(
+        ui: &mut egui::Ui,
+        width: f32,
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 18.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_size(egui::vec2(width, 18.0));
+                ui.set_max_size(egui::vec2(width, 18.0));
+                add_contents(ui);
             },
         );
     }
@@ -4318,80 +4331,98 @@ impl LanShareApp {
                         });
 
                         ui.horizontal(|ui| {
+                            let avail_w = ui.available_width();
+                            let right_pad = 12.0_f32;
+                            let size_col_w = 172.0_f32;
+                            let total_col_w = 110.0_f32;
+                            let eta_col_w = 92.0_f32;
+                            let speed_col_w = 100.0_f32;
+                            let gap_w = 8.0_f32;
+                            let metrics_total_w = right_pad
+                                + size_col_w
+                                + total_col_w
+                                + eta_col_w
+                                + speed_col_w
+                                + gap_w * 4.0;
+                            let bar_w = (avail_w - metrics_total_w).clamp(90.0, 420.0);
+
                             ui.add(
                                 egui::ProgressBar::new(pct)
                                     .show_percentage()
-                                    .desired_width(280.0),
+                                    .desired_width(bar_w),
                             );
 
-                            let speed_w = 96.0_f32;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(speed_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.set_min_size(egui::vec2(speed_w, 18.0));
-                                    if prog.speed_mbps > 0.0 {
-                                        ui.label(
-                                            RichText::new(format!("{:>6.1} MB/s", prog.speed_mbps))
-                                                .monospace(),
-                                        );
-                                    }
-                                },
-                            );
+                                    ui.add_space(right_pad);
 
-                            let eta_w = 88.0_f32;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(eta_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_size(egui::vec2(eta_w, 18.0));
-                                    let is_active_in_progress = !prog.is_finished;
-                                    if let Some(act_s) = active_eta {
-                                        if active_remaining > 0 || is_active_in_progress {
+                                    Self::render_fixed_metric_col(ui, size_col_w, |ui| {
+                                        if prog.bytes_total > 0 {
+                                            let done_str = format_file_size(prog.bytes_done);
+                                            let total_str = format_file_size(prog.bytes_total);
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "ETA: {:<5}",
-                                                    format_remaining_time(act_s)
-                                                ))
-                                                .monospace()
-                                                .strong()
-                                                .color(p.accent_blue),
-                                            );
-                                        }
-                                    }
-                                },
-                            );
-
-                            let total_w = 110.0_f32;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(total_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_size(egui::vec2(total_w, 18.0));
-                                    if let Some(tot_s) = total_eta {
-                                        if pending_count > 0 {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "(Total: {:<5})",
-                                                    format_remaining_time(tot_s)
+                                                    "{:>9} / {:<9}",
+                                                    done_str, total_str
                                                 ))
                                                 .monospace()
                                                 .color(p.text_muted),
                                             );
                                         }
-                                    }
+                                    });
+
+                                    ui.add_space(gap_w);
+
+                                    Self::render_fixed_metric_col(ui, total_col_w, |ui| {
+                                        if let Some(tot_s) = total_eta {
+                                            if pending_count > 0 {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "(Total: {:<5})",
+                                                        format_remaining_time(tot_s)
+                                                    ))
+                                                    .monospace()
+                                                    .color(p.text_muted),
+                                                );
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(gap_w);
+
+                                    Self::render_fixed_metric_col(ui, eta_col_w, |ui| {
+                                        let is_active_in_progress = !prog.is_finished;
+                                        if let Some(act_s) = active_eta {
+                                            if active_remaining > 0 || is_active_in_progress {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "ETA: {:<5}",
+                                                        format_remaining_time(act_s)
+                                                    ))
+                                                    .monospace()
+                                                    .strong()
+                                                    .color(p.accent_blue),
+                                                );
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(gap_w);
+
+                                    Self::render_fixed_metric_col(ui, speed_col_w, |ui| {
+                                        if prog.speed_mbps > 0.0 {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:>6.1} MB/s",
+                                                    prog.speed_mbps
+                                                ))
+                                                .monospace(),
+                                            );
+                                        }
+                                    });
                                 },
                             );
-
-                            if prog.bytes_total > 0 {
-                                let done_str = format_file_size(prog.bytes_done);
-                                let total_str = format_file_size(prog.bytes_total);
-                                ui.label(
-                                    RichText::new(format!("{:>9} / {:<9}", done_str, total_str))
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
-                            }
                         });
                     }
 
@@ -4426,6 +4457,15 @@ impl LanShareApp {
 
                                 for item in display_items {
                                     ui.horizontal(|ui| {
+                                        let row_avail_w = ui.available_width();
+                                        let right_pad = 12.0_f32;
+                                        let size_col_w = 132.0_f32;
+                                        let eta_col_w = 166.0_f32;
+                                        let gap_w = 8.0_f32;
+                                        let right_cols_w =
+                                            right_pad + size_col_w + eta_col_w + gap_w;
+                                        let left_w = (row_avail_w - right_cols_w - 8.0).max(120.0);
+
                                         let (badge, color) = match &item.status {
                                             QueueItemStatus::Downloading => {
                                                 ("Active", p.accent_blue)
@@ -4437,103 +4477,56 @@ impl LanShareApp {
                                             }
                                             QueueItemStatus::Failed(_) => ("Failed", p.accent_red),
                                         };
-                                        ui.label(RichText::new(badge).strong().color(color));
-                                        ui.label(format!(
-                                            "{} ({})",
-                                            item.entry.name, item.peer_name
-                                        ));
 
-                                        if matches!(
-                                            item.status,
-                                            QueueItemStatus::Pending | QueueItemStatus::Failed(_)
-                                        ) {
-                                            let tip = if item.status == QueueItemStatus::Pending {
-                                                "Remove from queue"
-                                            } else {
-                                                "Remove from list"
-                                            };
-                                            if ui.button("✖").on_hover_text(tip).clicked() {
-                                                remove_id = Some(item.id);
-                                            }
-                                        }
+                                        let mut size_text = String::new();
+                                        let mut detail_text = String::new();
+                                        let mut detail_color = p.text_muted;
+                                        let mut detail_tooltip: Option<String> = None;
 
                                         match &item.status {
-                                            QueueItemStatus::Downloading => {
-                                                // Active ETA is shown in active download section above, not needed in list
-                                            }
+                                            QueueItemStatus::Downloading => {}
                                             QueueItemStatus::Pending => {
                                                 let item_bytes =
                                                     item.total_bytes.unwrap_or(item.entry.size);
-                                                if item.entry.is_dir {
-                                                    if item_bytes > 0 {
-                                                        let sz_str = format_file_size(item_bytes);
-                                                        if let Some(item_s) =
-                                                            active_speed.and_then(|spd| {
-                                                                estimate_remaining_seconds(
-                                                                    item_bytes, spd,
-                                                                )
-                                                            })
-                                                        {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "• Folder • {} • ETA: {}",
-                                                                    sz_str,
-                                                                    format_remaining_time(item_s)
-                                                                ))
-                                                                .color(p.text_muted),
-                                                            );
-                                                        } else {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "• Folder • {}",
-                                                                    sz_str
-                                                                ))
-                                                                .color(p.text_muted),
-                                                            );
-                                                        }
-                                                    } else {
-                                                        ui.label(
-                                                            RichText::new("• Folder")
-                                                                .color(p.text_muted),
-                                                        );
-                                                    }
-                                                } else if item_bytes > 0 {
-                                                    let sz_str = format_file_size(item_bytes);
-                                                    if let Some(spd) = active_speed {
-                                                        if let Some(item_s) =
+                                                let kind_tag =
+                                                    if item.entry.is_dir { "Folder" } else { "" };
+                                                let sz_str = if item_bytes > 0 {
+                                                    format_file_size(item_bytes)
+                                                } else if item.entry.is_dir {
+                                                    "-".to_string()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                if !kind_tag.is_empty() || !sz_str.is_empty() {
+                                                    size_text =
+                                                        format!("{:<6} {:>9}", kind_tag, sz_str);
+                                                }
+                                                if item_bytes > 0 {
+                                                    if let Some(item_s) =
+                                                        active_speed.and_then(|spd| {
                                                             estimate_remaining_seconds(
                                                                 item_bytes, spd,
                                                             )
-                                                        {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "• {} • ETA: {}",
-                                                                    sz_str,
-                                                                    format_remaining_time(item_s)
-                                                                ))
-                                                                .color(p.text_muted),
-                                                            );
-                                                        } else {
-                                                            ui.label(
-                                                                RichText::new(format!(
-                                                                    "• {}",
-                                                                    sz_str
-                                                                ))
-                                                                .color(p.text_muted),
-                                                            );
-                                                        }
-                                                    } else {
-                                                        ui.label(
-                                                            RichText::new(format!("• {}", sz_str))
-                                                                .color(p.text_muted),
+                                                        })
+                                                    {
+                                                        detail_text = format!(
+                                                            "ETA: {:<5}",
+                                                            format_remaining_time(item_s)
                                                         );
+                                                        detail_color = p.accent_blue;
                                                     }
                                                 }
                                             }
                                             QueueItemStatus::Completed => {
                                                 let final_bytes =
                                                     item.total_bytes.unwrap_or(item.entry.size);
-                                                let size_str = format_file_size(final_bytes);
+                                                let kind_tag =
+                                                    if item.entry.is_dir { "Folder" } else { "" };
+                                                size_text = format!(
+                                                    "{:<6} {:>9}",
+                                                    kind_tag,
+                                                    format_file_size(final_bytes)
+                                                );
                                                 let took_str = item.elapsed_duration.map(|dur| {
                                                     if dur.as_secs() == 0 {
                                                         "< 1s".to_string()
@@ -4544,28 +4537,117 @@ impl LanShareApp {
                                                 let time_str = item
                                                     .completed_at
                                                     .map(format_completed_timestamp);
-
-                                                let mut parts = vec![size_str];
-                                                if let Some(took) = took_str {
-                                                    parts.push(format!("Took {}", took));
-                                                }
-                                                if let Some(finished_ts) = time_str {
-                                                    parts.push(finished_ts);
-                                                }
-
-                                                let label_text = format!("• {}", parts.join(" • "));
-                                                ui.label(
-                                                    RichText::new(label_text).color(p.text_muted),
-                                                );
+                                                detail_text = match (took_str, time_str) {
+                                                    (Some(took), Some(ts)) => {
+                                                        format!("Took {:<4}  {}", took, ts)
+                                                    }
+                                                    (Some(took), None) => {
+                                                        format!("Took {}", took)
+                                                    }
+                                                    (None, Some(ts)) => ts,
+                                                    (None, None) => String::new(),
+                                                };
                                             }
                                             QueueItemStatus::Failed(ref err) => {
-                                                ui.label(
-                                                    RichText::new(format!("• Error: {}", err))
-                                                        .color(p.accent_red),
-                                                );
+                                                detail_text = format!("Error: {}", err);
+                                                detail_color = p.accent_red;
+                                                detail_tooltip = Some(err.clone());
                                             }
-                                            _ => {}
+                                            QueueItemStatus::Cancelled => {}
                                         }
+
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(left_w, 20.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_min_size(egui::vec2(left_w, 20.0));
+                                                ui.set_max_size(egui::vec2(left_w, 20.0));
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                                if matches!(
+                                                    item.status,
+                                                    QueueItemStatus::Pending
+                                                        | QueueItemStatus::Failed(_)
+                                                ) {
+                                                    let tip = if item.status
+                                                        == QueueItemStatus::Pending
+                                                    {
+                                                        "Remove from queue"
+                                                    } else {
+                                                        "Remove from list"
+                                                    };
+                                                    if ui
+                                                        .add_sized(
+                                                            [22.0, 18.0],
+                                                            egui::Button::new("✖"),
+                                                        )
+                                                        .on_hover_text(tip)
+                                                        .clicked()
+                                                    {
+                                                        remove_id = Some(item.id);
+                                                    }
+                                                } else {
+                                                    ui.allocate_space(egui::vec2(22.0, 18.0));
+                                                }
+
+                                                Self::render_fixed_metric_col(ui, 52.0, |ui| {
+                                                    ui.label(
+                                                        RichText::new(badge).strong().color(color),
+                                                    );
+                                                });
+
+                                                ui.add(
+                                                    egui::Label::new(format!(
+                                                        "{} ({})",
+                                                        item.entry.name, item.peer_name
+                                                    ))
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add_space(right_pad);
+
+                                                Self::render_fixed_metric_col(
+                                                    ui,
+                                                    size_col_w,
+                                                    |ui| {
+                                                        if !size_text.is_empty() {
+                                                            ui.label(
+                                                                RichText::new(size_text)
+                                                                    .monospace()
+                                                                    .color(p.text_muted),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+
+                                                ui.add_space(gap_w);
+
+                                                Self::render_fixed_metric_col(
+                                                    ui,
+                                                    eta_col_w,
+                                                    |ui| {
+                                                        if !detail_text.is_empty() {
+                                                            let resp = ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(detail_text)
+                                                                        .monospace()
+                                                                        .color(detail_color),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                            if let Some(ref tip) = detail_tooltip {
+                                                                resp.on_hover_text(tip);
+                                                            }
+                                                        }
+                                                    },
+                                                );
+                                            },
+                                        );
                                     });
                                 }
                             });
@@ -5084,15 +5166,10 @@ impl LanShareApp {
                                             |ui| {
                                                 ui.add_space(right_pad);
 
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(size_col_w, 18.0),
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    ),
+                                                Self::render_fixed_metric_col(
+                                                    ui,
+                                                    size_col_w,
                                                     |ui| {
-                                                        ui.set_min_size(egui::vec2(
-                                                            size_col_w, 18.0,
-                                                        ));
                                                         if upload.total_size > 0 {
                                                             ui.label(
                                                                 RichText::new(format!(
@@ -5113,15 +5190,10 @@ impl LanShareApp {
 
                                                 ui.add_space(gap_w);
 
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(eta_col_w, 18.0),
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    ),
+                                                Self::render_fixed_metric_col(
+                                                    ui,
+                                                    eta_col_w,
                                                     |ui| {
-                                                        ui.set_min_size(egui::vec2(
-                                                            eta_col_w, 18.0,
-                                                        ));
                                                         let remaining = upload
                                                             .total_size
                                                             .saturating_sub(upload.bytes_sent);
@@ -5150,16 +5222,10 @@ impl LanShareApp {
 
                                                 ui.add_space(gap_w);
 
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(speed_col_w, 18.0),
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    ),
+                                                Self::render_fixed_metric_col(
+                                                    ui,
+                                                    speed_col_w,
                                                     |ui| {
-                                                        ui.set_min_size(egui::vec2(
-                                                            speed_col_w,
-                                                            18.0,
-                                                        ));
                                                         if upload.speed_mbps > 0.0 {
                                                             ui.label(
                                                                 RichText::new(format!(
@@ -5623,12 +5689,8 @@ mod tests {
                 && light.text_primary.g() < 50
                 && light.text_primary.b() < 50
         );
-        // Light mode browse alternating row stripe and hover highlight must have clear contrast
-        let light_stripe_delta =
-            (light.panel_bg.r() as i16 - light.browse_row_stripe_bg.r() as i16).abs();
-        assert!(light_stripe_delta >= 12);
+        // Light mode browse hover highlight must have clear contrast
         assert_ne!(light.browse_row_hover_bg, light.panel_bg);
-        assert_ne!(light.browse_row_hover_bg, light.browse_row_stripe_bg);
         assert!(light.browse_row_hover_bg.b() > light.browse_row_hover_bg.r() + 30);
 
         let dark = AppPalette::new(true);
@@ -7112,10 +7174,10 @@ mod tests {
             expected_max_w
         );
         assert!(
-            hover_rects[0].right() <= dl_btn_rects[0].right() + 8.0,
+            hover_rects[0].right() <= dl_btn_rects[0].right() + 12.0,
             "Highlight right ({}) must not extend past Download button ({})",
             hover_rects[0].right(),
-            dl_btn_rects[0].right() + 8.0
+            dl_btn_rects[0].right() + 12.0
         );
     }
 
@@ -8082,6 +8144,252 @@ mod tests {
             "Growing upload_section_height should move Uploads header upward ({} vs {})",
             header_y_resized,
             header_y_default
+        );
+    }
+
+    #[test]
+    fn test_browse_uniform_buttons_and_queue_left_cross_and_padded_cols() {
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.client_connected = true;
+        app.client_ip = "mock://host".to_string();
+        app.client_port = 4433;
+        app.client_file_list = vec![
+            FileEntry {
+                name: "active.iso".to_string(),
+                is_dir: false,
+                size: 100 * 1024 * 1024,
+                modified_timestamp: 0,
+            },
+            FileEntry {
+                name: "queued.zip".to_string(),
+                is_dir: false,
+                size: 50 * 1024 * 1024,
+                modified_timestamp: 0,
+            },
+            FileEntry {
+                name: "fresh.tar".to_string(),
+                is_dir: false,
+                size: 20 * 1024 * 1024,
+                modified_timestamp: 0,
+            },
+        ];
+
+        let make_item =
+            |id: u64, name: &str, size: u64, status: QueueItemStatus| QueuedDownloadItem {
+                id,
+                peer_name: "MockHost".to_string(),
+                conn_ctx: ConnectionContext {
+                    ip: "mock://host".to_string(),
+                    port: 4433,
+                    password: "secret".to_string(),
+                    peer_name: Some("MockHost".to_string()),
+                },
+                is_mock: true,
+                entry: FileEntry {
+                    name: name.to_string(),
+                    is_dir: false,
+                    size,
+                    modified_timestamp: 0,
+                },
+                remote_subpath: name.to_string(),
+                local_dest_dir: PathBuf::from("/tmp"),
+                status,
+                started_at: None,
+                elapsed_duration: None,
+                completed_at: None,
+                total_bytes: Some(size),
+            };
+
+        let ctx = egui::Context::default();
+        let collect_button_rect = |out: &egui::FullOutput, label: &str| -> egui::Rect {
+            fn find_text(s: &egui::epaint::Shape, label: &str) -> Option<(egui::Pos2, egui::Vec2)> {
+                match s {
+                    egui::epaint::Shape::Text(t) if t.galley.job.text == label => {
+                        Some((t.pos, t.galley.size()))
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(|c| find_text(c, label)),
+                    _ => None,
+                }
+            }
+            fn find_btn_rect(s: &egui::epaint::Shape, center: egui::Pos2) -> Option<egui::Rect> {
+                match s {
+                    egui::epaint::Shape::Rect(r)
+                        if r.rect.width() >= 60.0
+                            && r.rect.width() <= 100.0
+                            && r.rect.height() >= 18.0
+                            && r.rect.height() <= 28.0
+                            && r.rect.contains(center) =>
+                    {
+                        Some(r.rect)
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(|c| find_btn_rect(c, center)),
+                    _ => None,
+                }
+            }
+            let (pos, sz) = out
+                .shapes
+                .iter()
+                .find_map(|c| find_text(&c.shape, label))
+                .unwrap_or_else(|| panic!("Missing button label {label}"));
+            let center = pos + sz * 0.5;
+            out.shapes
+                .iter()
+                .find_map(|c| find_btn_rect(&c.shape, center))
+                .unwrap_or_else(|| panic!("Missing background rect for button {label}"))
+        };
+
+        // 1. Idle state -> "Download" button + uniform row background (no alternating stripes)
+        let idle_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let download_rect = collect_button_rect(&idle_out, "Download");
+        fn count_row_stripes(s: &egui::epaint::Shape) -> usize {
+            match s {
+                egui::epaint::Shape::Rect(r)
+                    if r.rect.width() >= 400.0
+                        && r.rect.height() >= 18.0
+                        && r.rect.height() <= 36.0
+                        && r.fill != Color32::TRANSPARENT =>
+                {
+                    1
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().map(count_row_stripes).sum(),
+                _ => 0,
+            }
+        }
+        let stripe_count: usize = idle_out
+            .shapes
+            .iter()
+            .map(|c| count_row_stripes(&c.shape))
+            .sum();
+        assert_eq!(
+            stripe_count, 0,
+            "Browse table rows must not alternate background"
+        );
+
+        // 2. Active + Queued + Queue state -> Active / Queued / Queue must match Download size
+        app.active_queue_id = Some(1);
+        app.active_progress = Some(TransferProgress {
+            selected_target: "active.iso".to_string(),
+            file_name: "active.iso".to_string(),
+            bytes_done: 50 * 1024 * 1024,
+            bytes_total: 100 * 1024 * 1024,
+            speed_mbps: 10.0,
+            is_finished: false,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+        });
+        app.download_queue.push_back(make_item(
+            1,
+            "active.iso",
+            100 * 1024 * 1024,
+            QueueItemStatus::Downloading,
+        ));
+        app.download_queue.push_back(make_item(
+            2,
+            "queued.zip",
+            50 * 1024 * 1024,
+            QueueItemStatus::Pending,
+        ));
+        app.download_queue.push_back(make_item(
+            3,
+            "much_longer_queued_archive_name.tar",
+            1_500_000_000,
+            QueueItemStatus::Pending,
+        ));
+
+        let busy_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_client_browser_panel(ui);
+            });
+        });
+        let active_rect = collect_button_rect(&busy_out, "Active");
+        let queued_rect = collect_button_rect(&busy_out, "Queued");
+        let queue_rect = collect_button_rect(&busy_out, "Queue");
+        for (name, r) in [
+            ("Active", active_rect),
+            ("Queued", queued_rect),
+            ("Queue", queue_rect),
+        ] {
+            assert!(
+                (r.width() - download_rect.width()).abs() < 0.5,
+                "{name} width {} != Download width {}",
+                r.width(),
+                download_rect.width()
+            );
+            assert!(
+                (r.height() - download_rect.height()).abs() < 0.5,
+                "{name} height {} != Download height {}",
+                r.height(),
+                download_rect.height()
+            );
+        }
+
+        // 3. Download queue cross button sits on the left before Queued badge/filename,
+        // and ETA + Size columns stay aligned across differing filename lengths
+        let q_out = run_test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.render_download_queue_panel(ui, 220.0);
+            });
+        });
+        let mut text_positions: Vec<(String, egui::Pos2)> = Vec::new();
+        fn collect_pos(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.job.text.clone(), t.pos)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|c| collect_pos(c, out)),
+                _ => {}
+            }
+        }
+        q_out
+            .shapes
+            .iter()
+            .for_each(|c| collect_pos(&c.shape, &mut text_positions));
+
+        let cross_xs: Vec<f32> = text_positions
+            .iter()
+            .filter(|(t, _)| t == "✖")
+            .map(|(_, p)| p.x)
+            .collect();
+        let queued_xs: Vec<f32> = text_positions
+            .iter()
+            .filter(|(t, _)| t == "Queued")
+            .map(|(_, p)| p.x)
+            .collect();
+        let row_name_pos = text_positions
+            .iter()
+            .find(|(t, _)| t.starts_with("queued.zip"))
+            .map(|(_, p)| p.x)
+            .expect("queued.zip must render");
+        assert!(!cross_xs.is_empty());
+        assert!(cross_xs[0] < queued_xs[0]);
+        assert!(queued_xs[0] < row_name_pos);
+
+        let queue_eta_xs: Vec<f32> = text_positions
+            .iter()
+            .filter(|(t, p)| t.starts_with("ETA:") && p.y > 80.0)
+            .map(|(_, p)| p.x)
+            .collect();
+        assert_eq!(queue_eta_xs.len(), 2, "{:?}", text_positions);
+        assert!(
+            (queue_eta_xs[0] - queue_eta_xs[1]).abs() < 0.5,
+            "Queued ETA columns must align vertically: {:?}",
+            queue_eta_xs
+        );
+
+        let queue_size_xs: Vec<f32> = text_positions
+            .iter()
+            .filter(|(t, p)| (t.ends_with("MB") || t.ends_with("GB")) && p.y > 80.0)
+            .map(|(_, p)| p.x)
+            .collect();
+        assert_eq!(queue_size_xs.len(), 2, "{:?}", text_positions);
+        assert!(
+            (queue_size_xs[0] - queue_size_xs[1]).abs() < 0.5,
+            "Queued Size columns must align vertically: {:?}",
+            queue_size_xs
         );
     }
 }
