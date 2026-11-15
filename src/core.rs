@@ -1305,7 +1305,7 @@ pub const GITHUB_REPO_URL: &str = "https://github.com/jokkeheikkila/LanShare";
 pub const GITHUB_RELEASES_URL: &str = "https://github.com/jokkeheikkila/LanShare/releases";
 
 #[cfg(target_os = "windows")]
-fn windows_shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
+fn windows_shell_open(target: &std::ffi::OsStr, kind: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "shell32")]
@@ -1338,14 +1338,17 @@ fn windows_shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
     if rc > 32 {
         Ok(())
     } else {
-        Err(format!("Failed to open target (ShellExecuteW code {})", rc))
+        Err(format!(
+            "Failed to open {} (ShellExecuteW code {})",
+            kind, rc
+        ))
     }
 }
 
 fn open_in_os(target: &std::ffi::OsStr, kind: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        windows_shell_open(target)
+        windows_shell_open(target, kind)
     }
 
     #[cfg(target_os = "macos")]
