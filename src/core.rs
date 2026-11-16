@@ -1712,6 +1712,30 @@ pub fn test_downloads_dir() -> PathBuf {
     std::env::temp_dir().join(format!("lanshare-test-downloads-{}", std::process::id()))
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn spawn_desktop_open(target: &std::ffi::OsStr, err_context: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut xdg = Command::new("xdg-open");
+    xdg.arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match xdg.spawn() {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let mut gio = Command::new("gio");
+            gio.arg("open")
+                .arg(target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            gio.spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to open {}: {}", err_context, e))
+        }
+    }
+}
+
 /// Opens a directory in the native file explorer / manager (Explorer on Windows, xdg-open on Linux, Finder on macOS).
 pub fn open_folder_in_explorer(path: &std::path::Path) -> Result<(), String> {
     if cfg!(test) {
@@ -1735,6 +1759,9 @@ pub fn open_folder_in_explorer(path: &std::path::Path) -> Result<(), String> {
     {
         std::process::Command::new("open")
             .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Failed to open Finder: {}", e))
@@ -1742,16 +1769,7 @@ pub fn open_folder_in_explorer(path: &std::path::Path) -> Result<(), String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let res = std::process::Command::new("xdg-open").arg(path).spawn();
-        match res {
-            Ok(_) => Ok(()),
-            Err(_) => std::process::Command::new("gio")
-                .arg("open")
-                .arg(path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| format!("Failed to open file manager: {}", e)),
-        }
+        spawn_desktop_open(path.as_os_str(), "file manager")
     }
 }
 
@@ -1809,6 +1827,9 @@ fn open_in_os(target: &std::ffi::OsStr, kind: &str) -> Result<(), String> {
     {
         std::process::Command::new("open")
             .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Failed to open {}: {}", kind, e))
@@ -1816,16 +1837,7 @@ fn open_in_os(target: &std::ffi::OsStr, kind: &str) -> Result<(), String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let res = std::process::Command::new("xdg-open").arg(target).spawn();
-        match res {
-            Ok(_) => Ok(()),
-            Err(_) => std::process::Command::new("gio")
-                .arg("open")
-                .arg(target)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| format!("Failed to open {}: {}", kind, e)),
-        }
+        spawn_desktop_open(target, kind)
     }
 }
 
