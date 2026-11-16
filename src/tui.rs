@@ -1,14 +1,14 @@
 use crate::client::{self, ClientTlsStream, ConnectionContext, TransferProgress};
 use crate::core::{
-    complete_queued_download, compute_queue_etas, default_mock_peers, dirs_fallback,
-    estimate_remaining_seconds, format_completed_timestamp, format_file_size,
+    complete_queued_download, compute_active_uploads_etas, compute_queue_etas, default_mock_peers,
+    dirs_fallback, estimate_queued_item_eta, format_completed_timestamp, format_file_size,
     format_remaining_time, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
     mock_folder_total_bytes, open_url, parse_host_and_port, queue_status_sort_rank,
     resolve_remote_folder_total_bytes, sort_peers_alphabetically, sort_shared_paths,
     spawn_next_queued_download, test_downloads_dir, ClientActionResult, EtaStabilizer,
     QueueEtaSummary, QueueItemStatus, QueuedDownloadItem, SharedPathSizeResolver,
-    SharedPathSizeStatus, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
+    SharedPathSizeStatus, UploadEtaTracker, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
@@ -630,7 +630,7 @@ pub struct LanShareTui {
     progress_finished_at: Option<Instant>,
     active_eta_stabilizer: EtaStabilizer,
     total_eta_stabilizer: EtaStabilizer,
-    upload_total_eta_stabilizer: EtaStabilizer,
+    upload_total_eta_stabilizer: UploadEtaTracker,
     progress_rx: Receiver<TransferProgress>,
     progress_tx: tokio::sync::mpsc::UnboundedSender<TransferProgress>,
     transfer_cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -809,7 +809,7 @@ impl LanShareTui {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
-            upload_total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: UploadEtaTracker::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tokio_tx,
             transfer_cancel_tx: None,
@@ -3180,20 +3180,20 @@ impl LanShareTui {
             .filter(|i| i.status == QueueItemStatus::Completed)
             .count();
 
-        let QueueEtaSummary {
-            active_remaining,
-            total_remaining_bytes,
-            active_speed,
-            active_eta,
-            total_eta,
-            ..
-        } = compute_queue_etas(
+        let eta_summary = compute_queue_etas(
             &self.download_queue,
             self.active_queue_id,
             self.active_progress.as_ref(),
             &mut self.active_eta_stabilizer,
             &mut self.total_eta_stabilizer,
         );
+        let QueueEtaSummary {
+            active_remaining,
+            total_remaining_bytes,
+            active_eta,
+            total_eta,
+            ..
+        } = eta_summary;
 
         if self.client_section == ClientSection::Downloads {
             self.last_downloads_header_y = Some(cur_y);
@@ -3361,18 +3361,14 @@ impl LanShareTui {
                                 } else {
                                     sz_str
                                 };
-                                if let Some(spd) = active_speed {
-                                    if let Some(item_s) =
-                                        estimate_remaining_seconds(item_bytes, spd)
-                                    {
-                                        format!(
-                                            "{} (ETA: {:<4})",
-                                            prefix,
-                                            format_remaining_time(item_s)
-                                        )
-                                    } else {
-                                        prefix
-                                    }
+                                if let Some(item_s) =
+                                    estimate_queued_item_eta(item_bytes, &eta_summary)
+                                {
+                                    format!(
+                                        "{} (ETA: {:<4})",
+                                        prefix,
+                                        format_remaining_time(item_s)
+                                    )
                                 } else {
                                     prefix
                                 }
@@ -3692,10 +3688,9 @@ impl LanShareTui {
             .as_ref()
             .map(|h| h.active_uploads_snapshot())
             .unwrap_or_default();
-        let upload_total_eta = crate::core::compute_active_uploads_total_eta(
-            &active_uploads,
-            &mut self.upload_total_eta_stabilizer,
-        );
+        let upload_etas =
+            compute_active_uploads_etas(&active_uploads, &mut self.upload_total_eta_stabilizer);
+        let upload_total_eta = upload_etas.total_eta;
         if self.upload_scroll_offset >= active_uploads.len() {
             self.upload_scroll_offset = active_uploads.len().saturating_sub(1);
         }
@@ -3839,12 +3834,10 @@ impl LanShareTui {
                     } else {
                         0.0
                     };
-                    let rem_bytes = upload.total_size.saturating_sub(upload.bytes_sent);
                     let eta_str = if upload.bytes_sent >= upload.total_size && upload.total_size > 0
                     {
                         "0s".to_string()
-                    } else if let Some(s) = estimate_remaining_seconds(rem_bytes, upload.speed_mbps)
-                    {
+                    } else if let Some(s) = upload_etas.eta_for(upload.id) {
                         format_remaining_time(s)
                     } else {
                         "--".to_string()
@@ -3896,11 +3889,10 @@ impl LanShareTui {
                     } else {
                         0.0
                     };
-                    let rem = single.total_size.saturating_sub(single.bytes_sent);
                     let eta_str = if single.bytes_sent >= single.total_size && single.total_size > 0
                     {
                         " | ETA: 0s   ".to_string()
-                    } else if let Some(s) = estimate_remaining_seconds(rem, single.speed_mbps) {
+                    } else if let Some(s) = upload_etas.eta_for(single.id) {
                         format!(" | ETA: {:<5}", format_remaining_time(s))
                     } else {
                         " | ETA: --   ".to_string()

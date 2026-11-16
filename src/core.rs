@@ -1418,6 +1418,7 @@ pub struct QueueEtaSummary {
     pub total_remaining_bytes: u64,
     pub active_speed: Option<f32>,
     pub active_eta: Option<u64>,
+    pub pending_eta: Option<u64>,
     pub total_eta: Option<u64>,
 }
 
@@ -1500,9 +1501,9 @@ pub fn compute_queue_etas(
     };
     let active_eta = active_eta_stabilizer.update(active_key.as_deref(), raw_active_eta);
 
-    let total_eta = if queued_pending_bytes == 0 {
+    let (pending_eta, total_eta) = if queued_pending_bytes == 0 {
         total_eta_stabilizer.reset();
-        active_eta
+        (None, active_eta)
     } else {
         // Stabilize only the pending queue component so total_eta always tracks
         // active_eta directly without double-smoothing or timer-phase drift.
@@ -1510,12 +1511,13 @@ pub fn compute_queue_etas(
         let raw_pending_eta =
             active_speed.and_then(|spd| estimate_remaining_seconds(queued_pending_bytes, spd));
         let pending_eta = total_eta_stabilizer.update(Some(&total_key), raw_pending_eta);
-        match (active_eta, pending_eta) {
+        let total_eta = match (active_eta, pending_eta) {
             (Some(act_s), Some(pend_s)) => Some(act_s.saturating_add(pend_s)),
             (Some(act_s), None) => Some(act_s),
             (None, Some(pend_s)) => Some(pend_s),
             (None, None) => None,
-        }
+        };
+        (pending_eta, total_eta)
     };
 
     QueueEtaSummary {
@@ -1524,7 +1526,32 @@ pub fn compute_queue_etas(
         total_remaining_bytes,
         active_speed,
         active_eta,
+        pending_eta,
         total_eta,
+    }
+}
+
+/// Computes a pending queue item's ETA in lockstep with [`QueueEtaSummary::pending_eta`],
+/// preventing row estimates from drifting independently on momentary speed noise.
+pub fn estimate_queued_item_eta(item_bytes: u64, summary: &QueueEtaSummary) -> Option<u64> {
+    if item_bytes == 0 {
+        return None;
+    }
+    match (summary.pending_eta, summary.queued_pending_bytes) {
+        (Some(pend_s), tot) if tot > 0 => {
+            if item_bytes == tot {
+                Some(pend_s)
+            } else {
+                Some(
+                    ((pend_s as f64) * (item_bytes as f64 / tot as f64))
+                        .round()
+                        .max(1.0) as u64,
+                )
+            }
+        }
+        _ => summary
+            .active_speed
+            .and_then(|spd| estimate_remaining_seconds(item_bytes, spd)),
     }
 }
 
@@ -1536,28 +1563,75 @@ pub fn should_show_loading_spinner(loading: bool, started_at: Option<Instant>) -
     loading && started_at.is_some_and(|t| t.elapsed() >= LOADING_SPINNER_DELAY)
 }
 
-/// Computes a stabilized total ETA (in seconds) across active concurrent server uploads.
-pub fn compute_active_uploads_total_eta(
-    uploads: &[crate::server::ActiveUploadInfo],
-    stabilizer: &mut EtaStabilizer,
-) -> Option<u64> {
-    let raw_max_eta = uploads
-        .iter()
-        .filter_map(|u| {
-            let rem = u.total_size.saturating_sub(u.bytes_sent);
-            if rem > 0 {
-                estimate_remaining_seconds(rem, u.speed_mbps)
-            } else {
-                None
-            }
-        })
-        .max();
-    if uploads.is_empty() || raw_max_eta.is_none() {
-        stabilizer.reset();
-        return None;
+/// Per-upload ETA stabilizer state so each active upload row and aggregate `Total ETA` stay in sync.
+#[derive(Debug, Clone, Default)]
+pub struct UploadEtaTracker {
+    stabilizers: HashMap<u64, EtaStabilizer>,
+}
+
+impl UploadEtaTracker {
+    pub fn new() -> Self {
+        Self::default()
     }
-    let key = format!("uploads:{}", uploads.len());
-    stabilizer.update(Some(&key), raw_max_eta)
+
+    pub fn reset(&mut self) {
+        self.stabilizers.clear();
+    }
+}
+
+/// Synchronized stabilized ETAs for active concurrent uploads and their aggregate `Total ETA`.
+#[derive(Debug, Clone, Default)]
+pub struct UploadEtaSummary {
+    pub per_upload: HashMap<u64, Option<u64>>,
+    pub total_eta: Option<u64>,
+}
+
+impl UploadEtaSummary {
+    pub fn eta_for(&self, id: u64) -> Option<u64> {
+        self.per_upload.get(&id).copied().flatten()
+    }
+}
+
+/// Computes stabilized per-upload ETAs and aggregate `Total ETA` across active server uploads.
+/// Every upload row displays the same stabilized ETA that contributes to `total_eta = max(rows)`.
+pub fn compute_active_uploads_etas(
+    uploads: &[crate::server::ActiveUploadInfo],
+    tracker: &mut UploadEtaTracker,
+) -> UploadEtaSummary {
+    tracker
+        .stabilizers
+        .retain(|id, _| uploads.iter().any(|u| u.id == *id));
+
+    let mut per_upload = HashMap::with_capacity(uploads.len());
+    let mut total_eta: Option<u64> = None;
+
+    for u in uploads {
+        let rem = u.total_size.saturating_sub(u.bytes_sent);
+        let raw_eta = if u.bytes_sent >= u.total_size && u.total_size > 0 {
+            Some(0)
+        } else if rem > 0 {
+            estimate_remaining_seconds(rem, u.speed_mbps)
+        } else {
+            None
+        };
+        let key = u.id.to_string();
+        let stabilized = tracker
+            .stabilizers
+            .entry(u.id)
+            .or_default()
+            .update(Some(&key), raw_eta);
+        if rem > 0 {
+            if let Some(eta_s) = stabilized {
+                total_eta = Some(total_eta.map_or(eta_s, |cur| cur.max(eta_s)));
+            }
+        }
+        per_upload.insert(u.id, stabilized);
+    }
+
+    UploadEtaSummary {
+        per_upload,
+        total_eta,
+    }
 }
 
 /// Computes the total byte size of a simulated mock folder recursively.
@@ -3329,7 +3403,9 @@ mod tests {
             &mut tot_s,
         );
         assert_eq!(r1.active_eta, Some(200));
+        assert_eq!(r1.pending_eta, Some(30));
         assert_eq!(r1.total_eta, Some(230));
+        assert_eq!(estimate_queued_item_eta(30 * 1024 * 1024, &r1), Some(30));
 
         // Remaining drops below 60s -> fast update fires on active_eta; total_eta updates in lockstep!
         let prog_near_end = TransferProgress {
@@ -3345,6 +3421,7 @@ mod tests {
         );
         assert_eq!(r2.active_eta, Some(50));
         assert_eq!(r2.total_eta, Some(80));
+        assert_eq!(estimate_queued_item_eta(30 * 1024 * 1024, &r2), Some(30));
 
         // Transition to item 11 while active_progress still has finished item 10:
         jump_queue[0].status = QueueItemStatus::Completed;
@@ -3365,7 +3442,43 @@ mod tests {
         assert_eq!(r3.active_eta, Some(30));
         assert_eq!(r3.total_eta, Some(30));
 
-        // 6. Mock folder total bytes sums recursively
+        // 6. Upload ETA tracker keeps row ETAs and Total ETA in exact lockstep even across swaps
+        let mut ul_tracker = UploadEtaTracker::new();
+        let ul1 = crate::server::ActiveUploadInfo {
+            id: 1,
+            peer: "192.168.1.20".to_string(),
+            folder_root: PathBuf::from("/tmp/share"),
+            file_name: "a.bin".to_string(),
+            bytes_sent: 0,
+            total_size: 200 * 1024 * 1024,
+            speed_mbps: 1.0,
+            started_at: Instant::now(),
+        };
+        let ul2 = crate::server::ActiveUploadInfo {
+            id: 2,
+            peer: "192.168.1.21".to_string(),
+            folder_root: PathBuf::from("/tmp/share"),
+            file_name: "b.bin".to_string(),
+            bytes_sent: 0,
+            total_size: 50 * 1024 * 1024,
+            speed_mbps: 1.0,
+            started_at: Instant::now(),
+        };
+        let u1 = compute_active_uploads_etas(std::slice::from_ref(&ul1), &mut ul_tracker);
+        assert_eq!(u1.eta_for(1), Some(200));
+        assert_eq!(u1.total_eta, Some(200));
+
+        let u2 = compute_active_uploads_etas(&[ul1.clone(), ul2.clone()], &mut ul_tracker);
+        assert_eq!(u2.eta_for(1), Some(200));
+        assert_eq!(u2.eta_for(2), Some(50));
+        assert_eq!(u2.total_eta, Some(200));
+
+        // Swapping out upload #1 for #2 keeps count == 1, and immediately shows upload #2's ETA!
+        let u3 = compute_active_uploads_etas(std::slice::from_ref(&ul2), &mut ul_tracker);
+        assert_eq!(u3.eta_for(2), Some(50));
+        assert_eq!(u3.total_eta, Some(50));
+
+        // 7. Mock folder total bytes sums recursively
         assert!(mock_folder_total_bytes("mock://bob", "LAN_Party_Photos") > 0);
         assert!(mock_folder_total_bytes("mock://alice", "Design_Assets") > 0);
     }

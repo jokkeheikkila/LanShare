@@ -1,14 +1,15 @@
 use crate::client::{self, ClientTlsStream, ConnectionContext, TransferProgress};
 use crate::core::{
-    complete_queued_download, compute_queue_etas, default_mock_peers, dirs_fallback,
-    estimate_remaining_seconds, format_completed_timestamp, format_file_size,
+    complete_queued_download, compute_active_uploads_etas, compute_queue_etas, default_mock_peers,
+    dirs_fallback, estimate_queued_item_eta, format_completed_timestamp, format_file_size,
     format_remaining_time, format_secret_display, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
     mock_folder_total_bytes, open_file_in_default_app, open_folder_in_explorer, open_url,
     parse_host_and_port, queue_status_sort_rank, resolve_remote_folder_total_bytes,
     sort_peers_alphabetically, sort_shared_paths, spawn_next_queued_download, test_downloads_dir,
     ClientActionResult, EtaStabilizer, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem,
-    SharedPathSizeResolver, SharedPathSizeStatus, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
+    SharedPathSizeResolver, SharedPathSizeStatus, UploadEtaTracker, GITHUB_RELEASES_URL,
+    GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
@@ -213,7 +214,7 @@ pub struct LanShareApp {
     progress_finished_at: Option<Instant>,
     active_eta_stabilizer: EtaStabilizer,
     total_eta_stabilizer: EtaStabilizer,
-    upload_total_eta_stabilizer: EtaStabilizer,
+    upload_total_eta_stabilizer: UploadEtaTracker,
     progress_rx: Receiver<TransferProgress>,
     progress_tx: tokio::sync::mpsc::UnboundedSender<TransferProgress>,
     transfer_cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -581,7 +582,7 @@ impl LanShareApp {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
-            upload_total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: UploadEtaTracker::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tokio_tx,
             transfer_cancel_tx: None,
@@ -4441,20 +4442,20 @@ impl LanShareApp {
             .filter(|i| matches!(i.status, QueueItemStatus::Completed))
             .count();
 
-        let QueueEtaSummary {
-            active_remaining,
-            total_remaining_bytes,
-            active_speed,
-            active_eta,
-            total_eta,
-            ..
-        } = compute_queue_etas(
+        let eta_summary = compute_queue_etas(
             &self.download_queue,
             self.active_queue_id,
             self.active_progress.as_ref(),
             &mut self.active_eta_stabilizer,
             &mut self.total_eta_stabilizer,
         );
+        let QueueEtaSummary {
+            active_remaining,
+            total_remaining_bytes,
+            active_eta,
+            total_eta,
+            ..
+        } = eta_summary;
 
         let mut cancel_current = false;
         let mut cancel_all = false;
@@ -4719,13 +4720,10 @@ impl LanShareApp {
                                                         "{:>9}",
                                                         format_file_size(item_bytes)
                                                     );
-                                                    if let Some(item_s) =
-                                                        active_speed.and_then(|spd| {
-                                                            estimate_remaining_seconds(
-                                                                item_bytes, spd,
-                                                            )
-                                                        })
-                                                    {
+                                                    if let Some(item_s) = estimate_queued_item_eta(
+                                                        item_bytes,
+                                                        &eta_summary,
+                                                    ) {
                                                         detail_text = format!(
                                                             "ETA: {:<4}",
                                                             format_remaining_time(item_s)
@@ -5319,10 +5317,8 @@ impl LanShareApp {
             max_uploads_h,
         );
         ui.add_space(2.0);
-        let upload_total_eta = crate::core::compute_active_uploads_total_eta(
-            &active_uploads,
-            &mut self.upload_total_eta_stabilizer,
-        );
+        let upload_etas =
+            compute_active_uploads_etas(&active_uploads, &mut self.upload_total_eta_stabilizer);
         let target_h = (ui.available_height() - 4.0).min(upload_h).max(70.0);
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), target_h),
@@ -5332,7 +5328,7 @@ impl LanShareApp {
                     ui.set_min_height((target_h - 8.0).max(60.0));
                     ui.horizontal(|ui| {
                         let mut header_text = format!("Uploads — Active: {}", active_uploads.len());
-                        if let Some(tot_s) = upload_total_eta {
+                        if let Some(tot_s) = upload_etas.total_eta {
                             header_text.push_str(&format!(
                                 " | Total ETA: {}",
                                 format_remaining_time(tot_s)
@@ -5426,10 +5422,9 @@ impl LanShareApp {
                                                     .total_size
                                                     .saturating_sub(upload.bytes_sent);
                                                 if remaining > 0 {
-                                                    if let Some(eta_s) = estimate_remaining_seconds(
-                                                        remaining,
-                                                        upload.speed_mbps,
-                                                    ) {
+                                                    if let Some(eta_s) =
+                                                        upload_etas.eta_for(upload.id)
+                                                    {
                                                         ui.label(
                                                             RichText::new(format!(
                                                                 "ETA: {:<4}",
@@ -5991,7 +5986,7 @@ mod tests {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
-            upload_total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: UploadEtaTracker::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tx,
             transfer_cancel_tx: None,
@@ -6244,7 +6239,7 @@ mod tests {
             progress_finished_at: None,
             active_eta_stabilizer: EtaStabilizer::new(),
             total_eta_stabilizer: EtaStabilizer::new(),
-            upload_total_eta_stabilizer: EtaStabilizer::new(),
+            upload_total_eta_stabilizer: UploadEtaTracker::new(),
             progress_rx: prog_std_rx,
             progress_tx: prog_tx,
             transfer_cancel_tx: None,
