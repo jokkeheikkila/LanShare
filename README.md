@@ -10,7 +10,6 @@ Built in **Rust** from a single shared core powering both a lightweight native G
 
 - [How the Share-Ring Works](#how-the-share-ring-works)
 - [Key Features](#key-features)
-- [Screenshots](#screenshots)
 - [Download](#download)
 - [Usage](#usage)
   - [GUI (`lanshare-gui`)](#gui-lanshare-gui)
@@ -41,30 +40,6 @@ Instead of configuring IP addresses, user accounts, or SMB shares:
 * **Queue Entire Folders with Auto-Resume**: Download single files or full directory trees sequentially with automatic resume on interrupted transfers.
 * **Tailscale & WireGuard Ready**: Connect directly to remote peers across private tailnets (`100.64.0.0/10` and IPv6 ULA) via **Direct IP Connect**.
 * **Single-User Test Mode (`--test`)**: Try out browsing, peer switching, and transfers on one machine using built-in simulated peers.
-
----
-
-## Screenshots
-
-### Desktop GUI (`lanshare-gui`)
-![LanShare GUI — Browse LAN](assets/screenshots/1.0.0_gui_browse_white.png)
-
-### Terminal UI (`lanshare-cli`)
-![LanShare TUI — Browse LAN](assets/screenshots/1.0.0_tui_browse.png)
-
-<details>
-<summary>More Screenshots (Login & Share Files)</summary>
-
-#### GUI — Share-Ring Login
-![LanShare GUI — Login](assets/screenshots/1.0.0_gui_login_white.png)
-
-#### GUI — Share Files (Hosting)
-![LanShare GUI — Share Files](assets/screenshots/1.0.0_gui_share_white.png)
-
-#### TUI — Share Files (Hosting)
-![LanShare TUI — Share Files](assets/screenshots/1.0.0_tui_share.png)
-
-</details>
 
 ---
 
