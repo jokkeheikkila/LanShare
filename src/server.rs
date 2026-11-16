@@ -1,4 +1,4 @@
-use crate::core::format_file_size;
+use crate::core::{format_file_size, sort_shared_paths};
 use crate::network::{
     compute_tls_server_auth_token, generate_ephemeral_tls, get_computer_name,
     make_server_tls_config, read_frame, verify_tls_auth_token, write_frame,
@@ -175,16 +175,19 @@ impl Drop for ActiveDownloadGuard {
 }
 
 impl ServerHandle {
-    /// Dynamically updates the shared folders while the server is running without restarting or disconnecting peers.
+    /// Dynamically updates the shared folders and files while the server is running without restarting or disconnecting peers.
     pub fn update_shared_folders(&self, new_paths: Vec<PathBuf>) -> Result<(), String> {
         let mut validated = Vec::new();
         for p in &new_paths {
-            let safe = validate_shared_folder(p)?;
-            validated.push(safe);
+            let safe = validate_shared_path(p)?;
+            if !validated.contains(&safe) {
+                validated.push(safe);
+            }
         }
+        sort_shared_paths(&mut validated);
         if validated.is_empty() {
             return Err(
-                "Cannot remove all folders while sharing is active. Stop sharing instead."
+                "Cannot remove all shares while sharing is active. Stop sharing instead."
                     .to_string(),
             );
         }
@@ -198,10 +201,7 @@ impl ServerHandle {
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let _ = self.log_tx.send(ServerLogEvent {
             timestamp: ts,
-            message: format!(
-                "Shared folders updated: {} folder(s) active on LAN.",
-                validated.len()
-            ),
+            message: format!("Shares updated: {} item(s) active on LAN.", validated.len()),
             is_error: false,
         });
 
@@ -241,7 +241,8 @@ pub struct SharedFolderRegistry {
 }
 
 impl SharedFolderRegistry {
-    pub fn new(paths: Vec<PathBuf>) -> Self {
+    pub fn new(mut paths: Vec<PathBuf>) -> Self {
+        sort_shared_paths(&mut paths);
         let mut folders = Vec::new();
         let mut name_counts: HashMap<String, usize> = HashMap::new();
 
@@ -290,8 +291,10 @@ impl SharedFolderRegistry {
         // Backward compatibility fallback: if subpath doesn't start with alias and there's 1 shared folder
         if self.folders.len() == 1 {
             let (_, folder_path) = &self.folders[0];
-            if let Ok(safe) = resolve_safe_path(folder_path, &clean_subpath) {
-                return Ok((safe, folder_path.clone()));
+            if folder_path.is_dir() {
+                if let Ok(safe) = resolve_safe_path(folder_path, &clean_subpath) {
+                    return Ok((safe, folder_path.clone()));
+                }
             }
         }
 
@@ -312,18 +315,21 @@ pub async fn start_server(
     log_tx: UnboundedSender<ServerLogEvent>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     if shared_folders.is_empty() {
-        return Err("No folders specified to share.".into());
+        return Err("No folders or files specified to share.".into());
     }
     if password.trim().len() < MIN_SECRET_LEN {
         return Err(format!("LAN secret must be at least {} characters.", MIN_SECRET_LEN).into());
     }
 
-    // Re-validate all shared folders before starting server
+    // Re-validate all shared folders and files before starting server
     let mut validated_folders = Vec::with_capacity(shared_folders.len());
     for folder in &shared_folders {
-        let safe = validate_shared_folder(folder)?;
-        validated_folders.push(safe);
+        let safe = validate_shared_path(folder)?;
+        if !validated_folders.contains(&safe) {
+            validated_folders.push(safe);
+        }
     }
+    sort_shared_paths(&mut validated_folders);
 
     let validated_folders_arc = Arc::new(std::sync::RwLock::new(validated_folders.clone()));
     let registry = Arc::new(std::sync::RwLock::new(SharedFolderRegistry::new(
@@ -918,28 +924,37 @@ where
         match cmd {
             ClientCommand::ListDirectory { subpath } => {
                 let clean_sub = subpath.trim_matches('/').replace('\\', "/");
-                // Always list the shared folders at root, whether 1 folder or multiple folders
+                // Always list the shared folders and files at root (folders first, then files)
                 let resp = if clean_sub.is_empty() {
                     let mut entries = Vec::new();
                     {
                         let reg = rw_read(registry);
                         for (alias, path) in &reg.folders {
-                            let modified_timestamp = fs::metadata(path)
-                                .and_then(|m| m.modified())
+                            let meta = match fs::symlink_metadata(path) {
+                                Ok(m) if !is_symlink_or_reparse(&m) => m,
+                                _ => continue,
+                            };
+                            let modified_timestamp = meta
+                                .modified()
                                 .ok()
                                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
+                            let is_dir = meta.is_dir();
 
                             entries.push(FileEntry {
                                 name: alias.clone(),
-                                is_dir: true,
-                                size: 0,
+                                is_dir,
+                                size: if is_dir { 0 } else { meta.len() },
                                 modified_timestamp,
                             });
                         }
                     }
-                    entries.sort_by_key(|a| a.name.to_lowercase());
+                    entries.sort_by(|a, b| {
+                        b.is_dir
+                            .cmp(&a.is_dir)
+                            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    });
                     ServerCommandResponse::DirectoryListing {
                         current_path: String::new(),
                         entries,
@@ -950,6 +965,9 @@ where
                         reg.resolve_path(&subpath)
                     };
                     match safe_dir_res {
+                        Ok(safe_dir) if !safe_dir.is_dir() => ServerCommandResponse::Error {
+                            message: "Selected share is a file, not a directory.".to_string(),
+                        },
                         Ok(safe_dir) => {
                             let mut entries = Vec::new();
                             if let Ok(read_dir) = fs::read_dir(&safe_dir) {
@@ -1043,6 +1061,9 @@ where
                         reg.resolve_path(&subpath)
                     };
                     match folder_res {
+                        Ok(folder_path) if !folder_path.is_dir() => ServerCommandResponse::Error {
+                            message: "Selected share is a file; download it directly.".to_string(),
+                        },
                         Ok(folder_path) => {
                             let folder_name = folder_path
                                 .file_name()
@@ -1419,9 +1440,15 @@ mod tests {
             clean_path(&temp_dir1.canonicalize().unwrap())
         );
 
-        // 2. Multi-share registry
-        let reg_multi = SharedFolderRegistry::new(vec![temp_dir1.clone(), temp_dir2.clone()]);
-        assert_eq!(reg_multi.folders.len(), 2);
+        // 2. Multi-share registry (folders ordered before shared files)
+        let reg_multi =
+            SharedFolderRegistry::new(vec![file1.clone(), temp_dir1.clone(), temp_dir2.clone()]);
+        assert_eq!(reg_multi.folders.len(), 3);
+        assert_eq!(reg_multi.folders[2].0, "hello.txt");
+        assert_eq!(
+            reg_multi.resolve_path("hello.txt").unwrap(),
+            clean_path(&file1.canonicalize().unwrap())
+        );
 
         let _ = std::fs::remove_file(file1);
         let _ = std::fs::remove_dir_all(temp_dir1);

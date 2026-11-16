@@ -2,11 +2,11 @@ use crate::client::{self, ConnectionContext, TransferProgress};
 use crate::core::{
     default_mock_peers, dirs_fallback, estimate_remaining_seconds, execute_queued_download,
     format_file_size, format_remaining_time, mock_directory_entries, read_secret_from_env,
-    read_secret_from_stdin, run_mock_server_downloads, test_downloads_dir, validate_cli_secret,
-    MockDownloadConfig, QueueItemStatus, QueuedDownloadItem,
+    read_secret_from_stdin, run_mock_server_downloads, sort_shared_paths, test_downloads_dir,
+    validate_cli_secret, MockDownloadConfig, QueueItemStatus, QueuedDownloadItem,
 };
 use crate::protocol::{FileEntry, DEFAULT_TCP_PORT, MIN_SECRET_LEN};
-use crate::security::{clean_display_path, ensure_safe_client_dir, validate_shared_folder};
+use crate::security::{clean_display_path, ensure_safe_client_dir, validate_shared_path};
 use crate::server::{self, ServerLogEvent};
 use chrono::{Local, TimeZone};
 use std::io::Write;
@@ -137,14 +137,14 @@ pub fn format_cli_help() -> String {
 USAGE:\n\
   lanshare-cli [TUI_OPTIONS]\n\
   lanshare-cli tui [TUI_OPTIONS]\n\
-  lanshare-cli host <FOLDER>...\n\
+  lanshare-cli host <PATH>...\n\
   lanshare-cli peers\n\
   lanshare-cli ls --peer <HOSTNAME_OR_IP> [REMOTE_PATH]\n\
   lanshare-cli download --peer <HOSTNAME_OR_IP> [-d <DEST_DIR>] <REMOTE_PATH>...\n\
 \n\
 COMMANDS:\n\
   tui                   Launch the interactive Terminal UI (default when no command is given)\n\
-  host, share           Share one or more local folders read-only and print live server logs to terminal\n\
+  host, share           Share one or more local folders or files read-only and print live status\n\
   peers, scan           Discover and list active hosts on the Share-Ring\n\
   ls, list              List shared folders or directory contents on a remote host\n\
   download, get         Download one or more files or folders from a remote host (no wildcards)\n\
@@ -1030,24 +1030,60 @@ fn log_transfer_progress<W: Write>(
     }
 }
 
-/// Validates local folder paths to share before starting hosting or prompting for secrets.
+fn log_active_uploads<W: Write>(
+    out: &mut W,
+    uploads: &[server::ActiveUploadInfo],
+    last_progress_print: &mut Instant,
+) {
+    if uploads.is_empty() || last_progress_print.elapsed() < Duration::from_secs(1) {
+        return;
+    }
+    for u in uploads {
+        let pct = if u.total_size > 0 {
+            ((u.bytes_sent as f64 / u.total_size as f64) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let rem_bytes = u.total_size.saturating_sub(u.bytes_sent);
+        let eta_str = estimate_remaining_seconds(rem_bytes, u.speed_mbps)
+            .map(|s| format!(", ETA: {}", format_remaining_time(s)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "[{}] [Server] Upload Progress '{}' -> {}: {:.0}% ({} / {}) at {:.1} MB/s{}",
+            now_ts(),
+            u.file_name,
+            u.peer,
+            pct,
+            format_file_size(u.bytes_sent),
+            format_file_size(u.total_size),
+            u.speed_mbps,
+            eta_str
+        );
+    }
+    let _ = out.flush();
+    *last_progress_print = Instant::now();
+}
+
+/// Validates local folder or file paths to share before starting hosting or prompting for secrets.
 pub fn validate_cli_host_folders(folders: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     if folders.is_empty() {
-        return Err("At least one folder path is required to start hosting.".to_string());
+        return Err("At least one folder or file path is required to start hosting.".to_string());
     }
 
     let mut validated = Vec::with_capacity(folders.len());
     for f in folders {
-        let safe = validate_shared_folder(f)?;
+        let safe = validate_shared_path(f)?;
         if !validated.contains(&safe) {
             validated.push(safe);
         }
     }
+    sort_shared_paths(&mut validated);
     Ok(validated)
 }
 
-/// Runs the `host` / `share` CLI command in the foreground, printing all server logs directly
-/// to `out` until interrupted (or until `max_duration` elapses in tests).
+/// Runs the `host` / `share` CLI command in the foreground, printing all server logs and
+/// periodic upload progress directly to `out` until interrupted (or until `max_duration` elapses in tests).
 pub async fn run_cli_host<W: Write>(
     secret: &str,
     folders: &[PathBuf],
@@ -1072,12 +1108,26 @@ pub async fn run_cli_host<W: Write>(
         handle.local_ip,
         host_name
     );
-    for folder in &validated {
+    for share_path in &validated {
+        let kind = if share_path.is_dir() {
+            "folder"
+        } else {
+            "file"
+        };
+        let size_note = if share_path.is_file() {
+            std::fs::metadata(share_path)
+                .map(|m| format!(" ({})", format_file_size(m.len())))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "[{}] [Server] Sharing folder (Read-Only): {}",
+            "[{}] [Server] Sharing {} (Read-Only): {}{}",
             now_ts(),
-            clean_display_path(folder)
+            kind,
+            clean_display_path(share_path),
+            size_note
         );
     }
     let _ = writeln!(
@@ -1095,6 +1145,7 @@ pub async fn run_cli_host<W: Write>(
     }
 
     let start_instant = Instant::now();
+    let mut last_upload_progress_print = Instant::now();
     loop {
         if CLI_INTERRUPTED.load(Ordering::SeqCst) {
             let _ = writeln!(
@@ -1119,6 +1170,12 @@ pub async fn run_cli_host<W: Write>(
         if !handle.is_running.load(Ordering::Relaxed) {
             break;
         }
+
+        log_active_uploads(
+            out,
+            &handle.active_uploads_snapshot(),
+            &mut last_upload_progress_print,
+        );
 
         tokio::select! {
             maybe_evt = log_rx.recv() => {
@@ -1425,8 +1482,38 @@ mod tests {
             .join(format!("lanshare_cli_validate_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&valid_dir);
         std::fs::create_dir_all(&valid_dir).unwrap();
-        let deduped = validate_cli_host_folders(&[valid_dir.clone(), valid_dir.clone()]).unwrap();
-        assert_eq!(deduped.len(), 1);
+        let valid_file = valid_dir.join("shared_sample.txt");
+        std::fs::write(&valid_file, b"hello cli").unwrap();
+        let deduped = validate_cli_host_folders(&[
+            valid_file.clone(),
+            valid_dir.clone(),
+            valid_dir.clone(),
+            valid_file.clone(),
+        ])
+        .unwrap();
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped[0].is_dir(), "Folders must precede files");
+        assert!(deduped[1].is_file(), "Files must follow folders");
+
+        let mut upload_out = Vec::new();
+        let mut last_tick = Instant::now() - Duration::from_secs(2);
+        let uploads = vec![server::ActiveUploadInfo {
+            id: 1,
+            folder_root: valid_dir.clone(),
+            peer: "192.168.1.42".to_string(),
+            file_name: "shared_sample.txt".to_string(),
+            bytes_sent: 500_000_000,
+            total_size: 1_000_000_000,
+            speed_mbps: 100.0,
+            started_at: Instant::now() - Duration::from_secs(5),
+        }];
+        log_active_uploads(&mut upload_out, &uploads, &mut last_tick);
+        let upload_text = String::from_utf8(upload_out).unwrap();
+        assert!(upload_text
+            .contains("[Server] Upload Progress 'shared_sample.txt' -> 192.168.1.42: 50%"));
+        assert!(upload_text.contains("at 100.0 MB/s"));
+        assert!(upload_text.contains("ETA:"));
+
         let _ = std::fs::remove_dir_all(&valid_dir);
 
         assert!(validate_cli_download_inputs(None, &[], false).is_err());

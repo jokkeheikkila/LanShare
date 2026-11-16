@@ -6,14 +6,17 @@ use crate::core::{
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
     mock_folder_total_bytes, open_file_in_default_app, open_folder_in_explorer, open_url,
     parse_host_and_port, queue_status_sort_rank, resolve_remote_folder_total_bytes,
-    sort_peers_alphabetically, spawn_next_queued_download, test_downloads_dir, ClientActionResult,
-    EtaStabilizer, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem, GITHUB_RELEASES_URL,
-    GITHUB_REPO_URL,
+    sort_peers_alphabetically, sort_shared_paths, spawn_next_queued_download, test_downloads_dir,
+    ClientActionResult, EtaStabilizer, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem,
+    SharedPathSizeResolver, SharedPathSizeStatus, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
 };
-use crate::security::{clean_display_path, clean_path, validate_shared_folder};
+use crate::security::{
+    clean_display_path, clean_path, validate_shared_file, validate_shared_folder,
+    validate_shared_path,
+};
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
 use chrono::{Local, TimeZone};
@@ -131,6 +134,7 @@ pub const BROWSE_COL_SIZE_W: f32 = 85.0;
 pub const BROWSE_COL_DATE_W: f32 = 135.0;
 pub const BROWSE_COL_ACTION_W: f32 = 84.0;
 pub const DEFAULT_TRANSFER_SECTION_HEIGHT: f32 = 276.0;
+pub const MIN_WINDOW_INNER_SIZE: [f32; 2] = [1140.0, 640.0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSourceFilter {
@@ -168,6 +172,7 @@ pub struct LanShareApp {
 
     // --- Host State ---
     host_folders: Vec<PathBuf>,
+    host_share_sizes: SharedPathSizeResolver,
     host_error: Option<String>,
     server_handle: Option<ServerHandle>,
     server_logs: VecDeque<ServerLogEvent>,
@@ -387,32 +392,56 @@ fn configure_readable_style(ctx: &egui::Context, is_dark: bool) {
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
 
     visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
-    visuals.widgets.inactive.bg_fill = p.card_bg;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text_muted);
+    let inactive_bg = if is_dark {
+        p.card_bg
+    } else {
+        Color32::from_rgb(233, 238, 245)
+    };
+    visuals.widgets.inactive.bg_fill = inactive_bg;
+    visuals.widgets.inactive.weak_bg_fill = inactive_bg;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(
+        1.0_f32,
+        if is_dark {
+            p.border
+        } else {
+            Color32::from_rgb(168, 180, 198)
+        },
+    );
+    visuals.widgets.inactive.fg_stroke = Stroke::new(
+        1.0_f32,
+        if is_dark {
+            p.text_muted
+        } else {
+            p.text_primary
+        },
+    );
 
     visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
-    visuals.widgets.hovered.bg_fill = if is_dark {
+    let hovered_bg = if is_dark {
         Color32::from_rgb(45, 55, 72)
     } else {
-        Color32::from_rgb(226, 232, 240)
+        Color32::from_rgb(220, 229, 242)
     };
+    visuals.widgets.hovered.bg_fill = hovered_bg;
+    visuals.widgets.hovered.weak_bg_fill = hovered_bg;
     visuals.widgets.hovered.bg_stroke = Stroke::new(
         1.0_f32,
         if is_dark {
             p.accent_blue
         } else {
-            Color32::from_rgb(147, 175, 224)
+            Color32::from_rgb(96, 134, 196)
         },
     );
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
 
     visuals.widgets.active.corner_radius = CornerRadius::same(6);
-    visuals.widgets.active.bg_fill = if is_dark {
+    let active_bg = if is_dark {
         Color32::from_rgb(55, 65, 81)
     } else {
-        Color32::from_rgb(214, 222, 234)
+        Color32::from_rgb(206, 218, 236)
     };
+    visuals.widgets.active.bg_fill = active_bg;
+    visuals.widgets.active.weak_bg_fill = active_bg;
     visuals.widgets.active.bg_stroke = Stroke::new(1.2_f32, p.accent_blue);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
 
@@ -515,6 +544,7 @@ impl LanShareApp {
             local_ips,
 
             host_folders: Vec::new(),
+            host_share_sizes: SharedPathSizeResolver::new(),
             host_error: None,
             server_handle: None,
             server_logs: VecDeque::new(),
@@ -996,6 +1026,7 @@ impl LanShareApp {
                     if let Some(err) = outcome.error {
                         self.client_error = Some(err);
                     }
+                    self.active_eta_stabilizer.reset();
                     self.total_eta_stabilizer.reset();
                     self.start_next_queued_download();
                 }
@@ -1115,35 +1146,16 @@ impl eframe::App for LanShareApp {
             }
         }
 
-        // Drag & Drop handling on Share Folders tab
+        // Drag & Drop handling on Share Folders tab (accepts folders and individual files)
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-            let mut added_any = false;
             if self.current_tab == AppTab::Host {
                 self.clear_errors();
-            }
-            for file in dropped {
-                let path = file.path();
-                if self.current_tab == AppTab::Host && path.is_dir() {
-                    match validate_shared_folder(path) {
-                        Ok(safe) => {
-                            if !self.host_folders.contains(&safe) {
-                                self.host_folders.push(safe);
-                                added_any = true;
-                            }
-                        }
-                        Err(e) => self.host_error = Some(e),
-                    }
-                }
-            }
-            if added_any {
-                if let Some(ref handle) = self.server_handle {
-                    if let Err(e) = handle.update_shared_folders(self.host_folders.clone()) {
-                        self.host_error = Some(e);
-                    }
-                } else if self.ring_secret.trim().len() >= MIN_SECRET_LEN {
-                    self.start_hosting_server();
-                }
+                let paths: Vec<PathBuf> = dropped
+                    .into_iter()
+                    .map(|f| f.path().to_path_buf())
+                    .collect();
+                self.add_host_paths(paths, validate_shared_path);
             }
         }
 
@@ -2532,6 +2544,36 @@ impl LanShareApp {
         }
     }
 
+    fn add_host_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        validator: fn(&std::path::Path) -> Result<PathBuf, String>,
+    ) {
+        let mut added_any = false;
+        for path in paths {
+            match validator(&path) {
+                Ok(safe) => {
+                    if !self.host_folders.contains(&safe) {
+                        self.host_share_sizes.invalidate(&safe);
+                        self.host_folders.push(safe);
+                        added_any = true;
+                    }
+                }
+                Err(e) => self.host_error = Some(e),
+            }
+        }
+        if added_any {
+            sort_shared_paths(&mut self.host_folders);
+            if let Some(ref handle) = self.server_handle {
+                if let Err(e) = handle.update_shared_folders(self.host_folders.clone()) {
+                    self.host_error = Some(e);
+                }
+            } else if self.ring_secret.trim().len() >= MIN_SECRET_LEN {
+                self.start_hosting_server();
+            }
+        }
+    }
+
     fn remove_host_folder(&mut self, idx: usize) {
         self.clear_errors();
         if idx >= self.host_folders.len() {
@@ -2554,7 +2596,8 @@ impl LanShareApp {
                 self.pending_remove_host_folder_idx = Some(idx);
                 self.show_stop_server_confirm_dialog = true;
             } else {
-                self.host_folders.remove(idx);
+                let removed = self.host_folders.remove(idx);
+                self.host_share_sizes.invalidate(&removed);
                 self.host_error = None;
                 self.stop_hosting_server();
             }
@@ -2567,7 +2610,8 @@ impl LanShareApp {
             return;
         }
 
-        self.host_folders.remove(idx);
+        let removed = self.host_folders.remove(idx);
+        self.host_share_sizes.invalidate(&removed);
         self.host_error = None;
         if let Some(ref handle) = self.server_handle {
             if let Err(e) = handle.update_shared_folders(self.host_folders.clone()) {
@@ -2667,10 +2711,21 @@ impl LanShareApp {
                     stroke: Stroke::new(1.5_f32, p.accent_red),
                 };
 
-                let pending_remove_folder = self
+                let pending_remove_path = self
                     .pending_remove_host_folder_idx
                     .and_then(|idx| self.host_folders.get(idx))
+                    .cloned();
+                let pending_remove_folder = pending_remove_path
+                    .as_ref()
                     .map(|p| clean_display_path(p));
+                let pending_is_file = pending_remove_path
+                    .as_ref()
+                    .is_some_and(|p| p.is_file());
+                let (kind_lower, kind_title) = if pending_is_file {
+                    ("file", "File")
+                } else {
+                    ("folder", "Folder")
+                };
                 let removes_non_last_folder =
                     pending_remove_folder.is_some() && self.host_folders.len() > 1;
                 let folder_active_dl = self
@@ -2688,12 +2743,16 @@ impl LanShareApp {
                         if removes_non_last_folder {
                             (
                                 format!(
-                                    "ALERT: Someone is currently downloading from:\n{}\n({} active transfer{} in progress from this folder)",
+                                    "ALERT: Someone is currently downloading from:\n{}\n({} active transfer{} in progress from this {})",
                                     folder_name,
                                     folder_active_dl,
-                                    if folder_active_dl == 1 { "" } else { "s" }
+                                    if folder_active_dl == 1 { "" } else { "s" },
+                                    kind_lower
                                 ),
-                                "If you remove this folder from shares now, their file download will be immediately aborted and left incomplete on their device.",
+                                format!(
+                                    "If you remove this {} from shares now, their file download will be immediately aborted and left incomplete on their device.",
+                                    kind_lower
+                                ),
                             )
                         } else {
                             (
@@ -2702,7 +2761,10 @@ impl LanShareApp {
                                     active_server_dl,
                                     if active_server_dl == 1 { "" } else { "s" }
                                 ),
-                                "Removing the last shared folder will stop sharing and immediately abort their file download.",
+                                format!(
+                                    "Removing the last shared {} will stop sharing and immediately abort their file download.",
+                                    kind_lower
+                                ),
                             )
                         }
                     } else {
@@ -2712,7 +2774,7 @@ impl LanShareApp {
                                 active_server_dl,
                                 if active_server_dl == 1 { "" } else { "s" }
                             ),
-                            "If you stop sharing now, their file download will be immediately aborted and left incomplete on their device.",
+                            "If you stop sharing now, their file download will be immediately aborted and left incomplete on their device.".to_string(),
                         )
                     };
                     ui.label(
@@ -2736,9 +2798,9 @@ impl LanShareApp {
                 // Action buttons
                 ui.horizontal(|ui| {
                     let cancel_label = if removes_non_last_folder {
-                        "Cancel (Keep Folder)"
+                        format!("Cancel (Keep {})", kind_title)
                     } else {
-                        "Cancel (Keep Sharing)"
+                        "Cancel (Keep Sharing)".to_string()
                     };
                     let cancel_btn = egui::Button::new(
                         RichText::new(cancel_label)
@@ -2787,7 +2849,8 @@ impl LanShareApp {
             self.show_stop_server_confirm_dialog = false;
             if let Some(idx) = self.pending_remove_host_folder_idx.take() {
                 if idx < self.host_folders.len() {
-                    self.host_folders.remove(idx);
+                    let removed = self.host_folders.remove(idx);
+                    self.host_share_sizes.invalidate(&removed);
                 }
                 self.host_error = None;
                 if self.host_folders.is_empty() {
@@ -3174,6 +3237,43 @@ impl LanShareApp {
                 color.gamma_multiply(0.15),
                 stroke,
                 egui::StrokeKind::Inside,
+            );
+        }
+        resp
+    }
+
+    fn draw_mini_file_icon(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+        let size = egui::vec2(12.0, 14.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        }
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            let stroke = Stroke::new(1.2_f32, color);
+            let doc_rect = rect.shrink2(egui::vec2(1.0, 0.5));
+            painter.rect(
+                doc_rect,
+                CornerRadius::same(2),
+                color.gamma_multiply(0.12),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            let y1 = doc_rect.min.y + 4.5;
+            let y2 = doc_rect.min.y + 8.0;
+            painter.line_segment(
+                [
+                    egui::pos2(doc_rect.min.x + 2.5, y1),
+                    egui::pos2(doc_rect.max.x - 2.5, y1),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(doc_rect.min.x + 2.5, y2),
+                    egui::pos2(doc_rect.max.x - 3.5, y2),
+                ],
+                stroke,
             );
         }
         resp
@@ -3736,7 +3836,7 @@ impl LanShareApp {
                     } else {
                         egui::scroll_area::ScrollBarVisibility::AlwaysHidden
                     };
-                    ScrollArea::both()
+                    ScrollArea::vertical()
                         .id_salt("client_file_list_scroll")
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(browse_scroll_visibility)
@@ -3767,12 +3867,20 @@ impl LanShareApp {
                                 return;
                             }
 
-                            let min_table_w = self.browse_col_name_w
+                            let max_name_w = (scroll_max_w
+                                - BROWSE_COL_SIZE_W
+                                - BROWSE_COL_DATE_W
+                                - BROWSE_COL_ACTION_W
+                                - 48.0
+                                - 22.0)
+                                .max(80.0);
+                            let name_col_w = self.browse_col_name_w.clamp(80.0, max_name_w);
+                            let min_table_w = name_col_w
                                 + BROWSE_COL_SIZE_W
                                 + BROWSE_COL_DATE_W
                                 + BROWSE_COL_ACTION_W
                                 + (3.0 * 16.0);
-                            let row_w = (min_table_w - 6.0).max(self.browse_col_name_w);
+                            let row_w = (min_table_w - 6.0).max(name_col_w);
                             let mut next_hovered_browse_idx = None;
 
                             ui.scope(|ui| {
@@ -3782,10 +3890,10 @@ impl LanShareApp {
                                     .min_col_width(50.0)
                                     .spacing([16.0, 8.0])
                                     .show(ui, |ui| {
-                                        // Column 0: Name with drag resize handle
+                                        // Column 0: Name with drag resize handle (clamped to current panel width; never auto-stretches with window)
                                         ui.horizontal(|ui| {
-                                            ui.set_width(self.browse_col_name_w);
-                                            ui.set_max_width(self.browse_col_name_w);
+                                            ui.set_width(name_col_w);
+                                            ui.set_max_width(name_col_w);
                                             ui.add_space(8.0);
                                             ui.label(RichText::new("Name").strong());
                                             ui.with_layout(
@@ -3815,10 +3923,12 @@ impl LanShareApp {
                                                         );
                                                     }
                                                     if res_resp.dragged() {
-                                                        self.browse_col_name_w = (self
+                                                        let base_w = self
                                                             .browse_col_name_w
+                                                            .clamp(80.0, max_name_w);
+                                                        self.browse_col_name_w = (base_w
                                                             + res_resp.drag_delta().x)
-                                                            .clamp(80.0, 1200.0);
+                                                            .clamp(80.0, max_name_w);
                                                     }
                                                 },
                                             );
@@ -3881,8 +3991,7 @@ impl LanShareApp {
                                                 if !ui.is_rect_visible(row_rect) && !is_highlighted
                                                 {
                                                     ui.allocate_space(egui::vec2(
-                                                        self.browse_col_name_w,
-                                                        row_h_est,
+                                                        name_col_w, row_h_est,
                                                     ));
                                                     ui.allocate_space(egui::vec2(
                                                         BROWSE_COL_SIZE_W,
@@ -3912,8 +4021,8 @@ impl LanShareApp {
                                                     };
                                                     ui.horizontal(|ui| {
                                                         ui.set_min_height(row_h_est);
-                                                        ui.set_width(self.browse_col_name_w);
-                                                        ui.set_max_width(self.browse_col_name_w);
+                                                        ui.set_width(name_col_w);
+                                                        ui.set_max_width(name_col_w);
                                                         ui.add_space(8.0);
                                                         ui.spacing_mut().item_spacing.x = 6.0;
                                                         let icon_resp = Self::draw_mini_folder_icon(
@@ -3967,8 +4076,8 @@ impl LanShareApp {
                                                 } else {
                                                     ui.horizontal(|ui| {
                                                         ui.set_min_height(row_h_est);
-                                                        ui.set_width(self.browse_col_name_w);
-                                                        ui.set_max_width(self.browse_col_name_w);
+                                                        ui.set_width(name_col_w);
+                                                        ui.set_max_width(name_col_w);
                                                         ui.add_space(8.0);
                                                         let label_text = RichText::new(&entry.name)
                                                             .strong()
@@ -4117,9 +4226,55 @@ impl LanShareApp {
                                                         };
                                                         let btn_resp = ui
                                                             .add_enabled_ui(btn_enabled, |ui| {
+                                                                let mut btn = if btn_enabled {
+                                                                    egui::Button::new(
+                                                                        RichText::new(btn_label)
+                                                                            .color(p.text_primary),
+                                                                    )
+                                                                } else {
+                                                                    egui::Button::new(
+                                                                        RichText::new(btn_label)
+                                                                            .color(if p.is_dark {
+                                                                                p.btn_disabled_text
+                                                                            } else {
+                                                                                Color32::from_rgb(
+                                                                                    71, 85, 105,
+                                                                                )
+                                                                            }),
+                                                                    )
+                                                                };
+                                                                if !p.is_dark {
+                                                                    if btn_enabled {
+                                                                        btn = btn
+                                                                            .fill(
+                                                                                Color32::from_rgb(
+                                                                                    224, 234, 248,
+                                                                                ),
+                                                                            )
+                                                                            .stroke(Stroke::new(
+                                                                                1.0_f32,
+                                                                                Color32::from_rgb(
+                                                                                    120, 148, 190,
+                                                                                ),
+                                                                            ));
+                                                                    } else {
+                                                                        btn = btn
+                                                                            .fill(
+                                                                                Color32::from_rgb(
+                                                                                    236, 239, 244,
+                                                                                ),
+                                                                            )
+                                                                            .stroke(Stroke::new(
+                                                                                1.0_f32,
+                                                                                Color32::from_rgb(
+                                                                                    186, 196, 210,
+                                                                                ),
+                                                                            ));
+                                                                    }
+                                                                }
                                                                 ui.add_sized(
                                                                     egui::vec2(78.0, 22.0),
-                                                                    egui::Button::new(btn_label),
+                                                                    btn,
                                                                 )
                                                             })
                                                             .inner;
@@ -4902,7 +5057,7 @@ impl LanShareApp {
             .clamp(min_uploads_h, max_uploads_h);
         let folders_area_h = (host_avail_h - upload_h - 22.0).max(110.0);
 
-        // 2. Folders to Share (Middle Card)
+        // 2. Shared Folders & Files (Middle Card)
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), folders_area_h),
             egui::Layout::top_down(egui::Align::Min),
@@ -4911,7 +5066,7 @@ impl LanShareApp {
                     ui.set_min_height((folders_area_h - 4.0).max(80.0));
                     ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Folders to Share")
+                    RichText::new("Shared Folders & Files")
                         .size(16.0)
                         .strong()
                         .color(p.text_primary),
@@ -4924,27 +5079,17 @@ impl LanShareApp {
                 {
                     self.clear_errors();
                     if let Some(folders) = rfd::FileDialog::new().pick_folders() {
-                        let mut added_any = false;
-                        for folder in folders {
-                            match validate_shared_folder(&folder) {
-                                Ok(safe) => {
-                                    if !self.host_folders.contains(&safe) {
-                                        self.host_folders.push(safe);
-                                        added_any = true;
-                                    }
-                                }
-                                Err(e) => self.host_error = Some(e),
-                            }
-                        }
-                        if added_any {
-                            if let Some(ref handle) = self.server_handle {
-                                if let Err(e) = handle.update_shared_folders(self.host_folders.clone()) {
-                                    self.host_error = Some(e);
-                                }
-                            } else if self.ring_secret.trim().len() >= MIN_SECRET_LEN {
-                                self.start_hosting_server();
-                            }
-                        }
+                        self.add_host_paths(folders, validate_shared_folder);
+                    }
+                }
+                if ui
+                    .button("Add File(s)...")
+                    .on_hover_text("Select one or multiple individual files to share")
+                    .clicked()
+                {
+                    self.clear_errors();
+                    if let Some(files) = rfd::FileDialog::new().pick_files() {
+                        self.add_host_paths(files, validate_shared_file);
                     }
                 }
 
@@ -4952,6 +5097,7 @@ impl LanShareApp {
                     if !is_running && !self.host_folders.is_empty() && ui.button("Clear All").clicked() {
                         self.clear_errors();
                         self.host_folders.clear();
+                        self.host_share_sizes.clear();
                     }
                 });
             });
@@ -4961,7 +5107,7 @@ impl LanShareApp {
             if self.host_folders.is_empty() {
                 ui.label(
                     RichText::new(
-                        "No folders added yet. Click 'Add Folder(s)...' or drag & drop folders below.",
+                        "No folders or files added yet. Click 'Add Folder(s)...', 'Add File(s)...', or drag & drop items below.",
                     )
                     .color(p.text_muted),
                 );
@@ -4971,6 +5117,9 @@ impl LanShareApp {
                 let mut next_hovered_host_remove = None;
                 let err_reserve = if self.host_error.is_some() { 24.0 } else { 0.0 };
                 let scroll_max_h = (ui.available_height() - 62.0 - err_reserve).max(48.0);
+                let ctx_for_sizes = ui.ctx().clone();
+                let repaint_cb: Arc<dyn Fn() + Send + Sync> =
+                    Arc::new(move || ctx_for_sizes.request_repaint());
                 ui.spacing_mut().scroll = Self::visible_scroll_style();
                 ScrollArea::vertical()
                     .id_salt("host_folders_scroll")
@@ -4980,11 +5129,17 @@ impl LanShareApp {
                     .show(ui, |ui| {
                         for (idx, folder) in self.host_folders.iter().enumerate() {
                             let is_remove_hovered = self.hovered_host_remove_idx == Some(idx);
+                            let is_dir_share = folder.is_dir();
 
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
 
-                                let btn = ui.button("✖").on_hover_text("Remove folder");
+                                let remove_tip = if is_dir_share {
+                                    "Remove folder"
+                                } else {
+                                    "Remove file"
+                                };
+                                let btn = ui.button("✖").on_hover_text(remove_tip);
                                 if btn.hovered() {
                                     next_hovered_host_remove = Some(idx);
                                 }
@@ -4992,12 +5147,21 @@ impl LanShareApp {
                                     remove_idx = Some(idx);
                                 }
 
-                                let folder_str = clean_display_path(folder);
                                 let link_color = if is_remove_hovered {
                                     p.accent_red
                                 } else {
                                     p.accent_blue
                                 };
+                                let icon_resp = if is_dir_share {
+                                    Self::draw_mini_folder_icon(ui, link_color)
+                                } else {
+                                    Self::draw_mini_file_icon(ui, link_color)
+                                };
+                                if icon_resp.clicked() {
+                                    open_folder_target = Some(folder.clone());
+                                }
+
+                                let folder_str = clean_display_path(folder);
                                 let link_label = egui::Label::new(
                                     RichText::new(&folder_str)
                                         .size(14.0)
@@ -5006,7 +5170,7 @@ impl LanShareApp {
                                 )
                                 .sense(egui::Sense::click());
                                 let (galley_pos, galley, resp) = link_label.layout_in_ui(ui);
-                                let is_link_hovered = resp.hovered();
+                                let is_link_hovered = resp.hovered() || icon_resp.hovered();
                                 if is_link_hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                                 }
@@ -5043,6 +5207,29 @@ impl LanShareApp {
                                     open_folder_target = Some(folder.clone());
                                 }
 
+                                match self
+                                    .host_share_sizes
+                                    .get_or_request(folder, Some(repaint_cb.clone()))
+                                {
+                                    SharedPathSizeStatus::Ready(bytes) => {
+                                        ui.label(
+                                            RichText::new(format!("({})", format_file_size(bytes)))
+                                                .size(12.5)
+                                                .monospace()
+                                                .color(p.text_muted),
+                                        );
+                                    }
+                                    SharedPathSizeStatus::Calculating => {
+                                        ui.label(
+                                            RichText::new("(...)")
+                                                .size(12.5)
+                                                .monospace()
+                                                .color(p.text_muted),
+                                        );
+                                    }
+                                    SharedPathSizeStatus::Unavailable => {}
+                                }
+
                                 let canonical_folder = folder
                                     .canonicalize()
                                     .ok()
@@ -5077,7 +5264,12 @@ impl LanShareApp {
 
                 if let Some(target) = open_folder_target {
                     self.clear_errors();
-                    if let Err(e) = open_folder_in_explorer(&target) {
+                    let open_res = if target.is_dir() {
+                        open_folder_in_explorer(&target)
+                    } else {
+                        open_file_in_default_app(&target)
+                    };
+                    if let Err(e) = open_res {
                         self.host_error = Some(e);
                     }
                 }
@@ -5101,7 +5293,7 @@ impl LanShareApp {
             drop_frame.show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        RichText::new("Drag & Drop Folders Here")
+                        RichText::new("Drag & Drop Folders or Files Here")
                             .strong()
                             .size(13.5)
                             .color(p.accent_blue),
@@ -5766,6 +5958,7 @@ mod tests {
             show_secret_plain: false,
             local_ips: vec!["192.168.1.100".to_string()],
             host_folders: vec![],
+            host_share_sizes: SharedPathSizeResolver::new(),
             host_error: None,
             server_handle: None,
             server_logs: VecDeque::new(),
@@ -6018,6 +6211,7 @@ mod tests {
             show_secret_plain: false,
             local_ips: vec!["192.168.1.100".to_string()],
             host_folders: vec![],
+            host_share_sizes: SharedPathSizeResolver::new(),
             host_error: None,
             server_handle: None,
             server_logs: VecDeque::new(),
@@ -8741,6 +8935,271 @@ mod tests {
                 .all(|w| (w[0] - w[1]).abs() < 0.5),
             "Queued & Done Size columns must align on right edge: {:?}",
             queue_size_rights
+        );
+    }
+
+    #[test]
+    fn test_gui_shared_files_and_folders_ordering_and_sizes() {
+        let base = std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("target")
+            .join(format!("lanshare_gui_share_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir_a = base.join("folder_one");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::write(dir_a.join("inside.bin"), vec![1u8; 4096]).unwrap();
+        let solo_file = base.join("solo_notes.txt");
+        std::fs::write(&solo_file, vec![2u8; 2048]).unwrap();
+
+        let ctx = egui::Context::default();
+        configure_readable_style(&ctx, false);
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.ring_secret = String::new(); // Prevent spawning server in this layout unit test
+        app.current_tab = AppTab::Host;
+
+        app.add_host_paths(vec![solo_file.clone()], validate_shared_file);
+        app.add_host_paths(vec![dir_a.clone()], validate_shared_folder);
+        assert_eq!(app.host_folders.len(), 2);
+        assert!(
+            app.host_folders[0].is_dir(),
+            "Folders must sort before files"
+        );
+        assert!(app.host_folders[1].is_file(), "Files must follow folders");
+
+        let out = run_test_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_host_tab(ui);
+                });
+            },
+        );
+        let texts = collect_rendered_texts(&out);
+        assert!(texts.iter().any(|t| t == "Add Folder(s)..."));
+        assert!(texts.iter().any(|t| t == "Add File(s)..."));
+        assert!(texts.iter().any(|t| t.contains("folder_one")));
+        assert!(texts.iter().any(|t| t.contains("solo_notes.txt")));
+        assert!(
+            texts.iter().any(|t| t.contains("4 KB")),
+            "Expected shared folder size (4 KB) in host share list: {:?}",
+            texts
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("2 KB")),
+            "Expected shared file size (2 KB) in host share list: {:?}",
+            texts
+        );
+
+        // Removing the shared file while an active upload is running shows "Cancel (Keep File)"
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+        let (log_tx, _log_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_dl = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        app.server_handle = Some(ServerHandle {
+            is_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_ip: "192.168.1.100".to_string(),
+            all_ips: vec!["192.168.1.100".to_string()],
+            port: 22222,
+            password: "secret-ring-1234".to_string(),
+            stop_sender: stop_tx,
+            shared_folders: std::sync::Arc::new(std::sync::RwLock::new(app.host_folders.clone())),
+            duration_hours: None,
+            registry: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::server::SharedFolderRegistry::new(app.host_folders.clone()),
+            )),
+            log_tx,
+            active_downloads: active_dl,
+            active_folder_downloads: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            active_uploads: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            registry_notify_tx: tokio::sync::watch::channel(0u64).0,
+        });
+        app.pending_remove_host_folder_idx = Some(1);
+        app.show_stop_server_confirm_dialog = true;
+        let modal_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = run_test_ui(&ctx, modal_input.clone(), |ui| {
+            app.render_stop_server_confirm_modal(ui.ctx());
+        });
+        let modal_out = run_test_ui(&ctx, modal_input, |ui| {
+            app.render_stop_server_confirm_modal(ui.ctx());
+        });
+        let modal_texts = collect_rendered_texts(&modal_out);
+        assert!(
+            modal_texts.iter().any(|t| t == "Cancel (Keep File)"),
+            "Expected 'Cancel (Keep File)' button label: {:?}",
+            modal_texts
+        );
+        assert!(
+            modal_texts.iter().any(|t| t.contains("from this file")),
+            "Expected 'from this file' alert text: {:?}",
+            modal_texts
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_gui_light_theme_browse_buttons_visible_and_no_horizontal_stretch() {
+        let ctx = egui::Context::default();
+        configure_readable_style(&ctx, false);
+        let light = AppPalette::new(false);
+        assert_ne!(
+            ctx.global_style().visuals.widgets.inactive.weak_bg_fill,
+            light.card_bg,
+            "Light theme button fill must contrast with white card background"
+        );
+
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.client_connected = true;
+        app.client_file_list = vec![
+            FileEntry {
+                name: "Extremely_Long_Shared_File_Name_To_Truncate_Cleanly_Without_Horizontal_Scroll_Bar_0001.bin".to_string(),
+                is_dir: false,
+                size: 10 * 1024 * 1024,
+                modified_timestamp: 1700000000,
+            },
+        ];
+
+        let find_download_btn_rect =
+            |out: &egui::FullOutput| -> (egui::Rect, Option<egui::epaint::RectShape>) {
+                fn find_text_rect(shape: &egui::epaint::Shape) -> Option<egui::Rect> {
+                    match shape {
+                        egui::epaint::Shape::Text(t) if t.galley.job.text == "Download" => {
+                            Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+                        }
+                        egui::epaint::Shape::Vec(v) => v.iter().find_map(find_text_rect),
+                        _ => None,
+                    }
+                }
+                let text_rect = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| find_text_rect(&c.shape))
+                    .expect("Missing Download button text");
+                fn find_bg_rect(
+                    shape: &egui::epaint::Shape,
+                    center: egui::Pos2,
+                ) -> Option<egui::epaint::RectShape> {
+                    match shape {
+                        egui::epaint::Shape::Rect(r)
+                            if r.rect.contains(center)
+                                && r.rect.width() >= 60.0
+                                && r.rect.width() <= 100.0
+                                && r.rect.height() >= 18.0
+                                && r.rect.height() <= 30.0 =>
+                        {
+                            Some(r.clone())
+                        }
+                        egui::epaint::Shape::Vec(v) => {
+                            v.iter().find_map(|s| find_bg_rect(s, center))
+                        }
+                        _ => None,
+                    }
+                }
+                let bg = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| find_bg_rect(&c.shape, text_rect.center()));
+                (text_rect, bg)
+            };
+
+        // 1. Wide browse_col_name_w on narrow 600px frame -> Action stays inside panel (< 600px), no horizontal overflow
+        app.browse_col_name_w = 1000.0;
+        let narrow_out = run_test_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_client_browser_panel(ui);
+                });
+            },
+        );
+        let (dl_rect_narrow, dl_bg_narrow) = find_download_btn_rect(&narrow_out);
+        assert!(
+            dl_rect_narrow.right() <= 600.0,
+            "Browse Action column ({}) must fit inside 600px viewport without horizontal scrollbar",
+            dl_rect_narrow.right()
+        );
+        let dl_bg =
+            dl_bg_narrow.expect("White-theme Download button must paint visible background");
+        assert_ne!(
+            dl_bg.fill, light.card_bg,
+            "White-theme Download button fill must contrast with white card_bg"
+        );
+        assert!(
+            dl_bg.stroke.width >= 1.0 && dl_bg.stroke.color != Color32::TRANSPARENT,
+            "White-theme Download button must draw a visible border"
+        );
+
+        // 2. Large 1920px frame with default 260px Name width -> Action column must NOT auto-stretch to right side
+        app.browse_col_name_w = 260.0;
+        let huge_out = run_test_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1920.0, 1080.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.render_client_browser_panel(ui);
+                });
+            },
+        );
+        let (dl_rect_huge, _) = find_download_btn_rect(&huge_out);
+        assert!(
+            dl_rect_huge.right() < 750.0,
+            "Browse Action column ({}) must stay compact near Name column on wide screens",
+            dl_rect_huge.right()
+        );
+
+        // 3. Full window at MIN_WINDOW_INNER_SIZE keeps Browse Download button visible inside viewport
+        let min_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(MIN_WINDOW_INNER_SIZE[0], MIN_WINDOW_INNER_SIZE[1]),
+            )),
+            ..Default::default()
+        };
+        let _ = run_test_ui(&ctx, min_input.clone(), |ui| {
+            app.render_main_left_rail(ui);
+            app.render_client_view(ui);
+        });
+        let min_out = run_test_ui(&ctx, min_input, |ui| {
+            app.render_main_left_rail(ui);
+            app.render_client_view(ui);
+        });
+        let (dl_rect_min, _) = find_download_btn_rect(&min_out);
+        assert!(
+            dl_rect_min.right() <= MIN_WINDOW_INNER_SIZE[0],
+            "Browse Download button ({}) must remain visible at minimum window width {}",
+            dl_rect_min.right(),
+            MIN_WINDOW_INNER_SIZE[0]
         );
     }
 }

@@ -207,15 +207,21 @@ pub fn ensure_safe_client_dest_path(dest_file_path: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// Validates that a user-selected folder is safe to share.
-/// Blocks filesystem/drive roots, Windows & Linux system directories, user home root, and sensitive folders.
-pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
+/// Validates that a user-selected folder or regular file is safe to share.
+/// Blocks symlinks/reparse points, filesystem/drive roots, Windows & Linux system directories,
+/// user home roots, and sensitive folders/files inside restricted directories.
+pub fn validate_shared_path(path: &Path) -> Result<PathBuf, String> {
+    let raw_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot resolve path: {}", e))?;
+    if is_symlink_or_reparse(&raw_meta) {
+        return Err("Access denied: Symbolic links and junctions cannot be shared.".to_string());
+    }
+
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("Cannot resolve path: {}", e))?;
 
-    if !canonical.is_dir() {
-        return Err("Selected path is not a directory.".to_string());
+    if !canonical.is_dir() && !canonical.is_file() {
+        return Err("Selected path must be a regular file or folder.".to_string());
     }
 
     // Convert to uppercase string for case-insensitive Windows comparisons
@@ -232,7 +238,7 @@ pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
         );
     }
 
-    // 2. Block Linux / Unix system directories
+    // 2. Block Linux / Unix system directories (and any file inside them)
     const UNIX_SYSTEM_DIRS: [&str; 9] = [
         "/etc", "/root", "/proc", "/sys", "/dev", "/boot", "/usr", "/var", "/run",
     ];
@@ -240,14 +246,14 @@ pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
         let sys_path = Path::new(sys_dir);
         if canonical == sys_path || canonical.starts_with(sys_path) {
             return Err(format!(
-                "Sharing system folder ({}) is strictly prohibited.",
+                "Sharing system path ({}) is strictly prohibited.",
                 sys_dir
             ));
         }
         if let Ok(canon_sys) = sys_path.canonicalize() {
             if canonical == canon_sys || canonical.starts_with(&canon_sys) {
                 return Err(format!(
-                    "Sharing system folder ({}) is strictly prohibited.",
+                    "Sharing system path ({}) is strictly prohibited.",
                     sys_dir
                 ));
             }
@@ -285,7 +291,8 @@ pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
                     ));
                 }
                 // Check if user tried to share a parent directory of SystemRoot, USERPROFILE, or HOME
-                if (*var == "SystemRoot" || *var == "USERPROFILE" || *var == "HOME")
+                if canonical.is_dir()
+                    && (*var == "SystemRoot" || *var == "USERPROFILE" || *var == "HOME")
                     && canon_val.starts_with(&canonical)
                 {
                     return Err(format!(
@@ -318,6 +325,24 @@ pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
     }
 
     Ok(clean_path(&canonical))
+}
+
+/// Validates that a user-selected folder is safe to share.
+pub fn validate_shared_folder(path: &Path) -> Result<PathBuf, String> {
+    let safe = validate_shared_path(path)?;
+    if !safe.is_dir() {
+        return Err("Selected path is not a directory.".to_string());
+    }
+    Ok(safe)
+}
+
+/// Validates that a user-selected regular file is safe to share.
+pub fn validate_shared_file(path: &Path) -> Result<PathBuf, String> {
+    let safe = validate_shared_path(path)?;
+    if !safe.is_file() {
+        return Err("Selected path is not a regular file.".to_string());
+    }
+    Ok(safe)
 }
 
 /// Resolves a requested relative subpath inside the shared root,
@@ -454,19 +479,33 @@ mod tests {
 
         // Validate shared folder allows safe project subfolder
         assert!(validate_shared_folder(&test_dir).is_ok());
+        // Validate shared file allows regular file, blocks folders in file validator,
+        // and blocks files inside restricted or system folders
+        assert!(validate_shared_path(&file_path).is_ok());
+        assert!(validate_shared_file(&file_path).is_ok());
+        assert!(validate_shared_file(&test_dir).is_err());
+        assert!(validate_shared_folder(&file_path).is_err());
 
-        // Sensitive subfolders (.ssh / .gnupg) blocked
+        // Sensitive subfolders (.ssh / .gnupg) and files inside them blocked
         let ssh_dir = test_dir.join(".ssh");
         let gnupg_dir = test_dir.join(".gnupg");
         let _ = fs::create_dir_all(&ssh_dir);
         let _ = fs::create_dir_all(&gnupg_dir);
+        let ssh_key = ssh_dir.join("id_ed25519");
+        let _ = fs::write(&ssh_key, b"secret");
         assert!(validate_shared_folder(&ssh_dir).is_err());
         assert!(validate_shared_folder(&gnupg_dir).is_err());
+        assert!(validate_shared_file(&ssh_key).is_err());
 
         #[cfg(unix)]
         {
             assert!(validate_shared_folder(Path::new("/")).is_err());
             assert!(validate_shared_folder(Path::new("/etc")).is_err());
+            assert!(validate_shared_path(Path::new("/etc/hosts")).is_err());
+            let link_path = test_dir.join("link_to_file.txt");
+            if std::os::unix::fs::symlink(&file_path, &link_path).is_ok() {
+                assert!(validate_shared_path(&link_path).is_err());
+            }
             if let Ok(home) = std::env::var("HOME") {
                 let home_path = Path::new(&home);
                 if home_path.exists() {

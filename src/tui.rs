@@ -5,14 +5,18 @@ use crate::core::{
     format_remaining_time, generate_random_password,
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
     mock_folder_total_bytes, open_url, parse_host_and_port, queue_status_sort_rank,
-    resolve_remote_folder_total_bytes, sort_peers_alphabetically, spawn_next_queued_download,
-    test_downloads_dir, ClientActionResult, EtaStabilizer, QueueEtaSummary, QueueItemStatus,
-    QueuedDownloadItem, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
+    resolve_remote_folder_total_bytes, sort_peers_alphabetically, sort_shared_paths,
+    spawn_next_queued_download, test_downloads_dir, ClientActionResult, EtaStabilizer,
+    QueueEtaSummary, QueueItemStatus, QueuedDownloadItem, SharedPathSizeResolver,
+    SharedPathSizeStatus, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
 use crate::protocol::{
     DiscoveredPeer, FileEntry, HandshakeResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
 };
-use crate::security::{clean_display_path, clean_path, validate_shared_folder};
+use crate::security::{
+    clean_display_path, clean_path, validate_shared_file, validate_shared_folder,
+    validate_shared_path,
+};
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
 use chrono::{Local, TimeZone};
@@ -48,6 +52,7 @@ pub enum InputPromptKind {
     DirectIp,
     DestFolder,
     AddHostFolder,
+    AddHostFile,
 }
 
 #[derive(Clone, Debug)]
@@ -582,6 +587,7 @@ pub struct LanShareTui {
 
     // Host state
     pub host_folders: Vec<PathBuf>,
+    pub host_share_sizes: SharedPathSizeResolver,
     pub selected_host_folder_idx: usize,
     pub host_error: Option<String>,
     pub server_handle: Option<ServerHandle>,
@@ -724,7 +730,7 @@ impl LanShareTui {
         let mut valid_host_folders = Vec::new();
         let mut host_error = None;
         for f in initial_host_folders {
-            match validate_shared_folder(&f) {
+            match validate_shared_path(&f) {
                 Ok(safe) => {
                     if !valid_host_folders.contains(&safe) {
                         valid_host_folders.push(safe);
@@ -733,6 +739,7 @@ impl LanShareTui {
                 Err(e) => host_error = Some(e),
             }
         }
+        sort_shared_paths(&mut valid_host_folders);
 
         let current_tab = if autostart_host || !valid_host_folders.is_empty() {
             TuiTab::Host
@@ -762,6 +769,7 @@ impl LanShareTui {
             local_ips,
 
             host_folders: valid_host_folders,
+            host_share_sizes: SharedPathSizeResolver::new(),
             selected_host_folder_idx: 0,
             host_error,
             server_handle: None,
@@ -1110,6 +1118,7 @@ impl LanShareTui {
                         self.progress_finished_at = Some(Instant::now());
                         self.set_flash(format!("Finished downloading '{}'", outcome.item_name));
                     }
+                    self.active_eta_stabilizer.reset();
                     self.total_eta_stabilizer.reset();
 
                     self.start_next_queued_download();
@@ -1842,19 +1851,34 @@ impl LanShareTui {
                                 }
                             }
                         }
-                        InputPromptKind::AddHostFolder => {
+                        InputPromptKind::AddHostFolder | InputPromptKind::AddHostFile => {
+                            let is_file = prompt.kind == InputPromptKind::AddHostFile;
                             if val.is_empty() {
-                                prompt.error = Some("Folder path cannot be empty.".to_string());
+                                prompt.error = Some(if is_file {
+                                    "File path cannot be empty.".to_string()
+                                } else {
+                                    "Folder path cannot be empty.".to_string()
+                                });
                                 self.active_prompt = Some(prompt);
                                 return;
                             }
                             let path = Self::expand_tilde(&val);
-                            match validate_shared_folder(&path) {
+                            let res = if is_file {
+                                validate_shared_file(&path)
+                            } else {
+                                validate_shared_folder(&path)
+                            };
+                            match res {
                                 Ok(safe) => {
                                     if !self.host_folders.contains(&safe) {
-                                        self.host_folders.push(safe);
-                                        self.selected_host_folder_idx =
-                                            self.host_folders.len().saturating_sub(1);
+                                        self.host_share_sizes.invalidate(&safe);
+                                        self.host_folders.push(safe.clone());
+                                        sort_shared_paths(&mut self.host_folders);
+                                        if let Some(pos) =
+                                            self.host_folders.iter().position(|p| p == &safe)
+                                        {
+                                            self.selected_host_folder_idx = pos;
+                                        }
                                         if let Some(ref handle) = self.server_handle {
                                             let _ = handle
                                                 .update_shared_folders(self.host_folders.clone());
@@ -1863,7 +1887,11 @@ impl LanShareTui {
                                         }
                                     }
                                     self.host_error = None;
-                                    self.set_flash("Added folder to read-only share list.");
+                                    self.set_flash(if is_file {
+                                        "Added file to read-only share list."
+                                    } else {
+                                        "Added folder to read-only share list."
+                                    });
                                 }
                                 Err(e) => {
                                     prompt.error = Some(e);
@@ -2520,6 +2548,14 @@ impl LanShareTui {
                     String::new(),
                 ));
             }
+            KeyEvent::Char('F') => {
+                self.active_prompt = Some(InputPrompt::new(
+                    InputPromptKind::AddHostFile,
+                    "Add File to Share (Read-Only)".to_string(),
+                    "Enter local file path to share into the ring:".to_string(),
+                    String::new(),
+                ));
+            }
             KeyEvent::Delete | KeyEvent::Char('d') => {
                 self.clear_errors();
                 if self.selected_host_folder_idx < self.host_folders.len() {
@@ -2539,9 +2575,9 @@ impl LanShareTui {
                     if server_active && active_dl > 0 && !self.stop_server_confirmed {
                         self.stop_server_confirmed = true;
                         let action = if is_last {
-                            "remove last folder and stop sharing"
+                            "remove last share and stop sharing"
                         } else {
-                            "abort transfer and remove folder"
+                            "abort transfer and remove share"
                         };
                         self.set_flash(format!(
                             "CRITICAL: Peer is downloading ({} active transfer{})! Press [Delete/d] again to {}.",
@@ -2552,15 +2588,17 @@ impl LanShareTui {
                     } else if is_last && server_active {
                         self.stop_server_confirmed = false;
                         let removed = self.host_folders.remove(self.selected_host_folder_idx);
+                        self.host_share_sizes.invalidate(&removed);
                         self.selected_host_folder_idx = 0;
                         self.toggle_server();
                         self.set_flash(format!(
-                            "Removed last folder '{}' and stopped sharing.",
+                            "Removed last share '{}' and stopped sharing.",
                             clean_display_path(&removed)
                         ));
                     } else {
                         self.stop_server_confirmed = false;
                         let removed = self.host_folders.remove(self.selected_host_folder_idx);
+                        self.host_share_sizes.invalidate(&removed);
                         if self.selected_host_folder_idx >= self.host_folders.len() {
                             self.selected_host_folder_idx =
                                 self.host_folders.len().saturating_sub(1);
@@ -2568,18 +2606,16 @@ impl LanShareTui {
                         if let Some(ref handle) = self.server_handle {
                             let _ = handle.update_shared_folders(self.host_folders.clone());
                         }
-                        self.set_flash(format!(
-                            "Removed folder '{}'",
-                            clean_display_path(&removed)
-                        ));
+                        self.set_flash(format!("Removed share '{}'", clean_display_path(&removed)));
                     }
                 }
             }
             KeyEvent::Char('C') if !server_active => {
                 self.clear_errors();
                 self.host_folders.clear();
+                self.host_share_sizes.clear();
                 self.selected_host_folder_idx = 0;
-                self.set_flash("Cleared shared folder list.");
+                self.set_flash("Cleared shared items list.");
             }
             _ => {}
         }
@@ -2722,7 +2758,7 @@ impl LanShareTui {
             },
             TuiTab::Host => match self.effective_host_section() {
                 HostSection::Folders => {
-                    " S:Start/Stop Sharing  a:Add Folder  Del:Remove  u:Uploads  l:Logs  Y:Copy IP  ?:About"
+                    " S:Start/Stop Sharing  a:Add Folder  F:Add File  Del:Remove  u:Uploads  l:Logs  Y:Copy IP  ?:About"
                 }
                 HostSection::Uploads => {
                     " ↑/↓/Wheel:Scroll  u/f/Esc:Folders  l:Logs  S:Start/Stop  Y:Copy IP  ?:About"
@@ -3631,7 +3667,7 @@ impl LanShareTui {
                     x + 2,
                     y + 4,
                     w.saturating_sub(4),
-                    "Add folders below with [a] to start sharing",
+                    "Add folders [a] or files [F] below to start sharing",
                     Color::DarkGray,
                     Color::Reset,
                     false,
@@ -3666,7 +3702,7 @@ impl LanShareTui {
 
         let mut cur_y = folders_y;
 
-        // 1. Folders to Share Section
+        // 1. Folders & Files to Share Section
         if active_sec == HostSection::Folders {
             self.last_host_folders_header_range =
                 Some((cur_y, cur_y + expanded_h.saturating_sub(1)));
@@ -3675,7 +3711,7 @@ impl LanShareTui {
                 cur_y,
                 w,
                 expanded_h,
-                "▼ Folders to Share on LAN ([a] Add Folder  [Del/d] Remove  [C] Clear All)",
+                "▼ Folders to Share on LAN ([a] Add Folder  [F] Add File  [Del/d] Remove  [C] Clear)",
                 Color::Cyan,
                 Color::Reset,
             );
@@ -3685,7 +3721,7 @@ impl LanShareTui {
                     x + 2,
                     cur_y + 2,
                     w.saturating_sub(4),
-                    "No folders added yet. Press [a] to add a local folder path to share.",
+                    "No items added yet. Press [a] to add a folder or [F] to add a file.",
                     Color::Yellow,
                     Color::Reset,
                     false,
@@ -3713,12 +3749,27 @@ impl LanShareTui {
                             ) == clean_folder
                         })
                         .count();
+                    let kind_tag = if folder.is_dir() { "[DIR]" } else { "[FILE]" };
+                    let size_part = match self.host_share_sizes.get_or_request(folder, None) {
+                        SharedPathSizeStatus::Ready(bytes) => {
+                            format!(" ({})", format_file_size(bytes))
+                        }
+                        SharedPathSizeStatus::Calculating => " (...)".to_string(),
+                        SharedPathSizeStatus::Unavailable => String::new(),
+                    };
                     let suffix = if up_cnt > 0 {
                         format!("  [↑ {} uploading]", up_cnt)
                     } else {
                         String::new()
                     };
-                    let label = format!("  {}. {}{}", idx + 1, clean_display_path(folder), suffix);
+                    let label = format!(
+                        "  {}. {} {}{}{}",
+                        idx + 1,
+                        kind_tag,
+                        clean_display_path(folder),
+                        size_part,
+                        suffix
+                    );
                     buf.draw_text(x + 2, row_y, w.saturating_sub(4), &label, fg, bg, is_sel);
                 }
             }
@@ -4271,17 +4322,31 @@ impl LanShareTui {
                 Color::Black,
                 true,
             );
-        } else if prompt.kind == InputPromptKind::AddHostFolder {
+        } else if prompt.kind == InputPromptKind::AddHostFolder
+            || prompt.kind == InputPromptKind::AddHostFile
+        {
             let val = prompt.value.trim();
             if !val.is_empty() {
                 let path = Self::expand_tilde(val);
-                match validate_shared_folder(&path) {
+                let res = if prompt.kind == InputPromptKind::AddHostFile {
+                    validate_shared_file(&path)
+                } else {
+                    validate_shared_folder(&path)
+                };
+                match res {
                     Ok(safe) => {
+                        let size_suffix = if safe.is_file() {
+                            std::fs::metadata(&safe)
+                                .map(|m| format!(" ({})", format_file_size(m.len())))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         buf.draw_text(
                             mx + 2,
                             my + 5,
                             mw.saturating_sub(4),
-                            &format!("Resolves to: {}", safe.display()),
+                            &format!("Resolves to: {}{}", safe.display(), size_suffix),
                             Color::Green,
                             Color::Black,
                             false,
@@ -6322,5 +6387,70 @@ mod tests {
             row: up_start,
         });
         assert_eq!(tui.host_section, HostSection::Uploads);
+    }
+
+    #[test]
+    fn test_tui_add_file_shares_after_folders_and_shows_sizes() {
+        let base = std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("target")
+            .join(format!("lanshare_tui_share_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let share_dir = base.join("alpha_folder");
+        std::fs::create_dir_all(&share_dir).unwrap();
+        std::fs::write(share_dir.join("sub.bin"), vec![1u8; 4096]).unwrap();
+        let share_file = base.join("single_doc.bin");
+        std::fs::write(&share_file, vec![2u8; 2048]).unwrap();
+
+        let mut tui = LanShareTui::new(true, Some("party-ring-42".to_string()), Vec::new(), false);
+        tui.secret_confirmed = true;
+        tui.current_tab = TuiTab::Host;
+
+        // 1. Add individual file first via 'F'
+        tui.handle_key(KeyEvent::Char('F'));
+        assert_eq!(
+            tui.active_prompt.as_ref().map(|p| p.kind),
+            Some(InputPromptKind::AddHostFile)
+        );
+        for c in share_file.to_string_lossy().chars() {
+            tui.handle_key(KeyEvent::Char(c));
+        }
+        tui.handle_key(KeyEvent::Enter);
+        assert!(tui.active_prompt.is_none());
+        assert_eq!(tui.host_folders.len(), 1);
+
+        // 2. Add folder next via 'a' -> folder must sort ahead of file
+        tui.handle_key(KeyEvent::Char('a'));
+        assert_eq!(
+            tui.active_prompt.as_ref().map(|p| p.kind),
+            Some(InputPromptKind::AddHostFolder)
+        );
+        for c in share_dir.to_string_lossy().chars() {
+            tui.handle_key(KeyEvent::Char(c));
+        }
+        tui.handle_key(KeyEvent::Enter);
+        assert!(tui.active_prompt.is_none());
+        assert_eq!(tui.host_folders.len(), 2);
+        assert!(tui.host_folders[0].is_dir(), "Folders must precede files");
+        assert!(tui.host_folders[1].is_file(), "Files must follow folders");
+
+        let mut buf = ScreenBuffer::new(140, 30);
+        tui.render(&mut buf);
+        let plain = buf.to_plain_text();
+        let dir_pos = plain.find("[DIR]").expect("Missing [DIR] tag");
+        let file_pos = plain.find("[FILE]").expect("Missing [FILE] tag");
+        assert!(dir_pos < file_pos, "Shared folder must render before file");
+        assert!(
+            plain.contains("(4 KB)"),
+            "Expected folder size (4 KB) in TUI shares list: {}",
+            plain
+        );
+        assert!(
+            plain.contains("(2 KB)"),
+            "Expected file size (2 KB) in TUI shares list: {}",
+            plain
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

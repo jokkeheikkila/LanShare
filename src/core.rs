@@ -3,13 +3,17 @@ use crate::protocol::{
     ClientCommand, DiscoveredPeer, FileEntry, HandshakeResponse, ServerCommandResponse,
     DEFAULT_TCP_PORT,
 };
-use crate::security::{ensure_safe_client_dest_path, sanitize_client_relative_path};
+use crate::security::{
+    ensure_safe_client_dest_path, is_symlink_or_reparse, sanitize_client_relative_path,
+};
 use chrono::{DateTime, Local};
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
+use walkdir::WalkDir;
 
 /// Results posted by background client network and download worker tasks to the UI loop.
 pub enum ClientActionResult {
@@ -27,6 +31,159 @@ pub struct QueueCompletionInfo {
     pub item_name: String,
     pub cancelled: bool,
     pub error: Option<String>,
+}
+
+/// Stably orders shared paths so folders always appear before individual files.
+pub fn sort_shared_paths(paths: &mut [PathBuf]) {
+    paths.sort_by_key(|p| !p.is_dir());
+}
+
+/// Computes the byte size of a safe shared file or directory without following symlinks.
+pub fn compute_shared_path_size(path: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if is_symlink_or_reparse(&meta) {
+        return None;
+    }
+    if meta.is_file() {
+        return Some(meta.len());
+    }
+    if !meta.is_dir() {
+        return None;
+    }
+
+    let mut total = 0u64;
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            std::fs::symlink_metadata(e.path())
+                .map(|m| !is_symlink_or_reparse(&m))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if let Ok(m) = std::fs::symlink_metadata(entry.path()) {
+            if !is_symlink_or_reparse(&m) && m.is_file() {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    Some(total)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedPathSizeStatus {
+    Ready(u64),
+    Calculating,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SharedSizeCacheEntry {
+    Calculating,
+    Ready(Option<u64>),
+}
+
+/// Non-blocking cache/resolver for local shared folder and file sizes shown in Host UIs.
+#[derive(Clone, Default)]
+pub struct SharedPathSizeResolver {
+    cache: Arc<RwLock<HashMap<PathBuf, SharedSizeCacheEntry>>>,
+}
+
+fn cache_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cache_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+impl SharedPathSizeResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_or_request(
+        &self,
+        path: &Path,
+        on_ready: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> SharedPathSizeStatus {
+        {
+            let guard = cache_read(&self.cache);
+            if let Some(entry) = guard.get(path) {
+                return match entry {
+                    SharedSizeCacheEntry::Calculating => SharedPathSizeStatus::Calculating,
+                    SharedSizeCacheEntry::Ready(Some(bytes)) => SharedPathSizeStatus::Ready(*bytes),
+                    SharedSizeCacheEntry::Ready(None) => SharedPathSizeStatus::Unavailable,
+                };
+            }
+        }
+
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) if !is_symlink_or_reparse(&m) => m,
+            _ => {
+                let mut guard = cache_write(&self.cache);
+                guard.insert(path.to_path_buf(), SharedSizeCacheEntry::Ready(None));
+                return SharedPathSizeStatus::Unavailable;
+            }
+        };
+
+        if meta.is_file() {
+            let len = meta.len();
+            let mut guard = cache_write(&self.cache);
+            guard.insert(path.to_path_buf(), SharedSizeCacheEntry::Ready(Some(len)));
+            return SharedPathSizeStatus::Ready(len);
+        }
+
+        if cfg!(test) {
+            let total = compute_shared_path_size(path);
+            let mut guard = cache_write(&self.cache);
+            guard.insert(path.to_path_buf(), SharedSizeCacheEntry::Ready(total));
+            return match total {
+                Some(bytes) => SharedPathSizeStatus::Ready(bytes),
+                None => SharedPathSizeStatus::Unavailable,
+            };
+        }
+
+        {
+            let mut guard = cache_write(&self.cache);
+            if let Some(existing) = guard.get(path) {
+                return match existing {
+                    SharedSizeCacheEntry::Calculating => SharedPathSizeStatus::Calculating,
+                    SharedSizeCacheEntry::Ready(Some(bytes)) => SharedPathSizeStatus::Ready(*bytes),
+                    SharedSizeCacheEntry::Ready(None) => SharedPathSizeStatus::Unavailable,
+                };
+            }
+            guard.insert(path.to_path_buf(), SharedSizeCacheEntry::Calculating);
+        }
+
+        let path_owned = path.to_path_buf();
+        let cache = self.cache.clone();
+        std::thread::spawn(move || {
+            let total = compute_shared_path_size(&path_owned);
+            {
+                let mut guard = cache_write(&cache);
+                if guard.contains_key(&path_owned) {
+                    guard.insert(path_owned, SharedSizeCacheEntry::Ready(total));
+                }
+            }
+            if let Some(cb) = on_ready {
+                cb();
+            }
+        });
+
+        SharedPathSizeStatus::Calculating
+    }
+
+    pub fn invalidate(&self, path: &Path) {
+        let mut guard = cache_write(&self.cache);
+        guard.remove(path);
+    }
+
+    pub fn clear(&self) {
+        let mut guard = cache_write(&self.cache);
+        guard.clear();
+    }
 }
 
 /// Sorts discovered LAN peers in-place case-insensitively by host name, then IP and TCP port.
@@ -1274,10 +1431,39 @@ pub fn compute_queue_etas(
     active_eta_stabilizer: &mut EtaStabilizer,
     total_eta_stabilizer: &mut EtaStabilizer,
 ) -> QueueEtaSummary {
-    let active_speed = active_progress.map(|p| p.speed_mbps).filter(|&s| s > 0.0);
-    let active_remaining = active_progress
-        .map(|p| p.bytes_total.saturating_sub(p.bytes_done))
-        .unwrap_or(0);
+    let active_item = active_queue_id
+        .and_then(|aid| download_queue.iter().find(|i| i.id == aid))
+        .or_else(|| {
+            download_queue
+                .iter()
+                .find(|i| i.status == QueueItemStatus::Downloading)
+        });
+    let prog_is_stale_finished = match (active_progress, active_item) {
+        (Some(prog), Some(item)) => {
+            prog.is_finished
+                && item.status == QueueItemStatus::Downloading
+                && prog.selected_target != item.entry.name
+                && prog.file_name != item.entry.name
+        }
+        _ => false,
+    };
+    let effective_progress = if prog_is_stale_finished {
+        None
+    } else {
+        active_progress
+    };
+
+    let active_speed = effective_progress
+        .map(|p| p.speed_mbps)
+        .filter(|&s| s > 0.0)
+        .or_else(|| active_progress.map(|p| p.speed_mbps).filter(|&s| s > 0.0));
+    let active_remaining = if let Some(prog) = effective_progress {
+        prog.bytes_total.saturating_sub(prog.bytes_done)
+    } else if let Some(item) = active_item.filter(|i| i.status == QueueItemStatus::Downloading) {
+        item.total_bytes.unwrap_or(item.entry.size)
+    } else {
+        0
+    };
 
     let mut pending_count = 0usize;
     let mut queued_pending_bytes = 0u64;
@@ -1291,16 +1477,13 @@ pub fn compute_queue_etas(
     }
     let total_remaining_bytes = active_remaining.saturating_add(queued_pending_bytes);
 
-    let active_item = download_queue
-        .iter()
-        .find(|i| i.status == QueueItemStatus::Downloading);
     let active_elapsed = active_item.and_then(|i| i.started_at.map(|t| t.elapsed()));
 
     let active_key = active_queue_id
         .map(|id| id.to_string())
-        .or_else(|| active_progress.map(|p| p.selected_target.clone()));
+        .or_else(|| effective_progress.map(|p| p.selected_target.clone()));
 
-    let raw_active_eta = if let Some(prog) = active_progress {
+    let raw_active_eta = if let Some(prog) = effective_progress {
         if prog.is_finished {
             Some(0)
         } else {
@@ -1321,23 +1504,18 @@ pub fn compute_queue_etas(
         total_eta_stabilizer.reset();
         active_eta
     } else {
-        let raw_total_eta = match (active_eta, active_speed) {
-            (Some(act_s), Some(spd)) => {
-                let pending_secs =
-                    estimate_remaining_seconds(queued_pending_bytes, spd).unwrap_or(0);
-                Some(act_s + pending_secs)
-            }
+        // Stabilize only the pending queue component so total_eta always tracks
+        // active_eta directly without double-smoothing or timer-phase drift.
+        let total_key = format!("{}:{}", pending_count, queued_pending_bytes);
+        let raw_pending_eta =
+            active_speed.and_then(|spd| estimate_remaining_seconds(queued_pending_bytes, spd));
+        let pending_eta = total_eta_stabilizer.update(Some(&total_key), raw_pending_eta);
+        match (active_eta, pending_eta) {
+            (Some(act_s), Some(pend_s)) => Some(act_s.saturating_add(pend_s)),
             (Some(act_s), None) => Some(act_s),
-            (None, Some(spd)) => estimate_remaining_seconds(total_remaining_bytes, spd),
+            (None, Some(pend_s)) => Some(pend_s),
             (None, None) => None,
-        };
-        let total_key = format!(
-            "{}:{}:{}",
-            active_key.as_deref().unwrap_or(""),
-            pending_count,
-            queued_pending_bytes
-        );
-        total_eta_stabilizer.update(Some(&total_key), raw_total_eta)
+        }
     };
 
     QueueEtaSummary {
@@ -3113,7 +3291,81 @@ mod tests {
         assert_eq!(s4.active_eta, Some(300));
         assert_eq!(s4.total_eta, Some(300));
 
-        // 5. Mock folder total bytes sums recursively
+        // 5. Total ETA never falls out of sync with Active ETA + pending ETA when transitioning
+        //    below 60s or when active_progress still holds the previous finished item's stats.
+        let mut jump_queue = VecDeque::new();
+        jump_queue.push_back(make_item(
+            10,
+            "main.iso",
+            200 * 1024 * 1024,
+            false,
+            QueueItemStatus::Downloading,
+        ));
+        jump_queue.push_back(make_item(
+            11,
+            "extra.bin",
+            30 * 1024 * 1024,
+            false,
+            QueueItemStatus::Pending,
+        ));
+        let mut act_s = EtaStabilizer::new();
+        let mut tot_s = EtaStabilizer::new();
+        let prog_slow = TransferProgress {
+            selected_target: "main.iso".to_string(),
+            file_name: "main.iso".to_string(),
+            bytes_done: 0,
+            bytes_total: 200 * 1024 * 1024,
+            speed_mbps: 1.0,
+            is_finished: false,
+            current_file: 1,
+            total_files: 1,
+            log_message: None,
+        };
+        let r1 = compute_queue_etas(
+            &jump_queue,
+            Some(10),
+            Some(&prog_slow),
+            &mut act_s,
+            &mut tot_s,
+        );
+        assert_eq!(r1.active_eta, Some(200));
+        assert_eq!(r1.total_eta, Some(230));
+
+        // Remaining drops below 60s -> fast update fires on active_eta; total_eta updates in lockstep!
+        let prog_near_end = TransferProgress {
+            bytes_done: 150 * 1024 * 1024,
+            ..prog_slow.clone()
+        };
+        let r2 = compute_queue_etas(
+            &jump_queue,
+            Some(10),
+            Some(&prog_near_end),
+            &mut act_s,
+            &mut tot_s,
+        );
+        assert_eq!(r2.active_eta, Some(50));
+        assert_eq!(r2.total_eta, Some(80));
+
+        // Transition to item 11 while active_progress still has finished item 10:
+        jump_queue[0].status = QueueItemStatus::Completed;
+        jump_queue[1].status = QueueItemStatus::Downloading;
+        let stale_finished = TransferProgress {
+            bytes_done: 200 * 1024 * 1024,
+            is_finished: true,
+            ..prog_slow
+        };
+        let r3 = compute_queue_etas(
+            &jump_queue,
+            Some(11),
+            Some(&stale_finished),
+            &mut act_s,
+            &mut tot_s,
+        );
+        assert_eq!(r3.active_remaining, 30 * 1024 * 1024);
+        assert_eq!(r3.active_eta, Some(30));
+        assert_eq!(r3.total_eta, Some(30));
+
+        // 6. Mock folder total bytes sums recursively
         assert!(mock_folder_total_bytes("mock://bob", "LAN_Party_Photos") > 0);
         assert!(mock_folder_total_bytes("mock://alice", "Design_Assets") > 0);
     }
@@ -3139,5 +3391,46 @@ mod tests {
                 dur
             );
         }
+    }
+
+    #[test]
+    fn test_shared_path_sorting_and_size_resolver() {
+        let base = std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("target")
+            .join(format!("lanshare_core_share_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir_a = base.join("folder_a");
+        let dir_b = base.join("folder_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let file_a = base.join("alpha.bin");
+        let file_in_dir = dir_a.join("inside.bin");
+        std::fs::write(&file_a, vec![1u8; 120]).unwrap();
+        std::fs::write(&file_in_dir, vec![2u8; 340]).unwrap();
+
+        let mut paths = vec![file_a.clone(), dir_a.clone(), dir_b.clone()];
+        sort_shared_paths(&mut paths);
+        assert_eq!(paths, vec![dir_a.clone(), dir_b.clone(), file_a.clone()]);
+
+        let resolver = SharedPathSizeResolver::new();
+        assert_eq!(
+            resolver.get_or_request(&file_a, None),
+            SharedPathSizeStatus::Ready(120)
+        );
+        assert_eq!(
+            resolver.get_or_request(&dir_a, None),
+            SharedPathSizeStatus::Ready(340)
+        );
+        assert_eq!(
+            resolver.get_or_request(&dir_b, None),
+            SharedPathSizeStatus::Ready(0)
+        );
+        assert_eq!(
+            resolver.get_or_request(&base.join("missing"), None),
+            SharedPathSizeStatus::Unavailable
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

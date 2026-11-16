@@ -98,7 +98,7 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1220.0, 800.0])
-        .with_min_inner_size([800.0, 540.0])
+        .with_min_inner_size(lanshare::app::MIN_WINDOW_INNER_SIZE)
         .with_title(window_title);
 
     if let Some(icon) = lanshare::app::app_icon() {
