@@ -1,6 +1,6 @@
 # LanShare
 
-A zero-config, portable desktop (**GUI**) and terminal (**TUI** & **CLI**) app for **Windows & Linux** designed for fast, strictly read-only folder sharing across your local network (or Tailscale) using a shared **Share-Ring** secret.
+A zero-config, portable desktop (**GUI**) and terminal (**TUI** & **CLI**) app for **Windows & Linux** designed for fast, strictly read-only file and folder sharing across your local network (or Tailscale) using a shared **Share-Ring** secret.
 
 Built in **Rust** from a single shared core powering both a lightweight native GUI (`lanshare-gui`) and an interactive Terminal UI / command-line tool (`lanshare-cli`).
 
@@ -27,14 +27,14 @@ Instead of configuring IP addresses, user accounts, or SMB shares:
 
 1. **Start the Ring**: Enter (or generate) a shared secret phrase of at least **10 characters** (e.g., `abcd-efgh-42`).
 2. **Join the Ring**: Anyone else on your network enters that **exact same secret** in their GUI or TUI app.
-3. **Browse & Download**: Peers automatically find each other on the LAN. Add one or more folders in **Share Folders** and sharing starts automatically.
+3. **Browse & Download**: Peers automatically find each other on the LAN. Add one or more folders or files in **Share Files** and sharing starts automatically.
 
 ---
 
 ## Key Features
 
 * **GUI, TUI & Direct CLI from One Core**:
-  * **`lanshare-gui` (GUI)**: Native desktop app with drag-and-drop folder hosting, live upload progress, resizable **Downloads** & **Uploads** panels, and multi-instance peer support.
+  * **`lanshare-gui` (GUI)**: Native desktop app with drag-and-drop file & folder hosting, live upload progress, resizable **Downloads** & **Uploads** panels, and multi-instance peer support.
   * **`lanshare-cli` (TUI & CLI)**: Interactive terminal UI with mouse-free navigation, collapsible **Downloads** (`d`) and **Uploads** (`u`) progress panels, plus direct one-shot CLI subcommands (`host`, `peers`, `ls`, `download`)—great over SSH or on headless Linux machines.
 * **No Installation or Admin Rights Needed**: Single self-contained portable executable with zero external dependencies, installers, or background services.
 * **Zero-Config Discovery**: No servers, accounts, cloud relays, or manual port forwarding needed on a LAN.
@@ -53,16 +53,16 @@ Instead of configuring IP addresses, user accounts, or SMB shares:
 ![LanShare TUI — Browse LAN](assets/screenshots/1.0.0_tui_browse.png)
 
 <details>
-<summary>More Screenshots (Login & Share Folders)</summary>
+<summary>More Screenshots (Login & Share Files)</summary>
 
 #### GUI — Share-Ring Login
 ![LanShare GUI — Login](assets/screenshots/1.0.0_gui_login_white.png)
 
-#### GUI — Share Folders (Hosting)
-![LanShare GUI — Share Folders](assets/screenshots/1.0.0_gui_share_white.png)
+#### GUI — Share Files (Hosting)
+![LanShare GUI — Share Files](assets/screenshots/1.0.0_gui_share_white.png)
 
-#### TUI — Share Folders (Hosting)
-![LanShare TUI — Share Folders](assets/screenshots/1.0.0_tui_share.png)
+#### TUI — Share Files (Hosting)
+![LanShare TUI — Share Files](assets/screenshots/1.0.0_tui_share.png)
 
 </details>
 
@@ -101,7 +101,7 @@ Because LanShare is a portable standalone executable (not installed into your sy
 ./lanshare-cli
 ./lanshare-cli --test
 
-# Direct CLI: Host folders read-only in the foreground (prompts for ring secret, then prints live server logs until Ctrl+C)
+# Direct CLI: Host folders or files read-only in the foreground (prompts for ring secret, then prints live status until Ctrl+C)
 ./lanshare-cli host ~/Downloads ~/Videos
 
 # Direct CLI: Discover active peers on the Share-Ring
@@ -141,14 +141,14 @@ LanShare CLI & TUI (lanshare-cli) — Encrypted zero-config LAN folder sharing p
 USAGE:
   lanshare-cli [TUI_OPTIONS]
   lanshare-cli tui [TUI_OPTIONS]
-  lanshare-cli host <FOLDER>...
+  lanshare-cli host <PATH>...
   lanshare-cli peers
   lanshare-cli ls --peer <HOSTNAME_OR_IP> [REMOTE_PATH]
   lanshare-cli download --peer <HOSTNAME_OR_IP> [-d <DEST_DIR>] <REMOTE_PATH>...
 
 COMMANDS:
   tui                   Launch the interactive Terminal UI (default when no command is given)
-  host, share           Share one or more local folders read-only and print live server logs to terminal
+  host, share           Share one or more local folders or files read-only and print live status
   peers, scan           Discover and list active hosts on the Share-Ring
   ls, list              List shared folders or directory contents on a remote host
   download, get         Download one or more files or folders from a remote host (no wildcards)
@@ -177,7 +177,7 @@ GENERAL & TUI OPTIONS:
 
 | Key | Action |
 | :--- | :--- |
-| `Tab` | Switch between **Browse LAN (Client)** and **Share Folders (Host)** tabs |
+| `Tab` | Switch between **Browse LAN (Client)** and **Share Files (Host)** tabs |
 | `?` / `F1` | Open **About LanShare & How LanShare Works** modal |
 | `e` / `v` / `r` / `Y` | **Edit**, **Show/Hide**, **Randomize**, or **Copy** the Share-Ring Secret / Host IP |
 | `↑` / `↓` / `PgUp` / `PgDn` | Navigate files/folders in the browser or shared folder list |
@@ -188,7 +188,7 @@ GENERAL & TUI OPTIONS:
 | `s` / `i` / `o` | **Scan** LAN, connect via **Direct IP**, or change local **Download Folder** |
 | `b` / `d` | (Client Tab) Expand **Browse** (`b`) or expand/collapse **Downloads** (`d`) |
 | `c` / `Del` / `x` | (Downloads) **Cancel** active transfer, **Remove** pending queue item, or **Clear** finished items |
-| `a` / `Del` / `C` / `S` | (Host Tab) **Add** folder (`a`), **Remove** folder (`Del`), **Clear** list (`C`), or **Start/Stop** sharing (`S`) |
+| `a` / `F` / `Del` / `C` / `S` | (Host Tab) **Add** folder (`a`), **Add** file (`F`), **Remove** item (`Del`), **Clear** list (`C`), or **Start/Stop** sharing (`S`) |
 | `u` / `f` | (Host Tab) Expand/collapse **Uploads** panel (`u`) or return to **Folders** (`f`) |
 | `←` / `→` / `Home` / `End` | (Input Dialogs) Move cursor within path or secret |
 | `F2` | (Setup & Input Dialogs) **Copy** field to clipboard (also clickable on login setup) |
@@ -202,7 +202,7 @@ GENERAL & TUI OPTIONS:
 ### Connecting Across Tailscale (Remote Peers)
 
 1. Enter the **exact same Share-Ring secret** on both machines.
-2. Add at least one folder on the host in **Share Folders** (sharing starts automatically).
+2. Add at least one folder or file on the host in **Share Files** (sharing starts automatically).
 3. Connect using the host's Tailscale IP (e.g. `100.115.92.19`) under **Direct IP Connect** in the GUI (or press `i` in the TUI).
 4. Browse and download over the same mutual TLS encryption—no UDP broadcast needed.
 
@@ -222,7 +222,7 @@ If your tailnet restricts traffic in [Tailscale Access Controls](https://login.t
 
 LanShare is designed to stay simple to run while keeping both host and downloader safe on shared local networks:
 
-* **Strictly Read-Only by Design**: The protocol only supports listing shared folders and streaming existing files. There is no upload, rename, overwrite, delete, or remote-command endpoint.
+* **Strictly Read-Only by Design**: The protocol only supports listing shared items and streaming existing files. There is no upload, rename, overwrite, delete, or remote-command endpoint.
 * **Zero-Plaintext Secret Authentication**: Your Share-Ring secret (minimum 10 characters) never crosses the network. Keys are derived with **PBKDF2-HMAC-SHA256** (`100,000` rounds), and every connection uses an in-memory ephemeral **TLS 1.3 / 1.2** session (`rustls` + `ring`) with mutual channel-bound verification.
 * **Resumable & Verified Transfers**: Files stream in 64 KB chunks over TLS with strict byte-offset resume and end-of-stream **SHA-256** checksum verification.
 * **Path & Symlink Protection**: Hosts cannot accidentally share filesystem roots, OS folders, or home directories, and both host and client block `..` traversal, Windows reserved device names, and symlink/junction escapes.

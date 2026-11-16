@@ -2664,11 +2664,11 @@ impl LanShareTui {
             " [1] Browse LAN ".to_string()
         };
         let tab2 = if upload_count > 0 {
-            format!(" [2] Share Folders ● ↑{} ", upload_count)
+            format!(" [2] Share Files ● ↑{} ", upload_count)
         } else if hosting_active {
-            " [2] Share Folders ● ".to_string()
+            " [2] Share Files ● ".to_string()
         } else {
-            " [2] Share Folders ".to_string()
+            " [2] Share Files ".to_string()
         };
         let tab1_w = UnicodeWidthStr::width(tab1.as_str());
         let tab2_w = UnicodeWidthStr::width(tab2.as_str());
@@ -4222,7 +4222,7 @@ impl LanShareTui {
                 false,
             ),
             (
-                "3. In 'Share Folders', add folders and press [S] to start sharing read-only."
+                "3. In 'Share Files', add folders/files and press [S] to start sharing read-only."
                     .to_string(),
                 Color::White,
                 false,
@@ -4982,7 +4982,7 @@ mod tests {
         tui.render(&mut buf2);
         let text2 = buf2.to_plain_text();
         assert!(text2.contains("Browse LAN"));
-        assert!(text2.contains("Share Folders"));
+        assert!(text2.contains("Share Files"));
 
         // Open About modal
         tui.handle_key(KeyEvent::Char('?'));
@@ -6149,7 +6149,7 @@ mod tests {
         tui.render(&mut buf);
         let host_text = buf.to_plain_text();
         assert!(host_text.contains("[1] Browse LAN ● ↓1"));
-        assert!(host_text.contains("[2] Share Folders ● ↑1"));
+        assert!(host_text.contains("[2] Share Files ● ↑1"));
         assert!(host_text.contains("[↑ 1 uploading]"));
         assert!(host_text.contains("▶ [u] Uploads: 1 active | Total ETA:"));
         assert!(host_text.contains("backup.tar"));

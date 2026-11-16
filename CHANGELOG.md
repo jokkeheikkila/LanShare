@@ -7,26 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-11-15
+## [1.1.0] - 2026-11-16
 
 ### Added
+- Support sharing individual files alongside folders across GUI (`Add File(s)`), TUI (`F` / `Add File`), and `lanshare-cli host`, with upfront size calculation for shared items.
 - Support discovering and selecting multiple LanShare instances running on the same computer.
-- New **Uploads** section in **Share Folders** (always-visible and resizable in GUI, collapsible with `u` in TUI) showing active uploads, per-folder upload counts, progress bars, speed, ETA, and total upload ETA.
+- New **Uploads** section in **Share Files** (always-visible and resizable in GUI, collapsible with `u` in TUI) showing active uploads, per-share upload counts, progress bars, speed, ETA, and total upload ETA.
+- Live upload progress summaries in `lanshare-cli host`.
 - Live download (`↓`) and upload/hosting (`●` / `↑`) indicators in the navigation bar across GUI and TUI.
-- Upfront size and ETA calculation for queued folders.
+- Upfront size and ETA calculation for queued downloads.
 - Centered GUI startup window across primary and multi-monitor setups.
 - GitHub Releases update links in **About** and a Table of Contents in `README.md`.
 - Weekly CI security dependency checks (`cargo audit`) and pull-request build checks.
 
 ### Changed
+- Renamed the host tab from **Share Folders** to **Share Files** across GUI, TUI, and documentation.
 - Kept the GUI **Downloads** section always visible with a taller default height and a drag-resizable divider.
-- Clearer folder loading feedback with an animated spinner and icon-based toolbar controls.
+- Clearer folder/file loading feedback with an animated spinner and icon-based toolbar controls.
 - Stabilized download/upload table columns, action buttons, and completed timestamps so text no longer jumps while transferring.
 - Show two decimal places for `GB` and `TB` transfer sizes.
 - Validate `lanshare-cli` host and download paths before prompting for the Ring Secret.
+- Prevented horizontal scrolling in GUI **Browse LAN** and increased the minimum window size for consistent layout.
+- Updated remove-confirmation wording for individual files (`Keep File` instead of `Keep Folder`).
 
 ### Fixed
-- Kept `Total ETA` accurate and immediately updated as queue items are added, resolved, or removed.
+- Kept `Total ETA` accurate and synchronized with item ETAs for both downloads and uploads (summing active upload ETAs and updating immediately as items change).
+- Improved light-theme button visibility in **Browse LAN**.
+- Silenced Linux `xdg-open` GTK console warnings when opening files or folders from the TUI.
 - Fixed GUI **About** window height and clickable repository/release links.
 - Fixed Browse `Name` column resizing affecting queue columns, and matched row highlight height to buttons.
 

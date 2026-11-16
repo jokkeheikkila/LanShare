@@ -1479,7 +1479,7 @@ impl LanShareApp {
                 if Self::render_nav_tab_button(
                     ui,
                     &p,
-                    "Share Folders",
+                    "Share Files",
                     is_host,
                     host_badge
                         .as_ref()
@@ -1896,7 +1896,7 @@ impl LanShareApp {
                             ui.add_space(3.0);
                             ui.label("2. In 'Browse LAN', click 'Scan' to list peers, or connect directly by IP.");
                             ui.add_space(3.0);
-                            ui.label("3. In 'Share Folders', add folders and click 'Start Sharing' to share them read-only.");
+                            ui.label("3. In 'Share Files', add folders or files and click 'Start Sharing' to share them read-only.");
 
                             ui.add_space(12.0);
                             ui.label(
@@ -8218,7 +8218,7 @@ mod tests {
             let _ = LanShareApp::render_nav_tab_button(
                 ui,
                 &p,
-                "Share Folders",
+                "Share Files",
                 false,
                 Some(("↑ 1", Color32::LIGHT_GREEN, "Active upload")),
             );
@@ -9095,10 +9095,11 @@ mod tests {
                     match shape {
                         egui::epaint::Shape::Rect(r)
                             if r.rect.contains(center)
-                                && r.rect.width() >= 60.0
-                                && r.rect.width() <= 100.0
-                                && r.rect.height() >= 18.0
-                                && r.rect.height() <= 30.0 =>
+                                && r.fill != Color32::TRANSPARENT
+                                && r.rect.width() >= 50.0
+                                && r.rect.width() <= 140.0
+                                && r.rect.height() >= 16.0
+                                && r.rect.height() <= 44.0 =>
                         {
                             Some(r.clone())
                         }
