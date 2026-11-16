@@ -1593,7 +1593,7 @@ impl UploadEtaSummary {
 }
 
 /// Computes stabilized per-upload ETAs and aggregate `Total ETA` across active server uploads.
-/// Every upload row displays the same stabilized ETA that contributes to `total_eta = max(rows)`.
+/// Every upload row displays the same stabilized ETA that sums into `total_eta = sum(rows)`.
 pub fn compute_active_uploads_etas(
     uploads: &[crate::server::ActiveUploadInfo],
     tracker: &mut UploadEtaTracker,
@@ -1622,7 +1622,7 @@ pub fn compute_active_uploads_etas(
             .update(Some(&key), raw_eta);
         if rem > 0 {
             if let Some(eta_s) = stabilized {
-                total_eta = Some(total_eta.map_or(eta_s, |cur| cur.max(eta_s)));
+                total_eta = Some(total_eta.unwrap_or(0).saturating_add(eta_s));
             }
         }
         per_upload.insert(u.id, stabilized);
@@ -3483,7 +3483,7 @@ mod tests {
         let u2 = compute_active_uploads_etas(&[ul1.clone(), ul2.clone()], &mut ul_tracker);
         assert_eq!(u2.eta_for(1), Some(200));
         assert_eq!(u2.eta_for(2), Some(50));
-        assert_eq!(u2.total_eta, Some(200));
+        assert_eq!(u2.total_eta, Some(250));
 
         // Swapping out upload #1 for #2 keeps count == 1, and immediately shows upload #2's ETA!
         let u3 = compute_active_uploads_etas(std::slice::from_ref(&ul2), &mut ul_tracker);
