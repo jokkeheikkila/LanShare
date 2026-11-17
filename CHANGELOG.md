@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-17
+
+### Changed
+- Removed the redundant `(Total: ...)` ETA column from the GUI active download row in **Browse LAN** so speed, active ETA, and transferred/total sizes sit closer together without leaving empty space on single downloads (`Total ETA` remains in the panel header).
+- Updated `README.md` screenshots.
+
+### Fixed
+- Removed the stray outer whole-window scrollbar from the GUI **Share Files** page so scrolling stays confined to the individual **Shared Folders & Files** and **Uploads** panels.
+
 ## [1.1.0] - 2026-11-16
 
 ### Added
@@ -50,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direct IP Connect support for Tailscale (`100.64.0.0/10`) and private LAN/ULA subnets, plus offline `--test` simulated multi-peer mode.
 - Read-only path validation, symlink/`O_NOFOLLOW` protection, `--secret-env` / `--secret-stdin` secret loading, and bounded OS-standard log rotation.
 
-[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jokkeheikkila/LanShare/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jokkeheikkila/LanShare/releases/tag/v1.0.0
