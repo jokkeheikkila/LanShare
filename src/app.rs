@@ -1190,20 +1190,7 @@ impl eframe::App for LanShareApp {
 
         match self.current_tab {
             AppTab::Client => self.render_client_view(ui),
-            AppTab::Host => {
-                let p = self.palette(&ctx);
-                let panel_bg = p.panel_bg;
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::central_panel(&ctx.global_style()).fill(panel_bg))
-                    .show(ui, |ui| {
-                        ScrollArea::vertical()
-                            .id_salt("host_central_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.render_host_tab(ui);
-                            });
-                    });
-            }
+            AppTab::Host => self.render_host_central_panel(ui),
         }
     }
 }
@@ -4582,14 +4569,9 @@ impl LanShareApp {
                             let right_pad = 8.0_f32;
                             let speed_col_w = 94.0_f32;
                             let eta_col_w = 78.0_f32;
-                            let total_col_w = 112.0_f32;
                             let size_col_w = 148.0_f32;
-                            let metrics_total_w = right_pad
-                                + speed_col_w
-                                + eta_col_w
-                                + total_col_w
-                                + size_col_w
-                                + 6.0 * 4.0;
+                            let metrics_total_w =
+                                right_pad + speed_col_w + eta_col_w + size_col_w + 6.0 * 3.0;
                             let bar_w = (avail_w - metrics_total_w).max(90.0);
 
                             ui.add(
@@ -4619,21 +4601,6 @@ impl LanShareApp {
                                             .monospace()
                                             .strong()
                                             .color(p.accent_blue),
-                                        );
-                                    }
-                                }
-                            });
-
-                            Self::render_right_aligned_metric_col(ui, total_col_w, |ui| {
-                                if let Some(tot_s) = total_eta {
-                                    if pending_count > 0 {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "(Total: {:<4})",
-                                                format_remaining_time(tot_s)
-                                            ))
-                                            .monospace()
-                                            .color(p.text_muted),
                                         );
                                     }
                                 }
@@ -4884,6 +4851,16 @@ impl LanShareApp {
         if cancel_current {
             self.cancel_active_transfer();
         }
+    }
+
+    fn render_host_central_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let p = self.palette(&ctx);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.global_style()).fill(p.panel_bg))
+            .show(ui, |ui| {
+                self.render_host_tab(ui);
+            });
     }
 
     fn render_host_tab(&mut self, ui: &mut egui::Ui) {
@@ -8324,7 +8301,12 @@ mod tests {
             "Total ETA must update immediately after enqueue"
         );
 
-        // Under readable GUI styling (13pt monospace), ETA and (Total: ...) keep clear spacing
+        assert!(
+            !q2_texts.iter().any(|t| t.contains("(Total:")),
+            "Active download row must not duplicate Total ETA shown in the header"
+        );
+
+        // Under readable GUI styling (13pt monospace), ETA and size progress keep clear, compact spacing
         configure_readable_style(&ctx, true);
         let q_styled_out = run_test_ui(
             &ctx,
@@ -8358,12 +8340,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("Missing styled active download text '{needle}'"))
         };
         let active_eta_rect = find_styled_rect("ETA:");
-        let active_total_rect = find_styled_rect("(Total:");
+        let active_size_text = format!(
+            "{} / {}",
+            format_file_size(1_000_000_000),
+            format_file_size(1_500_000_000)
+        );
+        let active_size_rect = find_styled_rect(&active_size_text);
+        let eta_to_size_gap = active_size_rect.left() - active_eta_rect.right();
         assert!(
-            active_total_rect.left() - active_eta_rect.right() >= 8.0,
-            "(Total: ...) left ({}) must have clear space after ETA right ({})",
-            active_total_rect.left(),
-            active_eta_rect.right()
+            (8.0..=60.0).contains(&eta_to_size_gap),
+            "Size progress ('{}', left={}) should sit cleanly next to ETA (right={}), gap={}",
+            active_size_text,
+            active_size_rect.left(),
+            active_eta_rect.right(),
+            eta_to_size_gap
         );
 
         let _ = std::fs::remove_dir_all(&folder);
@@ -9196,6 +9186,69 @@ mod tests {
             "Browse Download button ({}) must remain visible at minimum window width {}",
             dl_rect_min.right(),
             MIN_WINDOW_INNER_SIZE[0]
+        );
+    }
+
+    #[test]
+    fn test_host_tab_has_no_outer_window_scrollbar() {
+        let ctx = egui::Context::default();
+        configure_readable_style(&ctx, false);
+        let mut app = create_test_app();
+        app.secret_confirmed = true;
+        app.current_tab = AppTab::Host;
+        app.host_folders.push(PathBuf::from("/tmp/share_a"));
+
+        let min_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(MIN_WINDOW_INNER_SIZE[0], MIN_WINDOW_INNER_SIZE[1]),
+            )),
+            events: vec![egui::Event::PointerMoved(egui::pos2(
+                MIN_WINDOW_INNER_SIZE[0] - 4.0,
+                MIN_WINDOW_INNER_SIZE[1] * 0.5,
+            ))],
+            ..Default::default()
+        };
+        let mut central_bottom_y = 0.0_f32;
+        let _ = run_test_ui(&ctx, min_input.clone(), |ui| {
+            app.render_status_bar(ui);
+            app.render_main_left_rail(ui);
+            app.render_host_central_panel(ui);
+        });
+        let out = run_test_ui(&ctx, min_input, |ui| {
+            app.render_status_bar(ui);
+            app.render_main_left_rail(ui);
+            app.render_host_central_panel(ui);
+            central_bottom_y = ui.ctx().globally_used_rect().bottom();
+        });
+
+        fn find_tall_edge_bar(shape: &egui::epaint::Shape, win_w: f32) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Rect(r)
+                    if r.rect.right() >= win_w - 16.0
+                        && r.rect.width() <= 20.0
+                        && r.rect.height() >= 300.0 =>
+                {
+                    Some(r.rect)
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().find_map(|s| find_tall_edge_bar(s, win_w)),
+                _ => None,
+            }
+        }
+        let edge_scrollbar = out
+            .shapes
+            .iter()
+            .find_map(|c| find_tall_edge_bar(&c.shape, MIN_WINDOW_INNER_SIZE[0]));
+        assert!(
+            edge_scrollbar.is_none(),
+            "Share Files page must not render a whole-window edge scrollbar: {:?}",
+            edge_scrollbar
+        );
+        assert!(
+            central_bottom_y <= MIN_WINDOW_INNER_SIZE[1] + 1.0,
+            "Share Files page content bottom ({}) must fit inside window height ({})",
+            central_bottom_y,
+            MIN_WINDOW_INNER_SIZE[1]
         );
     }
 }
