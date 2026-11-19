@@ -223,7 +223,7 @@ impl ServerHandle {
         let next_ver = self.registry_notify_tx.borrow().wrapping_add(1);
         let _ = self.registry_notify_tx.send(next_ver);
 
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = self.log_tx.send(ServerLogEvent {
             timestamp: ts,
             message: format!("Shares updated: {} item(s) active on LAN.", validated.len()),
@@ -538,7 +538,7 @@ pub async fn start_server(
                             let act_folder_dl = udp_active_folder_downloads.clone();
                             let act_uploads = udp_active_uploads.clone();
 
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
                             let _ = l_tx.send(ServerLogEvent {
                                 timestamp: ts,
                                 message: format!("Reverse TCP requested by {}. Connecting to callback port {}...", peer_ip, rev_req.tcp_port),
@@ -571,7 +571,7 @@ pub async fn start_server(
                                         .await;
                                     }
                                     Ok(Err(e)) => {
-                                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                        let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
                                         let _ = l_tx.send(ServerLogEvent {
                                             timestamp: ts,
                                             message: format!("Reverse TCP callback to {} failed: {}", target_addr, e),
@@ -579,7 +579,7 @@ pub async fn start_server(
                                         });
                                     }
                                     Err(_) => {
-                                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                        let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
                                         let _ = l_tx.send(ServerLogEvent {
                                             timestamp: ts,
                                             message: format!("Reverse TCP callback to {} timed out", target_addr),
@@ -612,7 +612,7 @@ pub async fn start_server(
     tokio::spawn(async move {
         let server_log_sender = server_log_tx_for_loop.clone();
         let server_log = move |msg: String, is_err: bool| {
-            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
             let _ = server_log_sender.send(ServerLogEvent {
                 timestamp: ts,
                 message: msg,
@@ -776,7 +776,7 @@ async fn run_client_session(
 ) {
     let peer_ip = peer_addr.ip();
     let c_log = move |msg: String, is_err: bool| {
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = client_log.send(ServerLogEvent {
             timestamp: ts,
             message: msg,

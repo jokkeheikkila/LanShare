@@ -7,7 +7,7 @@ use crate::core::{
     mock_folder_total_bytes, open_file_in_default_app, open_folder_in_explorer, open_url,
     parse_host_and_port, queue_status_sort_rank, resolve_remote_folder_total_bytes,
     sort_peers_alphabetically, sort_shared_paths, spawn_next_queued_download, test_downloads_dir,
-    ClientActionResult, EtaStabilizer, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem,
+    ClientActionResult, EtaStabilizer, Local, QueueEtaSummary, QueueItemStatus, QueuedDownloadItem,
     SharedPathSizeResolver, SharedPathSizeStatus, UploadEtaTracker, GITHUB_RELEASES_URL,
     GITHUB_REPO_URL,
 };
@@ -20,7 +20,6 @@ use crate::security::{
 };
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
-use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, RichText, ScrollArea, Stroke, TextStyle, Vec2,
 };

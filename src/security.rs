@@ -31,17 +31,16 @@ pub fn clean_display_path(path: &Path) -> String {
 
 /// Detects whether a path metadata represents a symbolic link or Windows reparse point (junction / mount).
 pub fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
+        meta.file_type().is_symlink()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// Sanitizes a server-supplied relative path on the client side.

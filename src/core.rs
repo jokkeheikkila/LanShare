@@ -6,7 +6,6 @@ use crate::protocol::{
 use crate::security::{
     ensure_safe_client_dest_path, is_symlink_or_reparse, sanitize_client_relative_path,
 };
-use chrono::{DateTime, Local};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -14,6 +13,216 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
+
+/// Lightweight, thread-safe local calendar date/time backed directly by OS timezone APIs
+/// (`libc::localtime_r` on Unix, `FileTimeToSystemTime` + `SystemTimeToTzSpecificLocalTime` on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDateTime {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub unix_secs: i64,
+}
+
+impl LocalDateTime {
+    /// Converts a Unix timestamp (seconds since 1970-01-01 00:00:00 UTC) into local time.
+    pub fn from_unix_timestamp(unix_secs: i64) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            #[allow(clippy::useless_conversion)]
+            let t: libc::time_t = unix_secs.try_into().ok()?;
+            let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+            // SAFETY: `t` points to a valid `time_t` and `tm.as_mut_ptr()` points to a writable `libc::tm` slot.
+            let ptr = unsafe { libc::localtime_r(&t, tm.as_mut_ptr()) };
+            if ptr.is_null() {
+                return None;
+            }
+            // SAFETY: `localtime_r` returned a non-null pointer, confirming `tm` was initialized.
+            let tm = unsafe { tm.assume_init() };
+            Some(Self {
+                year: tm.tm_year.saturating_add(1900),
+                month: (tm.tm_mon + 1).clamp(1, 12) as u8,
+                day: tm.tm_mday.clamp(1, 31) as u8,
+                hour: tm.tm_hour.clamp(0, 23) as u8,
+                minute: tm.tm_min.clamp(0, 59) as u8,
+                second: tm.tm_sec.clamp(0, 59) as u8,
+                unix_secs,
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            #[allow(non_snake_case)]
+            struct FileTime {
+                dwLowDateTime: u32,
+                dwHighDateTime: u32,
+            }
+
+            #[repr(C)]
+            #[allow(non_snake_case)]
+            struct SystemTime {
+                wYear: u16,
+                wMonth: u16,
+                wDayOfWeek: u16,
+                wDay: u16,
+                wHour: u16,
+                wMinute: u16,
+                wSecond: u16,
+                wMilliseconds: u16,
+            }
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn FileTimeToSystemTime(
+                    lpFileTime: *const FileTime,
+                    lpSystemTime: *mut SystemTime,
+                ) -> i32;
+                fn SystemTimeToTzSpecificLocalTime(
+                    lpTimeZoneInformation: *const core::ffi::c_void,
+                    lpUniversalTime: *const SystemTime,
+                    lpLocalTime: *mut SystemTime,
+                ) -> i32;
+            }
+
+            const WINDOWS_EPOCH_OFFSET_100NS: i128 = 116_444_736_000_000_000;
+            let intervals = (unix_secs as i128)
+                .checked_mul(10_000_000)?
+                .checked_add(WINDOWS_EPOCH_OFFSET_100NS)?;
+            if intervals < 0 || intervals > u64::MAX as i128 {
+                return None;
+            }
+            let ticks = intervals as u64;
+            let ft = FileTime {
+                dwLowDateTime: ticks as u32,
+                dwHighDateTime: (ticks >> 32) as u32,
+            };
+
+            let mut utc_st = std::mem::MaybeUninit::<SystemTime>::uninit();
+            // SAFETY: `ft` is a valid initialized `FileTime` and `utc_st.as_mut_ptr()` is a writable `SystemTime` slot.
+            if unsafe { FileTimeToSystemTime(&ft, utc_st.as_mut_ptr()) } == 0 {
+                return None;
+            }
+            // SAFETY: `FileTimeToSystemTime` returned non-zero, confirming `utc_st` was initialized.
+            let utc_st = unsafe { utc_st.assume_init() };
+
+            let mut local_st = std::mem::MaybeUninit::<SystemTime>::uninit();
+            // SAFETY: `utc_st` is initialized, null timezone uses current system timezone, and `local_st` is writable.
+            if unsafe {
+                SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, local_st.as_mut_ptr())
+            } == 0
+            {
+                return None;
+            }
+            // SAFETY: `SystemTimeToTzSpecificLocalTime` returned non-zero, confirming `local_st` was initialized.
+            let local_st = unsafe { local_st.assume_init() };
+
+            Some(Self {
+                year: local_st.wYear as i32,
+                month: local_st.wMonth.clamp(1, 12) as u8,
+                day: local_st.wDay.clamp(1, 31) as u8,
+                hour: local_st.wHour.clamp(0, 23) as u8,
+                minute: local_st.wMinute.clamp(0, 59) as u8,
+                second: local_st.wSecond.clamp(0, 59) as u8,
+                unix_secs,
+            })
+        }
+    }
+
+    /// Formats the date/time using `strftime`-compatible specifiers (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`).
+    pub fn format(&self, pattern: &str) -> String {
+        let mut out = String::with_capacity(pattern.len() + 8);
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('Y') => {
+                        let _ =
+                            std::fmt::Write::write_fmt(&mut out, format_args!("{:04}", self.year));
+                    }
+                    Some('m') => {
+                        let _ =
+                            std::fmt::Write::write_fmt(&mut out, format_args!("{:02}", self.month));
+                    }
+                    Some('d') => {
+                        let _ =
+                            std::fmt::Write::write_fmt(&mut out, format_args!("{:02}", self.day));
+                    }
+                    Some('H') => {
+                        let _ =
+                            std::fmt::Write::write_fmt(&mut out, format_args!("{:02}", self.hour));
+                    }
+                    Some('M') => {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut out,
+                            format_args!("{:02}", self.minute),
+                        );
+                    }
+                    Some('S') => {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut out,
+                            format_args!("{:02}", self.second),
+                        );
+                    }
+                    Some('%') => out.push('%'),
+                    Some(other) => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                    None => out.push('%'),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Returns a new [`LocalDateTime`] offset backwards by `secs` seconds.
+    pub fn sub_seconds(self, secs: i64) -> Self {
+        let target = self.unix_secs.saturating_sub(secs);
+        Self::from_unix_timestamp(target).unwrap_or(self)
+    }
+}
+
+/// Result wrapper matching `Local.timestamp_opt(secs, nsecs).single()`.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTimestampResult(Option<LocalDateTime>);
+
+impl LocalTimestampResult {
+    pub fn single(self) -> Option<LocalDateTime> {
+        self.0
+    }
+}
+
+/// Local timezone helper providing `Local::now()` and `Local.timestamp_opt(...)`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Local;
+
+impl Local {
+    pub fn now() -> LocalDateTime {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        LocalDateTime::from_unix_timestamp(secs).unwrap_or(LocalDateTime {
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            unix_secs: secs,
+        })
+    }
+
+    pub fn timestamp_opt(&self, secs: i64, _nsecs: u32) -> LocalTimestampResult {
+        LocalTimestampResult(LocalDateTime::from_unix_timestamp(secs))
+    }
+}
 
 /// Results posted by background client network and download worker tasks to the UI loop.
 pub enum ClientActionResult {
@@ -386,7 +595,7 @@ pub struct QueuedDownloadItem {
     pub status: QueueItemStatus,
     pub started_at: Option<Instant>,
     pub elapsed_duration: Option<Duration>,
-    pub completed_at: Option<DateTime<Local>>,
+    pub completed_at: Option<LocalDateTime>,
     pub total_bytes: Option<u64>,
 }
 
@@ -1258,7 +1467,7 @@ pub fn format_remaining_time(seconds: u64) -> String {
 }
 
 /// Formats a completed download timestamp as local time (`HH:MM:SS`).
-pub fn format_completed_timestamp(dt: DateTime<Local>) -> String {
+pub fn format_completed_timestamp(dt: LocalDateTime) -> String {
     dt.format("%H:%M:%S").to_string()
 }
 
@@ -1972,7 +2181,7 @@ pub fn get_log_file_path() -> PathBuf {
             let base_dir = get_writable_log_dir();
             let _ = std::fs::create_dir_all(&base_dir);
             prune_old_logs(&base_dir);
-            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            let ts = Local::now().format("%Y%m%d-%H%M%S");
             let pid = std::process::id();
             generate_session_log_path(&base_dir, &ts, pid)
         })
@@ -1999,7 +2208,7 @@ pub fn spool_log_entry(line: &str) {
 
 /// Writes a prominent session start banner whenever LanShare starts up.
 pub fn spool_log_session_start(mode: &str) {
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
     let version = env!("CARGO_PKG_VERSION");
     let pid = std::process::id();
     let banner = format!(
@@ -2097,7 +2306,7 @@ fn push_mock_server_log(
     message: String,
     is_error: bool,
 ) {
-    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
     let _ = log_tx.send(crate::server::ServerLogEvent {
         timestamp,
         message,
@@ -2542,7 +2751,7 @@ mod tests {
         let today_formatted = format_completed_timestamp(now);
         assert_eq!(today_formatted, now.format("%H:%M:%S").to_string());
 
-        let yesterday = now - chrono::Duration::days(1);
+        let yesterday = now.sub_seconds(86_400);
         let yesterday_formatted = format_completed_timestamp(yesterday);
         assert_eq!(
             yesterday_formatted,

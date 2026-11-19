@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `write_server_response_frame` payload guard so oversized directory responses return a clean `ServerCommandResponse::Error` instead of dropping the TLS connection.
 - Used `saturating_add` for folder manifest byte totals and portable 64-bit chunk size clamping.
 - Fixed Windows 11 Task Manager process description encoding (`â€”` mojibake) in `assets/lanshare.rc` by replacing the UTF-8 em-dash with an ASCII hyphen and bumping `VERSIONINFO` to `1.1.2.0`.
+- Replaced the unmaintained `chrono` dependency (`RUSTSEC-2026-0543`) with a lightweight, thread-safe OS-native local date/time formatter (`libc::localtime_r` on Unix, `FileTimeToSystemTime` + `SystemTimeToTzSpecificLocalTime` on Windows) so `cargo audit` passes with zero warnings.
 
 ## [1.1.1] - 2026-11-17
 

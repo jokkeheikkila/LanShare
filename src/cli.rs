@@ -3,7 +3,7 @@ use crate::core::{
     default_mock_peers, dirs_fallback, estimate_folder_remaining_seconds,
     estimate_remaining_seconds, execute_queued_download, format_file_size, format_remaining_time,
     mock_directory_entries, mock_folder_total_bytes, read_secret_from_env, read_secret_from_stdin,
-    run_mock_server_downloads, sort_shared_paths, test_downloads_dir, validate_cli_secret,
+    run_mock_server_downloads, sort_shared_paths, test_downloads_dir, validate_cli_secret, Local,
     MockDownloadConfig, QueueItemStatus, QueuedDownloadItem,
 };
 use crate::protocol::{
@@ -11,7 +11,6 @@ use crate::protocol::{
 };
 use crate::security::{clean_display_path, ensure_safe_client_dir, validate_shared_path};
 use crate::server::{self, ServerLogEvent};
-use chrono::{Local, TimeZone};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};

@@ -6,7 +6,7 @@ use crate::core::{
     has_active_client_downloads as core_has_active_client_downloads, mock_directory_entries,
     mock_folder_total_bytes, open_url, parse_host_and_port, queue_status_sort_rank,
     resolve_remote_folder_total_bytes, sort_peers_alphabetically, sort_shared_paths,
-    spawn_next_queued_download, test_downloads_dir, ClientActionResult, EtaStabilizer,
+    spawn_next_queued_download, test_downloads_dir, ClientActionResult, EtaStabilizer, Local,
     QueueEtaSummary, QueueItemStatus, QueuedDownloadItem, SharedPathSizeResolver,
     SharedPathSizeStatus, UploadEtaTracker, GITHUB_RELEASES_URL, GITHUB_REPO_URL,
 };
@@ -19,7 +19,6 @@ use crate::security::{
 };
 use crate::server::{self, ServerHandle, ServerLogEvent};
 use arboard::Clipboard;
-use chrono::{Local, TimeZone};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -5826,7 +5825,7 @@ mod tests {
         assert!(text.contains("ETA: 10s"));
         assert!(text.contains("ETA: 1m"));
         assert!(text.contains("took 45s"));
-        let now_h = chrono::Local::now().format("%H:").to_string();
+        let now_h = Local::now().format("%H:");
         assert!(
             text.contains(&now_h),
             "Done item in TUI must contain finished timestamp"
