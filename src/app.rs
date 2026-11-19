@@ -998,13 +998,13 @@ impl LanShareApp {
                     }
                     self.client_error = Some(err);
                 }
-                ClientActionResult::ListingLoaded(stream, loaded_path, entries) => {
+                ClientActionResult::ListingLoaded(stream, loaded_path, entries, notice) => {
                     self.set_client_loading(false);
                     self.client_connection_lost = false;
                     self.client_stream = Some(stream);
                     self.client_current_path = loaded_path;
                     self.client_file_list = entries;
-                    self.client_error = None;
+                    self.client_error = notice;
                 }
                 ClientActionResult::ListingFailed(stream, err) => {
                     self.set_client_loading(false);
@@ -3951,11 +3951,19 @@ impl LanShareApp {
                                         if files.is_empty() {
                                             ui.horizontal(|ui| {
                                                 ui.add_space(8.0);
-                                                ui.label(
-                                                    RichText::new("(Folder is empty)")
-                                                        .italics()
-                                                        .color(p.text_muted),
-                                                );
+                                                if let Some(ref err) = self.client_error {
+                                                    ui.label(
+                                                        RichText::new(err)
+                                                            .italics()
+                                                            .color(p.accent_amber),
+                                                    );
+                                                } else {
+                                                    ui.label(
+                                                        RichText::new("(Folder is empty)")
+                                                            .italics()
+                                                            .color(p.text_muted),
+                                                    );
+                                                }
                                             });
                                             ui.label("");
                                             ui.label("");
@@ -4298,6 +4306,22 @@ impl LanShareApp {
                                                     },
                                                 );
                                                 ui.end_row();
+                                            }
+                                            if let Some(ref err) = self.client_error {
+                                                if err.starts_with("Too many ") {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_space(8.0);
+                                                        ui.label(
+                                                            RichText::new(err)
+                                                                .italics()
+                                                                .color(p.accent_amber),
+                                                        );
+                                                    });
+                                                    ui.label("");
+                                                    ui.label("");
+                                                    ui.label("");
+                                                    ui.end_row();
+                                                }
                                             }
                                         }
                                     });
@@ -5637,12 +5661,18 @@ impl LanShareApp {
             self.set_client_loading(true);
 
             self.tokio_rt.spawn(async move {
-                match client::request_directory_listing_checked(&mut stream, &target_path).await {
-                    Ok(entries) => {
+                match client::request_directory_listing_with_notice_checked(
+                    &mut stream,
+                    &target_path,
+                )
+                .await
+                {
+                    Ok((entries, notice)) => {
                         let _ = tx.send(ClientActionResult::ListingLoaded(
                             stream,
                             target_path,
                             entries,
+                            notice,
                         ));
                     }
                     Err(e) => {

@@ -562,10 +562,11 @@ pub struct DirectoryListingError {
 
 /// Queries the remote server for file/folder listing of a relative subpath,
 /// enforcing a timeout and distinguishing transport/connection failures from server errors.
-pub async fn request_directory_listing_checked(
+/// Returns `(entries, optional_notice)`.
+pub async fn request_directory_listing_with_notice_checked(
     stream: &mut ClientTlsStream,
     subpath: &str,
-) -> Result<Vec<FileEntry>, DirectoryListingError> {
+) -> Result<(Vec<FileEntry>, Option<String>), DirectoryListingError> {
     const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let cmd = ClientCommand::ListDirectory {
         subpath: subpath.to_string(),
@@ -614,7 +615,9 @@ pub async fn request_directory_listing_checked(
         })?;
 
     match resp {
-        ServerCommandResponse::DirectoryListing { entries, .. } => Ok(entries),
+        ServerCommandResponse::DirectoryListing {
+            entries, notice, ..
+        } => Ok((entries, notice)),
         ServerCommandResponse::Error { message } => Err(DirectoryListingError {
             message,
             connection_lost: false,
@@ -624,6 +627,17 @@ pub async fn request_directory_listing_checked(
             connection_lost: false,
         }),
     }
+}
+
+/// Queries the remote server for file/folder listing of a relative subpath,
+/// enforcing a timeout and distinguishing transport/connection failures from server errors.
+pub async fn request_directory_listing_checked(
+    stream: &mut ClientTlsStream,
+    subpath: &str,
+) -> Result<Vec<FileEntry>, DirectoryListingError> {
+    request_directory_listing_with_notice_checked(stream, subpath)
+        .await
+        .map(|(entries, _)| entries)
 }
 
 /// Queries the remote server for file/folder listing of a relative subpath.
@@ -1044,54 +1058,80 @@ pub async fn download_folder_recursively_with_policy(
             }
         }
 
-        let resp_bytes =
-            match read_frame_with_cancel_timeout(stream, policy.io_timeout, &mut cancel_rx).await {
-                Ok(b) => b,
-                Err(TransferError::Fatal(msg)) => return Err(msg),
-                Err(TransferError::Recoverable(reason)) => {
-                    if let Some(ctx) = conn_ctx.as_deref_mut() {
-                        if let Some(max) = policy.max_attempts {
-                            if reconnect_attempt >= max {
-                                return Err(reason);
-                            }
-                            reconnect_attempt += 1;
-                        }
-                        let (new_stream, _) = connect_with_wait(
-                            ctx,
-                            policy,
-                            progress_tx.as_ref(),
-                            ReconnectProgressContext {
-                                selected_target: &fallback_label,
-                                bytes_done: 0,
-                                bytes_total: 0,
-                                file_index: 0,
-                                total_files: 0,
-                                after_drop: true,
-                            },
-                            &mut cancel_rx,
-                        )
-                        .await?;
-                        *stream = new_stream;
-                        continue;
+        let mut all_files = Vec::new();
+        let mut final_root_name = String::new();
+        let mut chunk_read_failed = None;
+
+        loop {
+            let resp_bytes =
+                match read_frame_with_cancel_timeout(stream, policy.io_timeout, &mut cancel_rx)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(TransferError::Fatal(msg)) => return Err(msg),
+                    Err(TransferError::Recoverable(reason)) => {
+                        chunk_read_failed = Some(reason);
+                        break;
                     }
-                    return Err(reason);
+                };
+
+            let resp: ServerCommandResponse =
+                serde_json::from_slice(&resp_bytes).map_err(|e| e.to_string())?;
+
+            match resp {
+                ServerCommandResponse::DirectoryManifest {
+                    root_folder_name,
+                    mut files,
+                    has_more,
+                } => {
+                    if final_root_name.is_empty() {
+                        final_root_name = root_folder_name;
+                    }
+                    all_files.append(&mut files);
+                    if !has_more {
+                        break;
+                    }
                 }
-            };
-
-        let resp: ServerCommandResponse =
-            serde_json::from_slice(&resp_bytes).map_err(|e| e.to_string())?;
-
-        match resp {
-            ServerCommandResponse::DirectoryManifest {
-                root_folder_name,
-                files,
-            } => break (root_folder_name, files),
-            ServerCommandResponse::Error { message } => return Err(message),
-            _ => return Err("Unexpected server response".to_string()),
+                ServerCommandResponse::Error { message } => return Err(message),
+                _ => return Err("Unexpected server response".to_string()),
+            }
         }
+
+        if let Some(reason) = chunk_read_failed {
+            if let Some(ctx) = conn_ctx.as_deref_mut() {
+                if let Some(max) = policy.max_attempts {
+                    if reconnect_attempt >= max {
+                        return Err(reason);
+                    }
+                    reconnect_attempt += 1;
+                }
+                let (new_stream, _) = connect_with_wait(
+                    ctx,
+                    policy,
+                    progress_tx.as_ref(),
+                    ReconnectProgressContext {
+                        selected_target: &fallback_label,
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        file_index: 0,
+                        total_files: 0,
+                        after_drop: true,
+                    },
+                    &mut cancel_rx,
+                )
+                .await?;
+                *stream = new_stream;
+                continue;
+            }
+            return Err(reason);
+        }
+
+        break (final_root_name, all_files);
     };
 
-    let folder_total_bytes: u64 = files.iter().map(|f| f.file_size).sum();
+    let folder_total_bytes: u64 = files
+        .iter()
+        .fold(0u64, |acc, f| acc.saturating_add(f.file_size));
     let target_base_dir = sanitize_client_relative_path(local_dest_root, &root_name)?;
     ensure_safe_client_dir(&target_base_dir)?;
     let folder_label = root_name.clone();
@@ -1139,7 +1179,9 @@ pub async fn download_folder_recursively_with_policy(
         )
         .await?;
 
-        tracker.completed_bytes_before_file += manifest_entry.file_size;
+        tracker.completed_bytes_before_file = tracker
+            .completed_bytes_before_file
+            .saturating_add(manifest_entry.file_size);
     }
 
     if let Some(ref tx) = progress_tx {
@@ -1377,8 +1419,9 @@ pub async fn download_single_file_with_policy(
         // File is already fully present on client!
         if remaining_size == 0 {
             if let Some(ref tx) = progress_tx {
+                let is_folder_batch = folder_tracker.is_some();
                 let (bytes_done, bytes_total, speed) = if let Some(ref tr) = folder_tracker {
-                    let done = tr.completed_bytes_before_file + total_size;
+                    let done = tr.completed_bytes_before_file.saturating_add(total_size);
                     let tot = if tr.total_bytes > 0 {
                         tr.total_bytes
                     } else {
@@ -1393,20 +1436,26 @@ pub async fn download_single_file_with_policy(
                 } else {
                     (total_size, total_size, 0.0)
                 };
-                let _ = tx.send(TransferProgress {
-                    selected_target: selected_target.to_string(),
-                    file_name: format!("{} (already complete)", file_name),
-                    bytes_done,
-                    bytes_total,
-                    speed_mbps: speed,
-                    is_finished: file_index >= total_files,
-                    current_file: file_index,
-                    total_files,
-                    log_message: Some(format!(
-                        "Skipped '{}' (already exists on client with full size)",
-                        file_name
-                    )),
-                });
+                if !is_folder_batch || file_index >= total_files {
+                    let _ = tx.send(TransferProgress {
+                        selected_target: selected_target.to_string(),
+                        file_name: format!("{} (already complete)", file_name),
+                        bytes_done,
+                        bytes_total,
+                        speed_mbps: speed,
+                        is_finished: file_index >= total_files,
+                        current_file: file_index,
+                        total_files,
+                        log_message: if is_folder_batch {
+                            None
+                        } else {
+                            Some(format!(
+                                "Skipped '{}' (already exists on client with full size)",
+                                file_name
+                            ))
+                        },
+                    });
+                }
             }
             return Ok(());
         }
@@ -1460,7 +1509,7 @@ pub async fn download_single_file_with_policy(
                 let _ = stream.shutdown().await;
                 return Err("Transfer cancelled by user.".to_string());
             }
-            let to_read = std::cmp::min(remaining as usize, buffer.len());
+            let to_read = remaining.min(buffer.len() as u64) as usize;
             let read_res = tokio::select! {
                 _ = cancel_rx.changed() => {
                     let _ = stream.shutdown().await;
@@ -1487,7 +1536,9 @@ pub async fn download_single_file_with_policy(
 
                         // Recalculate throughput at a slower, stabilized frequency (~1000ms) with smoothing
                         if let Some(ref mut tr) = folder_tracker {
-                            let cur_total_done = tr.completed_bytes_before_file + current_file_done;
+                            let cur_total_done = tr
+                                .completed_bytes_before_file
+                                .saturating_add(current_file_done);
                             let elapsed = tr.last_speed_instant.elapsed();
                             if elapsed >= Duration::from_millis(1000)
                                 || (remaining == 0 && file_index == total_files)
@@ -1531,7 +1582,9 @@ pub async fn download_single_file_with_policy(
                             last_progress_emit = Instant::now();
                             let (rep_done, rep_total, rep_speed) =
                                 if let Some(ref tr) = folder_tracker {
-                                    let done = tr.completed_bytes_before_file + current_file_done;
+                                    let done = tr
+                                        .completed_bytes_before_file
+                                        .saturating_add(current_file_done);
                                     let tot = if tr.total_bytes > 0 {
                                         tr.total_bytes
                                     } else {
@@ -1593,8 +1646,9 @@ pub async fn download_single_file_with_policy(
 
         if !stream_interrupted && remaining == 0 {
             if let Some(ref tx) = progress_tx {
+                let is_folder_batch = folder_tracker.is_some();
                 let (rep_done, rep_total, rep_speed) = if let Some(ref tr) = folder_tracker {
-                    let done = tr.completed_bytes_before_file + total_size;
+                    let done = tr.completed_bytes_before_file.saturating_add(total_size);
                     let tot = if tr.total_bytes > 0 {
                         tr.total_bytes
                     } else {
@@ -1619,11 +1673,15 @@ pub async fn download_single_file_with_policy(
                     is_finished: file_index >= total_files,
                     current_file: file_index,
                     total_files,
-                    log_message: Some(format!(
-                        "Downloaded '{}' ({})",
-                        file_name,
-                        crate::core::format_file_size(total_size)
-                    )),
+                    log_message: if is_folder_batch {
+                        None
+                    } else {
+                        Some(format!(
+                            "Downloaded '{}' ({})",
+                            file_name,
+                            crate::core::format_file_size(total_size)
+                        ))
+                    },
                 });
             }
             return Ok(());

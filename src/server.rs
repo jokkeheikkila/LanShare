@@ -1,7 +1,7 @@
 use crate::core::{format_file_size, sort_shared_paths};
 use crate::network::{
     compute_tls_server_auth_token, generate_ephemeral_tls, get_computer_name,
-    make_server_tls_config, read_frame, verify_tls_auth_token, write_frame,
+    make_server_tls_config, read_frame, verify_tls_auth_token, write_frame, MAX_FRAME_SIZE,
 };
 use crate::protocol::*;
 use crate::security::*;
@@ -20,9 +20,34 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use walkdir::WalkDir;
 
-pub const MAX_MANIFEST_FILES: usize = 50_000;
+pub const MAX_CONCURRENT_CLIENTS: usize = 64;
+pub const MAX_DIRECTORY_LISTING_ENTRIES: usize = 100_000;
+pub const MANIFEST_BATCH_FILES: usize = 25_000;
 pub const MAX_RATE_LIMIT_ENTRIES: usize = 1_024;
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn write_server_response_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    resp: &ServerCommandResponse,
+) -> std::io::Result<()> {
+    let payload = match serde_json::to_vec(resp) {
+        Ok(bytes) if bytes.len() <= MAX_FRAME_SIZE => bytes,
+        Ok(bytes) => {
+            let err_resp = ServerCommandResponse::Error {
+                message: format!(
+                    "Directory response payload ({} bytes) exceeds 16 MB protocol frame limit.",
+                    bytes.len()
+                ),
+            };
+            serde_json::to_vec(&err_resp)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        }
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+    };
+    write_frame(writer, &payload).await
+}
 
 fn rw_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|e| e.into_inner())
@@ -359,8 +384,8 @@ pub async fn start_server(
     let password_arc = Arc::new(password.clone());
     let is_running_clone = is_running.clone();
 
-    // Concurrency limiter (max 16 simultaneous client connections)
-    let conn_limiter = Arc::new(Semaphore::new(16));
+    // Concurrency limiter (max 64 simultaneous client connections)
+    let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
 
     // Shutdown broadcast to instantly terminate all active client tasks
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -666,8 +691,8 @@ pub async fn start_server(
                             Err(_) => {
                                 server_log(
                                     format!(
-                                        "Rejected {}: Maximum 16 concurrent clients reached.",
-                                        peer_addr
+                                        "Rejected {}: Maximum {} concurrent clients reached.",
+                                        peer_addr, MAX_CONCURRENT_CLIENTS
                                     ),
                                     true,
                                 );
@@ -861,10 +886,12 @@ async fn run_client_session(
     }
 
     // 2. Command Loop (Strictly Read-Only)
+    let peer_label = format!("{} ({})", peer_addr, client_name);
     let _ = handle_client_commands(
         &mut tls_stream,
         &registry,
         peer_addr,
+        &peer_label,
         &c_log,
         client_shutdown_rx,
         client_registry_rx,
@@ -874,7 +901,7 @@ async fn run_client_session(
     )
     .await;
 
-    c_log(format!("Peer disconnected: {}", peer_addr), false);
+    c_log(format!("Peer disconnected: {}", peer_label), false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -882,6 +909,7 @@ async fn handle_client_commands<S>(
     stream: &mut S,
     registry: &Arc<std::sync::RwLock<SharedFolderRegistry>>,
     peer_addr: SocketAddr,
+    peer_label: &str,
     log: &impl Fn(String, bool),
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut registry_rx: tokio::sync::watch::Receiver<u64>,
@@ -892,6 +920,7 @@ async fn handle_client_commands<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    let mut folder_manifest_active = false;
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -958,6 +987,7 @@ where
                     ServerCommandResponse::DirectoryListing {
                         current_path: String::new(),
                         entries,
+                        notice: None,
                     }
                 } else {
                     let safe_dir_res = {
@@ -969,13 +999,17 @@ where
                             message: "Selected share is a file, not a directory.".to_string(),
                         },
                         Ok(safe_dir) => {
-                            let mut entries = Vec::new();
+                            let mut dirs = Vec::new();
+                            let mut files = Vec::new();
+                            let mut too_many_dirs = false;
+                            let mut too_many_files = false;
                             if let Ok(read_dir) = fs::read_dir(&safe_dir) {
                                 for entry in read_dir.flatten() {
                                     if let Ok(meta) = fs::symlink_metadata(entry.path()) {
                                         if is_symlink_or_reparse(&meta) {
                                             continue;
                                         }
+                                        let is_dir = meta.is_dir();
                                         let modified_timestamp = meta
                                             .modified()
                                             .ok()
@@ -983,67 +1017,123 @@ where
                                             .map(|d| d.as_secs())
                                             .unwrap_or(0);
 
-                                        entries.push(FileEntry {
-                                            name: entry.file_name().to_string_lossy().to_string(),
-                                            is_dir: meta.is_dir(),
-                                            size: if meta.is_dir() { 0 } else { meta.len() },
-                                            modified_timestamp,
-                                        });
+                                        if is_dir {
+                                            if dirs.len() < MAX_DIRECTORY_LISTING_ENTRIES {
+                                                dirs.push(FileEntry {
+                                                    name: entry
+                                                        .file_name()
+                                                        .to_string_lossy()
+                                                        .to_string(),
+                                                    is_dir: true,
+                                                    size: 0,
+                                                    modified_timestamp,
+                                                });
+                                            } else {
+                                                too_many_dirs = true;
+                                                break;
+                                            }
+                                        } else if !too_many_files {
+                                            if files.len() < MAX_DIRECTORY_LISTING_ENTRIES {
+                                                files.push(FileEntry {
+                                                    name: entry
+                                                        .file_name()
+                                                        .to_string_lossy()
+                                                        .to_string(),
+                                                    is_dir: false,
+                                                    size: meta.len(),
+                                                    modified_timestamp,
+                                                });
+                                            } else {
+                                                too_many_files = true;
+                                                files.clear();
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            entries.sort_by(|a, b| {
-                                b.is_dir
-                                    .cmp(&a.is_dir)
-                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                            });
+                            if too_many_dirs {
+                                ServerCommandResponse::Error {
+                                    message: format!(
+                                        "Too many directories (> {} subdirectories) to display in browser. Go up one level and download the folder directly.",
+                                        MAX_DIRECTORY_LISTING_ENTRIES
+                                    ),
+                                }
+                            } else {
+                                let mut entries = dirs;
+                                if !too_many_files {
+                                    entries.extend(files);
+                                }
+                                entries.sort_by(|a, b| {
+                                    b.is_dir.cmp(&a.is_dir).then_with(|| {
+                                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                                    })
+                                });
 
-                            ServerCommandResponse::DirectoryListing {
-                                current_path: subpath,
-                                entries,
+                                let notice = if too_many_files {
+                                    Some(format!(
+                                        "Too many files in directory (> {} files) — showing subdirectories only. Go up one level to download this folder.",
+                                        MAX_DIRECTORY_LISTING_ENTRIES
+                                    ))
+                                } else {
+                                    None
+                                };
+
+                                ServerCommandResponse::DirectoryListing {
+                                    current_path: subpath,
+                                    entries,
+                                    notice,
+                                }
                             }
                         }
                         Err(e) => ServerCommandResponse::Error { message: e },
                     }
                 };
-                write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                write_server_response_frame(stream, &resp).await?;
             }
             ClientCommand::GetDirectoryManifest { subpath } => {
                 let clean_sub = subpath.trim_matches('/').replace('\\', "/");
-                let resp = if clean_sub.is_empty() {
-                    let mut files = Vec::new();
-                    {
-                        let reg = rw_read(registry);
-                        for (alias, folder_path) in &reg.folders {
-                            for entry in WalkDir::new(folder_path)
-                                .follow_links(false)
-                                .into_iter()
-                                .filter_entry(|e| {
-                                    fs::symlink_metadata(e.path())
-                                        .map(|m| !is_symlink_or_reparse(&m))
-                                        .unwrap_or(false)
-                                })
-                                .filter_map(|e| e.ok())
-                            {
-                                if files.len() >= MAX_MANIFEST_FILES {
-                                    break;
+                if clean_sub.is_empty() {
+                    let folders_snapshot = rw_read(registry).folders.clone();
+                    let mut batch = Vec::with_capacity(MANIFEST_BATCH_FILES.min(1024));
+                    let mut total_manifest_files = 0usize;
+
+                    for (alias, folder_path) in &folders_snapshot {
+                        for entry in WalkDir::new(folder_path)
+                            .follow_links(false)
+                            .into_iter()
+                            .filter_entry(|e| {
+                                fs::symlink_metadata(e.path())
+                                    .map(|m| !is_symlink_or_reparse(&m))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|e| e.ok())
+                        {
+                            if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                                if is_symlink_or_reparse(&meta) {
+                                    continue;
                                 }
-                                if let Ok(meta) = fs::symlink_metadata(entry.path()) {
-                                    if is_symlink_or_reparse(&meta) {
-                                        continue;
-                                    }
-                                    if meta.is_file() {
-                                        if let Ok(rel) = entry.path().strip_prefix(folder_path) {
-                                            let rel_str = rel.to_string_lossy().replace('\\', "/");
-                                            let full_rel = if rel_str.is_empty() {
-                                                alias.clone()
-                                            } else {
-                                                format!("{}/{}", alias, rel_str)
-                                            };
-                                            files.push(ManifestFileEntry {
-                                                relative_path: full_rel,
-                                                file_size: meta.len(),
-                                            });
+                                if meta.is_file() {
+                                    if let Ok(rel) = entry.path().strip_prefix(folder_path) {
+                                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                                        let full_rel = if rel_str.is_empty() {
+                                            alias.clone()
+                                        } else {
+                                            format!("{}/{}", alias, rel_str)
+                                        };
+                                        batch.push(ManifestFileEntry {
+                                            relative_path: full_rel,
+                                            file_size: meta.len(),
+                                        });
+                                        total_manifest_files += 1;
+                                        if batch.len() >= MANIFEST_BATCH_FILES {
+                                            let chunk_resp =
+                                                ServerCommandResponse::DirectoryManifest {
+                                                    root_folder_name: "Shared_Folders".to_string(),
+                                                    files: std::mem::take(&mut batch),
+                                                    has_more: true,
+                                                };
+                                            write_server_response_frame(stream, &chunk_resp)
+                                                .await?;
                                         }
                                     }
                                 }
@@ -1051,26 +1141,43 @@ where
                         }
                     }
 
-                    ServerCommandResponse::DirectoryManifest {
+                    folder_manifest_active = true;
+                    log(
+                        format!(
+                            "{} started downloading all shared folders ({} files)",
+                            peer_label, total_manifest_files
+                        ),
+                        false,
+                    );
+
+                    let final_resp = ServerCommandResponse::DirectoryManifest {
                         root_folder_name: "Shared_Folders".to_string(),
-                        files,
-                    }
+                        files: batch,
+                        has_more: false,
+                    };
+                    write_server_response_frame(stream, &final_resp).await?;
                 } else {
                     let folder_res = {
                         let reg = rw_read(registry);
                         reg.resolve_path(&subpath)
                     };
                     match folder_res {
-                        Ok(folder_path) if !folder_path.is_dir() => ServerCommandResponse::Error {
-                            message: "Selected share is a file; download it directly.".to_string(),
-                        },
+                        Ok(folder_path) if !folder_path.is_dir() => {
+                            let resp = ServerCommandResponse::Error {
+                                message: "Selected share is a file; download it directly."
+                                    .to_string(),
+                            };
+                            write_server_response_frame(stream, &resp).await?;
+                        }
                         Ok(folder_path) => {
                             let folder_name = folder_path
                                 .file_name()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "folder".to_string());
 
-                            let mut files = Vec::new();
+                            let mut batch = Vec::with_capacity(MANIFEST_BATCH_FILES.min(1024));
+                            let mut total_manifest_files = 0usize;
+                            let mut total_manifest_bytes = 0u64;
                             for entry in WalkDir::new(&folder_path)
                                 .follow_links(false)
                                 .into_iter()
@@ -1081,35 +1188,61 @@ where
                                 })
                                 .filter_map(|e| e.ok())
                             {
-                                if files.len() >= MAX_MANIFEST_FILES {
-                                    break;
-                                }
                                 if let Ok(meta) = fs::symlink_metadata(entry.path()) {
                                     if is_symlink_or_reparse(&meta) {
                                         continue;
                                     }
                                     if meta.is_file() {
                                         if let Ok(rel) = entry.path().strip_prefix(&folder_path) {
-                                            files.push(ManifestFileEntry {
+                                            let sz = meta.len();
+                                            total_manifest_bytes =
+                                                total_manifest_bytes.saturating_add(sz);
+                                            batch.push(ManifestFileEntry {
                                                 relative_path: rel
                                                     .to_string_lossy()
                                                     .replace('\\', "/"),
-                                                file_size: meta.len(),
+                                                file_size: sz,
                                             });
+                                            total_manifest_files += 1;
+                                            if batch.len() >= MANIFEST_BATCH_FILES {
+                                                let chunk_resp =
+                                                    ServerCommandResponse::DirectoryManifest {
+                                                        root_folder_name: folder_name.clone(),
+                                                        files: std::mem::take(&mut batch),
+                                                        has_more: true,
+                                                    };
+                                                write_server_response_frame(stream, &chunk_resp)
+                                                    .await?;
+                                            }
                                         }
                                     }
                                 }
                             }
+                            folder_manifest_active = true;
+                            log(
+                                format!(
+                                    "{} started downloading folder '{}' ({} files, {})",
+                                    peer_label,
+                                    folder_name,
+                                    total_manifest_files,
+                                    format_file_size(total_manifest_bytes)
+                                ),
+                                false,
+                            );
 
-                            ServerCommandResponse::DirectoryManifest {
+                            let final_resp = ServerCommandResponse::DirectoryManifest {
                                 root_folder_name: folder_name,
-                                files,
-                            }
+                                files: batch,
+                                has_more: false,
+                            };
+                            write_server_response_frame(stream, &final_resp).await?;
                         }
-                        Err(e) => ServerCommandResponse::Error { message: e },
+                        Err(e) => {
+                            let resp = ServerCommandResponse::Error { message: e };
+                            write_server_response_frame(stream, &resp).await?;
+                        }
                     }
-                };
-                write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                }
             }
             ClientCommand::DownloadFile {
                 subpath,
@@ -1127,7 +1260,7 @@ where
                                 let resp = ServerCommandResponse::Error {
                                     message: e.to_string(),
                                 };
-                                write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                                write_server_response_frame(stream, &resp).await?;
                                 continue;
                             }
                         };
@@ -1135,7 +1268,7 @@ where
                             let resp = ServerCommandResponse::Error {
                                 message: "Path is not a safe regular file.".to_string(),
                             };
-                            write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                            write_server_response_frame(stream, &resp).await?;
                             continue;
                         }
 
@@ -1150,7 +1283,7 @@ where
                                 let resp = ServerCommandResponse::Error {
                                     message: e.to_string(),
                                 };
-                                write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                                write_server_response_frame(stream, &resp).await?;
                                 continue;
                             }
                         };
@@ -1172,10 +1305,9 @@ where
                             start_offset,
                             has_digest_trailer,
                         };
-                        write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                        write_server_response_frame(stream, &resp).await?;
 
                         if remaining_size == 0 {
-                            log(format!("{} already has '{}' on disk with matching file size (skipped re-download)", peer_addr, file_name), false);
                             continue;
                         }
 
@@ -1194,18 +1326,18 @@ where
                             log(
                                 format!(
                                     "{} resuming '{}' from {} / {}",
-                                    peer_addr,
+                                    peer_label,
                                     file_name,
                                     format_file_size(start_offset),
                                     format_file_size(total_size)
                                 ),
                                 false,
                             );
-                        } else {
+                        } else if !folder_manifest_active {
                             log(
                                 format!(
                                     "{} started downloading '{}' ({})",
-                                    peer_addr,
+                                    peer_label,
                                     file_name,
                                     format_file_size(total_size)
                                 ),
@@ -1248,7 +1380,7 @@ where
                                 let _ = stream.shutdown().await;
                                 return Ok(());
                             }
-                            let to_read = std::cmp::min(remaining as usize, buffer.len());
+                            let to_read = remaining.min(buffer.len() as u64) as usize;
                             let n = file.read(&mut buffer[..to_read]).await?;
                             if n == 0 {
                                 log(
@@ -1383,19 +1515,21 @@ where
                             }
                         }
                         stream.flush().await?;
-                        log(
-                            format!(
-                                "{} finished downloading '{}' ({})",
-                                peer_addr,
-                                file_name,
-                                format_file_size(total_size)
-                            ),
-                            false,
-                        );
+                        if !folder_manifest_active {
+                            log(
+                                format!(
+                                    "{} finished downloading '{}' ({})",
+                                    peer_label,
+                                    file_name,
+                                    format_file_size(total_size)
+                                ),
+                                false,
+                            );
+                        }
                     }
                     Err(e) => {
                         let resp = ServerCommandResponse::Error { message: e };
-                        write_frame(stream, &serde_json::to_vec(&resp)?).await?;
+                        write_server_response_frame(stream, &resp).await?;
                     }
                 }
             }
@@ -1580,6 +1714,7 @@ mod tests {
                 &mut server_stream_a,
                 &reg_a,
                 peer_addr,
+                "127.0.0.1:45000 (TestPeer)",
                 &noop,
                 s_rx_a,
                 r_rx_a,
@@ -1645,6 +1780,7 @@ mod tests {
                 &mut server_stream_b,
                 &reg_b,
                 peer_addr,
+                "127.0.0.1:45000 (TestPeer)",
                 &noop,
                 s_rx_b,
                 r_rx_b,
@@ -1710,5 +1846,39 @@ mod tests {
         .to_string();
         assert!(err.contains("10"));
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_server_response_frame_converts_oversized_payload_to_error() {
+        let (mut server_side, mut client_side) = tokio::io::duplex(256 * 1024);
+        let huge_entries: Vec<FileEntry> = (0..MAX_DIRECTORY_LISTING_ENTRIES)
+            .map(|i| FileEntry {
+                name: format!("{:0>400}_{}", i, "x"),
+                is_dir: false,
+                size: 10,
+                modified_timestamp: 0,
+            })
+            .collect();
+        let oversized_resp = ServerCommandResponse::DirectoryListing {
+            current_path: "big".to_string(),
+            entries: huge_entries,
+            notice: None,
+        };
+
+        let send_task = tokio::spawn(async move {
+            write_server_response_frame(&mut server_side, &oversized_resp)
+                .await
+                .unwrap();
+        });
+
+        let raw = read_frame(&mut client_side).await.unwrap();
+        send_task.await.unwrap();
+        let decoded: ServerCommandResponse = serde_json::from_slice(&raw).unwrap();
+        match decoded {
+            ServerCommandResponse::Error { message } => {
+                assert!(message.contains("exceeds 16 MB protocol frame limit"));
+            }
+            other => panic!("Expected ServerCommandResponse::Error, got {:?}", other),
+        }
     }
 }

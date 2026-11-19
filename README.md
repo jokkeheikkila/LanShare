@@ -15,6 +15,7 @@ Built in **Rust** from a single shared core powering both a lightweight native G
 - [Usage](#usage)
   - [GUI (`lanshare-gui`)](#gui-lanshare-gui)
   - [Terminal UI (TUI) & Direct CLI (`lanshare-cli`)](#terminal-ui-tui--direct-cli-lanshare-cli)
+  - [Downloading Multiple Files Simultaneously](#downloading-multiple-files-simultaneously)
   - [Connecting Across Tailscale (Remote Peers)](#connecting-across-tailscale-remote-peers)
 - [Security & How It Works](#security--how-it-works)
 - [Building from Source](#building-from-source)
@@ -185,6 +186,22 @@ GENERAL & TUI OPTIONS:
 
 </details>
 
+### Downloading Multiple Files Simultaneously
+
+A single LanShare client instance processes its download queue **one active transfer at a time** (sequentially), while a LanShare host supports up to **64 simultaneous peer connections** and displays all concurrent active uploads live.
+
+If you want to download multiple files or folders in parallel at the same time (or connect to multiple hosts concurrently), simply **open multiple LanShare instances**:
+
+* **GUI (`lanshare-gui`)**: Launch two or more `lanshare-gui` windows side by side, enter the same Share-Ring secret, and start a download in each window.
+* **TUI / Direct CLI (`lanshare-cli`)**: Open multiple terminal tabs/windows and run `lanshare-cli` (or separate `lanshare-cli download ...` commands) in parallel:
+  ```bash
+  # Terminal 1
+  ./lanshare-cli download --peer Gaming-PC -d ~/Downloads Huge_File_1.iso
+
+  # Terminal 2 (runs simultaneously)
+  ./lanshare-cli download --peer Gaming-PC -d ~/Downloads Huge_File_2.iso
+  ```
+
 ### Connecting Across Tailscale (Remote Peers)
 
 1. Enter the **exact same Share-Ring secret** on both machines.
@@ -212,7 +229,7 @@ LanShare is designed to stay simple to run while keeping both host and downloade
 * **Zero-Plaintext Secret Authentication**: Your Share-Ring secret (minimum 10 characters) never crosses the network. Keys are derived with **PBKDF2-HMAC-SHA256** (`100,000` rounds), and every connection uses an in-memory ephemeral **TLS 1.3 / 1.2** session (`rustls` + `ring`) with mutual channel-bound verification.
 * **Resumable & Verified Transfers**: Files stream in 64 KB chunks over TLS with strict byte-offset resume and end-of-stream **SHA-256** checksum verification.
 * **Path & Symlink Protection**: Hosts cannot accidentally share filesystem roots, OS folders, or home directories, and both host and client block `..` traversal, Windows reserved device names, and symlink/junction escapes.
-* **Private Networks Only**: Connections are restricted to private LAN, loopback/link-local, and WireGuard/Tailscale (`100.64.0.0/10`, `fc00::/7`) ranges—no UPnP, NAT-PMP, or cloud relays. Repeated failed logins are automatically rate-limited.
+* **Private Networks Only**: Connections are restricted to private LAN, loopback/link-local, and WireGuard/Tailscale (`100.64.0.0/10`, `fc00::/7`) ranges—no UPnP, NAT-PMP, or cloud relays. Repeated failed logins are automatically rate-limited, and the server caps concurrent connections at 64 clients.
 * **Zero-Config Firewall Traversal**: Uses lightweight LAN discovery on **UDP `22223`** and encrypted transfers on **TCP `22222`** (with automatic free-port fallback and outbound reverse-TCP callbacks so desktop firewalls work without root/admin rights).
 
 For technical security details, automation flags (`--secret-env`, `--secret-stdin`), and vulnerability reporting, see [SECURITY.md](SECURITY.md).

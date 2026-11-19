@@ -1,6 +1,6 @@
 [package]
 name = "lanshare"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 authors = ["Jokke Heikkilä"]
 description = "Zero-config LAN folder sharing GUI and TUI powered by Share-Ring"

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-19
+
+### Added
+- Multi-frame `GetDirectoryManifest` streaming (`MANIFEST_BATCH_FILES = 25,000` with `has_more` continuation) so folders with unlimited numbers of files can be downloaded without hitting the 16 MB frame limit or 50,000-file truncation.
+- Live single-line in-place CLI progress bar (`\r\x1b[2K`) for `lanshare-cli download` and `lanshare-cli host` showing percentage gauge, transferred/total bytes, speed, item ETA, cumulative `Total ETA`, and folder file counter, dynamically truncated to terminal width to prevent multi-line wrapping.
+- Added documentation in `README.md` on downloading multiple files simultaneously by running multiple `lanshare-gui` or `lanshare-cli` instances.
+
+### Changed
+- Raised maximum concurrent server client connections (`MAX_CONCURRENT_CLIENTS`) from `16` to `64`.
+- Directory browsing (`ListDirectory`) now separates subdirectories from files when a folder contains over `100,000` files—keeping all subdirectories navigable in GUI and TUI while displaying an inline notice to download the folder from the parent level (and returning a clear error if a folder exceeds `100,000` subdirectories).
+- Removed per-file log spam during multi-file folder transfers on both server and client, logging once when a folder download begins (including peer name, file count, and total size) and once when standalone files start/finish.
+- Capped background shared folder size walks (`MAX_SHARED_SIZE_WALK_ENTRIES = 100,000`) and active session disk log files (`MAX_SESSION_LOG_BYTES = 10 MB`).
+
+### Fixed
+- Added `write_server_response_frame` payload guard so oversized directory responses return a clean `ServerCommandResponse::Error` instead of dropping the TLS connection.
+- Used `saturating_add` for folder manifest byte totals and portable 64-bit chunk size clamping.
+- Fixed Windows 11 Task Manager process description encoding (`â€”` mojibake) in `assets/lanshare.rc` by replacing the UTF-8 em-dash with an ASCII hyphen and bumping `VERSIONINFO` to `1.1.2.0`.
+
 ## [1.1.1] - 2026-11-17
 
 ### Changed
@@ -59,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direct IP Connect support for Tailscale (`100.64.0.0/10`) and private LAN/ULA subnets, plus offline `--test` simulated multi-peer mode.
 - Read-only path validation, symlink/`O_NOFOLLOW` protection, `--secret-env` / `--secret-stdin` secret loading, and bounded OS-standard log rotation.
 
-[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jokkeheikkila/LanShare/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jokkeheikkila/LanShare/releases/tag/v1.0.0

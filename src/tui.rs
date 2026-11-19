@@ -1064,7 +1064,7 @@ impl LanShareTui {
                     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     self.push_client_log(format!("[{}] Connection failed: {}", ts, err));
                 }
-                ClientActionResult::ListingLoaded(stream, loaded_path, entries) => {
+                ClientActionResult::ListingLoaded(stream, loaded_path, entries, notice) => {
                     self.set_client_loading(false);
                     self.client_connection_lost = false;
                     self.client_stream = Some(stream);
@@ -1077,7 +1077,7 @@ impl LanShareTui {
                     } else if self.selected_file_idx >= self.client_file_list.len() {
                         self.selected_file_idx = self.client_file_list.len().saturating_sub(1);
                     }
-                    self.client_error = None;
+                    self.client_error = notice;
                 }
                 ClientActionResult::ListingFailed(stream, err) => {
                     self.set_client_loading(false);
@@ -1304,12 +1304,18 @@ impl LanShareTui {
             self.set_client_loading(true);
 
             self.tokio_rt.spawn(async move {
-                match client::request_directory_listing_checked(&mut stream, &target_path).await {
-                    Ok(entries) => {
+                match client::request_directory_listing_with_notice_checked(
+                    &mut stream,
+                    &target_path,
+                )
+                .await
+                {
+                    Ok((entries, notice)) => {
                         let _ = tx.send(ClientActionResult::ListingLoaded(
                             stream,
                             target_path,
                             entries,
+                            notice,
                         ));
                     }
                     Err(e) => {
@@ -3053,12 +3059,17 @@ impl LanShareTui {
                         );
                     }
                 } else if self.client_file_list.is_empty() {
+                    let (empty_msg, empty_fg) = if let Some(ref err) = self.client_error {
+                        (err.as_str(), Color::Yellow)
+                    } else {
+                        ("(This folder is empty)", Color::DarkGray)
+                    };
                     buf.draw_text(
                         x + 2,
                         list_start_y,
                         w.saturating_sub(4),
-                        "(This folder is empty)",
-                        Color::DarkGray,
+                        empty_msg,
+                        empty_fg,
                         Color::Reset,
                         false,
                     );
@@ -3138,6 +3149,25 @@ impl LanShareTui {
 
                         buf.fill_rect(x + 1, row_y, w.saturating_sub(2), 1, fg, bg);
                         buf.draw_text(x + 2, row_y, w.saturating_sub(4), &line, fg, bg, bold);
+                    }
+                    if let Some(ref err) = self.client_error {
+                        if err.starts_with("Too many ") {
+                            let notice_row = self
+                                .client_file_list
+                                .len()
+                                .saturating_sub(self.file_scroll_offset);
+                            if notice_row < visible_rows {
+                                buf.draw_text(
+                                    x + 2,
+                                    list_start_y + notice_row,
+                                    w.saturating_sub(4),
+                                    err,
+                                    Color::Yellow,
+                                    Color::Reset,
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
             }

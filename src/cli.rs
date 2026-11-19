@@ -1,11 +1,14 @@
 use crate::client::{self, ConnectionContext, TransferProgress};
 use crate::core::{
-    default_mock_peers, dirs_fallback, estimate_remaining_seconds, execute_queued_download,
-    format_file_size, format_remaining_time, mock_directory_entries, read_secret_from_env,
-    read_secret_from_stdin, run_mock_server_downloads, sort_shared_paths, test_downloads_dir,
-    validate_cli_secret, MockDownloadConfig, QueueItemStatus, QueuedDownloadItem,
+    default_mock_peers, dirs_fallback, estimate_folder_remaining_seconds,
+    estimate_remaining_seconds, execute_queued_download, format_file_size, format_remaining_time,
+    mock_directory_entries, mock_folder_total_bytes, read_secret_from_env, read_secret_from_stdin,
+    run_mock_server_downloads, sort_shared_paths, test_downloads_dir, validate_cli_secret,
+    MockDownloadConfig, QueueItemStatus, QueuedDownloadItem,
 };
-use crate::protocol::{FileEntry, DEFAULT_TCP_PORT, MIN_SECRET_LEN};
+use crate::protocol::{
+    ClientCommand, FileEntry, ServerCommandResponse, DEFAULT_TCP_PORT, MIN_SECRET_LEN,
+};
 use crate::security::{clean_display_path, ensure_safe_client_dir, validate_shared_path};
 use crate::server::{self, ServerLogEvent};
 use chrono::{Local, TimeZone};
@@ -15,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 static CLI_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -788,6 +792,45 @@ pub fn validate_cli_download_inputs(
     Ok((resolved_dest, validated_paths))
 }
 
+async fn query_folder_total_bytes_on_stream(
+    stream: &mut client::ClientTlsStream,
+    subpath: &str,
+) -> Option<u64> {
+    let cmd = ClientCommand::GetDirectoryManifest {
+        subpath: subpath.to_string(),
+    };
+    let cmd_bytes = serde_json::to_vec(&cmd).ok()?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::network::write_frame(stream, &cmd_bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut total_bytes = 0u64;
+    loop {
+        let resp_bytes =
+            tokio::time::timeout(Duration::from_secs(10), crate::network::read_frame(stream))
+                .await
+                .ok()?
+                .ok()?;
+        match serde_json::from_slice::<ServerCommandResponse>(&resp_bytes).ok()? {
+            ServerCommandResponse::DirectoryManifest {
+                files, has_more, ..
+            } => {
+                for f in files {
+                    total_bytes = total_bytes.saturating_add(f.file_size);
+                }
+                if !has_more {
+                    break;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(total_bytes)
+}
+
 /// Runs the `download` / `get` CLI command: resolves all requested remote files/folders on the peer,
 /// downloads them sequentially to `dest_dir` while printing live logs to `out`, and finishes.
 pub async fn run_cli_download<W: Write>(
@@ -817,7 +860,10 @@ pub async fn run_cli_download<W: Write>(
             );
             let mut items = Vec::with_capacity(validated_paths.len());
             for req_path in &validated_paths {
-                let (subpath, entry) = resolve_remote_entry_mock(&mock_ip, req_path)?;
+                let (subpath, mut entry) = resolve_remote_entry_mock(&mock_ip, req_path)?;
+                if entry.is_dir {
+                    entry.size = mock_folder_total_bytes(&mock_ip, &subpath);
+                }
                 items.push((subpath, entry));
             }
             let ctx = ConnectionContext::new(
@@ -846,7 +892,16 @@ pub async fn run_cli_download<W: Write>(
             let mut items = Vec::with_capacity(validated_paths.len());
             for req_path in &validated_paths {
                 match resolve_remote_entry_network(&mut stream, req_path).await {
-                    Ok(item) => items.push(item),
+                    Ok((subpath, mut entry)) => {
+                        if entry.is_dir {
+                            if let Some(folder_bytes) =
+                                query_folder_total_bytes_on_stream(&mut stream, &subpath).await
+                            {
+                                entry.size = folder_bytes;
+                            }
+                        }
+                        items.push((subpath, entry));
+                    }
                     Err(e) => {
                         let _ = stream.shutdown().await;
                         return Err(e);
@@ -866,21 +921,35 @@ pub async fn run_cli_download<W: Write>(
     };
 
     let total_items = resolved_items.len();
+    let item_sizes: Vec<u64> = resolved_items.iter().map(|(_, e)| e.size).collect();
+    let total_queue_bytes: u64 = item_sizes
+        .iter()
+        .fold(0u64, |acc, &sz| acc.saturating_add(sz));
+    let queue_size_note = if total_queue_bytes > 0 {
+        format!(" ({})", format_file_size(total_queue_bytes))
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "[{}] [Client] Saving {} item(s) to '{}'",
+        "[{}] [Client] Saving {} item(s){} to '{}'",
         now_ts(),
         total_items,
+        queue_size_note,
         clean_display_path(&resolved_dest)
     );
 
     for (idx, (remote_subpath, entry)) in resolved_items.into_iter().enumerate() {
         let item_num = idx + 1;
+        let pending_queue_bytes: u64 = item_sizes
+            .iter()
+            .skip(idx + 1)
+            .fold(0u64, |acc, &sz| acc.saturating_add(sz));
         let kind_label = if entry.is_dir { "folder" } else { "file" };
-        let size_note = if entry.is_dir {
-            String::new()
-        } else {
+        let size_note = if entry.size > 0 {
             format!(" ({})", format_file_size(entry.size))
+        } else {
+            String::new()
         };
         let _ = writeln!(
             out,
@@ -923,6 +992,7 @@ pub async fn run_cli_download<W: Write>(
             );
 
         let mut last_progress_print = Instant::now() - Duration::from_secs(2);
+        let mut status_active = false;
         let mut final_res: Option<Result<(), String>> = None;
 
         while final_res.is_none() {
@@ -936,7 +1006,14 @@ pub async fn run_cli_download<W: Write>(
                 }
                 maybe_prog = prog_rx.recv() => {
                     if let Some(prog) = maybe_prog {
-                        log_transfer_progress(out, &prog, &mut last_progress_print);
+                        log_transfer_progress(
+                            out,
+                            &prog,
+                            pending_queue_bytes,
+                            started_at.elapsed(),
+                            &mut last_progress_print,
+                            &mut status_active,
+                        );
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -945,8 +1022,16 @@ pub async fn run_cli_download<W: Write>(
 
         // Drain any remaining progress messages queued right before completion
         while let Ok(prog) = prog_rx.try_recv() {
-            log_transfer_progress(out, &prog, &mut last_progress_print);
+            log_transfer_progress(
+                out,
+                &prog,
+                pending_queue_bytes,
+                started_at.elapsed(),
+                &mut last_progress_print,
+                &mut status_active,
+            );
         }
+        clear_in_place_status_line(out, &mut status_active);
 
         match final_res.unwrap() {
             Ok(()) => {
@@ -985,47 +1070,149 @@ pub async fn run_cli_download<W: Write>(
     Ok(())
 }
 
+fn format_cli_progress_bar(pct: f64, width: usize) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let mut bar = String::with_capacity(width + 2);
+    bar.push('[');
+    for i in 0..width {
+        if i < filled {
+            bar.push('#');
+        } else {
+            bar.push('-');
+        }
+    }
+    bar.push(']');
+    bar
+}
+
+fn truncate_to_display_width(text: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_cols {
+        return text.to_string();
+    }
+    if max_cols <= 3 {
+        return ".".repeat(max_cols);
+    }
+    let target = max_cols - 3;
+    let mut out = String::with_capacity(max_cols);
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if used + w > target {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push_str("...");
+    out
+}
+
+fn clear_in_place_status_line<W: Write>(out: &mut W, status_active: &mut bool) {
+    if *status_active {
+        let _ = write!(out, "\r\x1b[2K");
+        let _ = out.flush();
+        *status_active = false;
+    }
+}
+
+fn cli_status_max_cols() -> usize {
+    if cfg!(test) {
+        return 100;
+    }
+    let (term_cols, _) = crate::tui::terminal_size();
+    term_cols.saturating_sub(1).max(20)
+}
+
+fn write_in_place_status_line<W: Write>(out: &mut W, line: &str, status_active: &mut bool) {
+    let max_cols = cli_status_max_cols();
+    let fitted = truncate_to_display_width(line, max_cols);
+    let _ = write!(out, "\r\x1b[2K{}", fitted);
+    let _ = out.flush();
+    *status_active = true;
+}
+
 fn log_transfer_progress<W: Write>(
     out: &mut W,
     prog: &TransferProgress,
+    pending_queue_bytes: u64,
+    active_elapsed: Duration,
     last_progress_print: &mut Instant,
+    status_active: &mut bool,
 ) {
     if let Some(ref msg) = prog.log_message {
+        clear_in_place_status_line(out, status_active);
         let _ = writeln!(out, "[{}] [Client] {}", now_ts(), msg);
         let _ = out.flush();
     } else if crate::core::is_transfer_waiting_status(&prog.file_name) {
-        if last_progress_print.elapsed() >= Duration::from_secs(1) {
-            let _ = writeln!(
-                out,
-                "[{}] [Client] [WAIT] {}: {}",
-                now_ts(),
-                prog.selected_target,
-                prog.file_name
-            );
-            let _ = out.flush();
+        if last_progress_print.elapsed() >= Duration::from_millis(250) {
+            let line = format!("[WAIT] {}: {}", prog.selected_target, prog.file_name);
+            write_in_place_status_line(out, &line, status_active);
             *last_progress_print = Instant::now();
         }
     } else if !prog.is_finished
         && prog.bytes_total > 0
-        && last_progress_print.elapsed() >= Duration::from_secs(1)
+        && last_progress_print.elapsed() >= Duration::from_millis(200)
     {
         let pct = ((prog.bytes_done as f64 / prog.bytes_total as f64) * 100.0).clamp(0.0, 100.0);
-        let rem_bytes = prog.bytes_total.saturating_sub(prog.bytes_done);
-        let eta_str = estimate_remaining_seconds(rem_bytes, prog.speed_mbps)
-            .map(|s| format!(", ETA: {}", format_remaining_time(s)))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "[{}] [Client] Progress '{}': {:.0}% ({} / {}) at {:.1} MB/s{}",
-            now_ts(),
-            prog.file_name,
+        let active_rem = prog.bytes_total.saturating_sub(prog.bytes_done);
+        let total_rem = active_rem.saturating_add(pending_queue_bytes);
+
+        let active_eta = estimate_folder_remaining_seconds(
+            active_rem,
+            prog.speed_mbps,
+            prog.current_file,
+            prog.total_files,
+            Some(active_elapsed),
+        );
+        let pending_eta = if pending_queue_bytes > 0 {
+            estimate_remaining_seconds(pending_queue_bytes, prog.speed_mbps)
+        } else {
+            None
+        };
+        let total_eta = match (active_eta, pending_eta) {
+            (Some(a), Some(p)) => Some(a.saturating_add(p)),
+            (Some(a), None) => Some(a),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
+
+        let eta_str = match (active_eta, total_eta) {
+            (Some(act_s), Some(tot_s)) if pending_queue_bytes > 0 => format!(
+                " ETA {} (Tot {}/{})",
+                format_remaining_time(act_s),
+                format_file_size(total_rem),
+                format_remaining_time(tot_s)
+            ),
+            (Some(act_s), _) => format!(" ETA {}", format_remaining_time(act_s)),
+            _ if pending_queue_bytes > 0 => {
+                format!(" Tot {}", format_file_size(total_rem))
+            }
+            _ => String::new(),
+        };
+
+        let file_cnt = if prog.total_files > 1 {
+            format!(" [{}/{}]", prog.current_file, prog.total_files)
+        } else {
+            String::new()
+        };
+
+        let bar = format_cli_progress_bar(pct, 10);
+        let line = format!(
+            "↓ {} {:>3.0}% {}/{} {:.1}MB/s{}{}",
+            bar,
             pct,
             format_file_size(prog.bytes_done),
             format_file_size(prog.bytes_total),
             prog.speed_mbps,
-            eta_str
+            eta_str,
+            file_cnt
         );
-        let _ = out.flush();
+        write_in_place_status_line(out, &line, status_active);
         *last_progress_print = Instant::now();
     }
 }
@@ -1034,34 +1221,64 @@ fn log_active_uploads<W: Write>(
     out: &mut W,
     uploads: &[server::ActiveUploadInfo],
     last_progress_print: &mut Instant,
+    status_active: &mut bool,
 ) {
-    if uploads.is_empty() || last_progress_print.elapsed() < Duration::from_secs(1) {
+    if uploads.is_empty() {
+        clear_in_place_status_line(out, status_active);
         return;
     }
-    for u in uploads {
-        let pct = if u.total_size > 0 {
-            ((u.bytes_sent as f64 / u.total_size as f64) * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
-        let rem_bytes = u.total_size.saturating_sub(u.bytes_sent);
-        let eta_str = estimate_remaining_seconds(rem_bytes, u.speed_mbps)
-            .map(|s| format!(", ETA: {}", format_remaining_time(s)))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "[{}] [Server] Upload Progress '{}' -> {}: {:.0}% ({} / {}) at {:.1} MB/s{}",
-            now_ts(),
-            u.file_name,
-            u.peer,
-            pct,
-            format_file_size(u.bytes_sent),
-            format_file_size(u.total_size),
-            u.speed_mbps,
-            eta_str
-        );
+    if last_progress_print.elapsed() < Duration::from_millis(250) {
+        return;
     }
-    let _ = out.flush();
+    let u = &uploads[0];
+    let pct = if u.total_size > 0 {
+        ((u.bytes_sent as f64 / u.total_size as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let rem_bytes = u.total_size.saturating_sub(u.bytes_sent);
+    let eta_str = estimate_remaining_seconds(rem_bytes, u.speed_mbps)
+        .map(|s| format!(" ETA {}", format_remaining_time(s)))
+        .unwrap_or_default();
+    let bar = format_cli_progress_bar(pct, 10);
+    let extra = if uploads.len() > 1 {
+        let total_spd: f32 = uploads.iter().map(|x| x.speed_mbps).sum();
+        let total_rem: u64 = uploads.iter().fold(0u64, |acc, x| {
+            acc.saturating_add(x.total_size.saturating_sub(x.bytes_sent))
+        });
+        let total_eta_s: Option<u64> = uploads.iter().fold(None, |acc, x| {
+            let r = x.total_size.saturating_sub(x.bytes_sent);
+            match (acc, estimate_remaining_seconds(r, x.speed_mbps)) {
+                (Some(a), Some(e)) => Some(a.saturating_add(e)),
+                (None, Some(e)) => Some(e),
+                (a, None) => a,
+            }
+        });
+        let total_eta_part = total_eta_s
+            .map(|s| format!("/{}", format_remaining_time(s)))
+            .unwrap_or_default();
+        format!(
+            " (+{} {:.1}MB/s Tot {}{})",
+            uploads.len() - 1,
+            total_spd,
+            format_file_size(total_rem),
+            total_eta_part
+        )
+    } else {
+        String::new()
+    };
+
+    let line = format!(
+        "↑ {} {:>3.0}% {}/{} {:.1}MB/s{}{}",
+        bar,
+        pct,
+        format_file_size(u.bytes_sent),
+        format_file_size(u.total_size),
+        u.speed_mbps,
+        eta_str,
+        extra
+    );
+    write_in_place_status_line(out, &line, status_active);
     *last_progress_print = Instant::now();
 }
 
@@ -1146,8 +1363,10 @@ pub async fn run_cli_host<W: Write>(
 
     let start_instant = Instant::now();
     let mut last_upload_progress_print = Instant::now();
+    let mut upload_status_active = false;
     loop {
         if CLI_INTERRUPTED.load(Ordering::SeqCst) {
+            clear_in_place_status_line(out, &mut upload_status_active);
             let _ = writeln!(
                 out,
                 "[{}] [Server] Interrupt received — stopping server...",
@@ -1158,6 +1377,7 @@ pub async fn run_cli_host<W: Write>(
         }
         if let Some(max_dur) = max_duration {
             if start_instant.elapsed() >= max_dur {
+                clear_in_place_status_line(out, &mut upload_status_active);
                 let _ = writeln!(
                     out,
                     "[{}] [Server] Stopping server (duration reached)...",
@@ -1168,6 +1388,7 @@ pub async fn run_cli_host<W: Write>(
             }
         }
         if !handle.is_running.load(Ordering::Relaxed) {
+            clear_in_place_status_line(out, &mut upload_status_active);
             break;
         }
 
@@ -1175,11 +1396,13 @@ pub async fn run_cli_host<W: Write>(
             out,
             &handle.active_uploads_snapshot(),
             &mut last_upload_progress_print,
+            &mut upload_status_active,
         );
 
         tokio::select! {
             maybe_evt = log_rx.recv() => {
                 if let Some(evt) = maybe_evt {
+                    clear_in_place_status_line(out, &mut upload_status_active);
                     if evt.is_error {
                         let _ = writeln!(out, "[{}] [Server] [ERROR] {}", evt.timestamp, evt.message);
                     } else {
@@ -1187,6 +1410,7 @@ pub async fn run_cli_host<W: Write>(
                     }
                     let _ = out.flush();
                 } else {
+                    clear_in_place_status_line(out, &mut upload_status_active);
                     break;
                 }
             }
@@ -1194,6 +1418,7 @@ pub async fn run_cli_host<W: Write>(
         }
     }
 
+    clear_in_place_status_line(out, &mut upload_status_active);
     handle.is_running.store(false, Ordering::SeqCst);
     let _ = handle.stop_sender.send(());
     while let Ok(evt) = log_rx.try_recv() {
@@ -1497,6 +1722,7 @@ mod tests {
 
         let mut upload_out = Vec::new();
         let mut last_tick = Instant::now() - Duration::from_secs(2);
+        let mut status_active = false;
         let uploads = vec![server::ActiveUploadInfo {
             id: 1,
             folder_root: valid_dir.clone(),
@@ -1507,12 +1733,52 @@ mod tests {
             speed_mbps: 100.0,
             started_at: Instant::now() - Duration::from_secs(5),
         }];
-        log_active_uploads(&mut upload_out, &uploads, &mut last_tick);
+        log_active_uploads(
+            &mut upload_out,
+            &uploads,
+            &mut last_tick,
+            &mut status_active,
+        );
+        assert!(status_active);
         let upload_text = String::from_utf8(upload_out).unwrap();
-        assert!(upload_text
-            .contains("[Server] Upload Progress 'shared_sample.txt' -> 192.168.1.42: 50%"));
-        assert!(upload_text.contains("at 100.0 MB/s"));
-        assert!(upload_text.contains("ETA:"));
+        assert!(upload_text.contains("↑ [#####-----]  50%"));
+        assert!(upload_text.contains("100.0MB/s"));
+        assert!(upload_text.contains("ETA 5s"));
+        assert!(!upload_text.contains("shared_sample.txt"));
+
+        let mut dl_prog_out = Vec::new();
+        let mut dl_last_tick = Instant::now() - Duration::from_secs(2);
+        let mut dl_status_active = false;
+        let prog = TransferProgress {
+            selected_target: "Games_Patches".to_string(),
+            file_name: "balance_update.pak".to_string(),
+            bytes_done: 50 * 1024 * 1024,
+            bytes_total: 100 * 1024 * 1024,
+            speed_mbps: 25.0,
+            is_finished: false,
+            current_file: 1,
+            total_files: 3,
+            log_message: None,
+        };
+        log_transfer_progress(
+            &mut dl_prog_out,
+            &prog,
+            200 * 1024 * 1024,
+            Duration::from_secs(2),
+            &mut dl_last_tick,
+            &mut dl_status_active,
+        );
+        let dl_prog_text = String::from_utf8(dl_prog_out).unwrap();
+        assert!(dl_prog_text.contains("↓ [#####-----]  50%"));
+        assert!(dl_prog_text.contains("[1/3]"));
+        assert!(!dl_prog_text.contains("balance_update.pak"));
+        assert!(dl_prog_text.contains("Tot 250 MB/"));
+
+        // Long filename must truncate to fit terminal width without wrapping
+        assert_eq!(
+            truncate_to_display_width("very_long_filename_example.bin", 12),
+            "very_long..."
+        );
 
         let _ = std::fs::remove_dir_all(&valid_dir);
 

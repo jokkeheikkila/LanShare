@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 pub enum ClientActionResult {
     Connected(ClientTlsStream, HandshakeResponse, String, u16),
     ConnectFailed(String),
-    ListingLoaded(ClientTlsStream, String, Vec<FileEntry>),
+    ListingLoaded(ClientTlsStream, String, Vec<FileEntry>, Option<String>),
     ListingFailed(Option<ClientTlsStream>, String),
     QueueItemFinished { id: u64, result: Result<(), String> },
     FolderSizeResolved { id: u64, total_bytes: u64 },
@@ -38,7 +38,12 @@ pub fn sort_shared_paths(paths: &mut [PathBuf]) {
     paths.sort_by_key(|p| !p.is_dir());
 }
 
+pub const MAX_SHARED_SIZE_WALK_ENTRIES: usize = 100_000;
+pub const MAX_SESSION_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Computes the byte size of a safe shared file or directory without following symlinks.
+/// Caps directory walk at [`MAX_SHARED_SIZE_WALK_ENTRIES`] entries so folders with millions
+/// of files do not spin a background thread indefinitely.
 pub fn compute_shared_path_size(path: &Path) -> Option<u64> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if is_symlink_or_reparse(&meta) {
@@ -52,6 +57,7 @@ pub fn compute_shared_path_size(path: &Path) -> Option<u64> {
     }
 
     let mut total = 0u64;
+    let mut visited = 0usize;
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -62,6 +68,10 @@ pub fn compute_shared_path_size(path: &Path) -> Option<u64> {
         })
         .filter_map(|e| e.ok())
     {
+        visited += 1;
+        if visited > MAX_SHARED_SIZE_WALK_ENTRIES {
+            break;
+        }
         if let Ok(m) = std::fs::symlink_metadata(entry.path()) {
             if !is_symlink_or_reparse(&m) && m.is_file() {
                 total = total.saturating_add(m.len());
@@ -1041,7 +1051,7 @@ pub async fn simulate_mock_download_with_config(
                     is_finished: is_all_finished,
                     current_file: file_index,
                     total_files,
-                    log_message: if is_last_step {
+                    log_message: if is_last_step && !entry.is_dir {
                         Some(format!(
                             "[Mock] Downloaded '{}' ({})",
                             file_name,
@@ -1673,20 +1683,34 @@ pub async fn resolve_remote_folder_total_bytes(
     .await
     .ok()?
     .ok()?;
-    let resp_bytes = tokio::time::timeout(
-        Duration::from_secs(10),
-        crate::network::read_frame(&mut stream),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let _ = stream.shutdown().await;
-    match serde_json::from_slice::<ServerCommandResponse>(&resp_bytes).ok()? {
-        ServerCommandResponse::DirectoryManifest { files, .. } => {
-            Some(files.iter().map(|f| f.file_size).sum())
+    let mut total_bytes = 0u64;
+    loop {
+        let resp_bytes = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::network::read_frame(&mut stream),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        match serde_json::from_slice::<ServerCommandResponse>(&resp_bytes).ok()? {
+            ServerCommandResponse::DirectoryManifest {
+                files, has_more, ..
+            } => {
+                for f in files {
+                    total_bytes = total_bytes.saturating_add(f.file_size);
+                }
+                if !has_more {
+                    break;
+                }
+            }
+            _ => {
+                let _ = stream.shutdown().await;
+                return None;
+            }
         }
-        _ => None,
     }
+    let _ = stream.shutdown().await;
+    Some(total_bytes)
 }
 
 pub fn dirs_fallback() -> PathBuf {
@@ -1955,9 +1979,14 @@ pub fn get_log_file_path() -> PathBuf {
         .clone()
 }
 
-/// Appends a single line to the persistent log file on disk.
+/// Appends a single line to the persistent log file on disk (capped at [`MAX_SESSION_LOG_BYTES`]).
 pub fn spool_log_entry(line: &str) {
     let path = get_log_file_path();
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() >= MAX_SESSION_LOG_BYTES {
+            return;
+        }
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

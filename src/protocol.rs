@@ -159,10 +159,14 @@ pub enum ServerCommandResponse {
     DirectoryListing {
         current_path: String,
         entries: Vec<FileEntry>,
+        #[serde(default)]
+        notice: Option<String>,
     },
     DirectoryManifest {
         root_folder_name: String,
         files: Vec<ManifestFileEntry>,
+        #[serde(default)]
+        has_more: bool,
     },
     DownloadReady {
         file_name: String,
