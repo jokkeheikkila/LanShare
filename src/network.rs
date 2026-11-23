@@ -1,12 +1,12 @@
 use local_ip_address::{list_afinet_netifas, local_ip};
 use ring::rand::SecureRandom;
-use ring::{hmac, pbkdf2};
+use ring::{aead, hmac, pbkdf2};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, ServerConfig, SignatureScheme,
 };
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU32;
@@ -147,47 +147,73 @@ pub fn verify_tls_server_auth_token<Data>(
     hmac::verify(&key, &exporter_buf, server_auth_token).is_ok()
 }
 
-/// Computes an HMAC-SHA256 Share-Ring discovery tag over `(nonce, host_name, port)` keyed by
-/// the PBKDF2-stretched UDP discovery subkey.
-pub fn compute_ring_beacon_tag(
-    host_name: &str,
-    port: u16,
-    nonce: &[u8; 16],
+/// Encrypts a V3 UDP discovery/control payload with `CHACHA20_POLY1305` keyed by the
+/// PBKDF2-stretched UDP discovery subkey, binding `aad_magic` as Authenticated Associated Data.
+pub fn seal_discovery_payload(
+    aad_magic: &str,
+    plaintext: &[u8],
     secret: &str,
-) -> Vec<u8> {
+) -> ([u8; 12], Vec<u8>) {
+    let (discovery_key, _) = derive_secret_subkeys(secret);
+    let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &discovery_key)
+        .expect("32-byte ChaCha20-Poly1305 key");
+    let key = aead::LessSafeKey::new(unbound);
+    let nonce_bytes: [u8; 12] = random_bytes();
+    let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, aead::Aad::from(aad_magic.as_bytes()), &mut in_out)
+        .expect("AEAD seal_in_place_append_tag");
+    (nonce_bytes, in_out)
+}
+
+/// Decrypts and authenticates a V3 UDP discovery/control payload with `CHACHA20_POLY1305`
+/// in constant time against the user's Share-Ring secret and `aad_magic`.
+pub fn open_discovery_payload(
+    aad_magic: &str,
+    nonce_bytes: &[u8; 12],
+    ciphertext: &[u8],
+    secret: &str,
+) -> Option<Vec<u8>> {
+    if secret.trim().is_empty() || ciphertext.len() < aead::CHACHA20_POLY1305.tag_len() {
+        return None;
+    }
+    let (discovery_key, _) = derive_secret_subkeys(secret);
+    let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &discovery_key).ok()?;
+    let key = aead::LessSafeKey::new(unbound);
+    let nonce = aead::Nonce::assume_unique_for_key(*nonce_bytes);
+    let mut in_out = ciphertext.to_vec();
+    let plain = key
+        .open_in_place(nonce, aead::Aad::from(aad_magic.as_bytes()), &mut in_out)
+        .ok()?;
+    Some(plain.to_vec())
+}
+
+/// Computes an HMAC-SHA256 Share-Ring discovery probe tag over `(nonce, label)` keyed by
+/// the PBKDF2-stretched UDP discovery subkey.
+pub fn compute_ring_probe_tag(label: &str, nonce: &[u8; 16], secret: &str) -> Vec<u8> {
     let (discovery_key, _) = derive_secret_subkeys(secret);
     let key = hmac::Key::new(hmac::HMAC_SHA256, &discovery_key);
-    let mut msg = Vec::with_capacity(64 + host_name.len());
-    msg.extend_from_slice(b"LANSHARE-RING-BEACON-V2:");
+    let mut msg = Vec::with_capacity(48 + label.len());
+    msg.extend_from_slice(b"LANSHARE-RING-PROBE-V3:");
     msg.extend_from_slice(nonce);
     msg.push(b':');
-    msg.extend_from_slice(host_name.as_bytes());
-    msg.push(b':');
-    msg.extend_from_slice(&port.to_be_bytes());
+    msg.extend_from_slice(label.as_bytes());
     let tag = hmac::sign(&key, &msg);
     tag.as_ref().to_vec()
 }
 
-/// Verifies a UDP beacon's Share-Ring tag in constant time against the user's Share-Ring secret.
-pub fn verify_ring_beacon_tag(
-    host_name: &str,
-    port: u16,
-    nonce: &[u8; 16],
-    secret: &str,
-    ring_tag: &[u8],
-) -> bool {
+/// Verifies a UDP probe's Share-Ring tag in constant time against the user's Share-Ring secret.
+pub fn verify_ring_probe_tag(label: &str, nonce: &[u8; 16], secret: &str, ring_tag: &[u8]) -> bool {
     if secret.trim().is_empty() || ring_tag.is_empty() {
         return false;
     }
     let (discovery_key, _) = derive_secret_subkeys(secret);
     let key = hmac::Key::new(hmac::HMAC_SHA256, &discovery_key);
-    let mut msg = Vec::with_capacity(64 + host_name.len());
-    msg.extend_from_slice(b"LANSHARE-RING-BEACON-V2:");
+    let mut msg = Vec::with_capacity(48 + label.len());
+    msg.extend_from_slice(b"LANSHARE-RING-PROBE-V3:");
     msg.extend_from_slice(nonce);
     msg.push(b':');
-    msg.extend_from_slice(host_name.as_bytes());
-    msg.push(b':');
-    msg.extend_from_slice(&port.to_be_bytes());
+    msg.extend_from_slice(label.as_bytes());
     hmac::verify(&key, &msg, ring_tag).is_ok()
 }
 
@@ -212,91 +238,169 @@ pub fn get_computer_name() -> String {
         .unwrap_or_else(|| "LanShareHost".to_string())
 }
 
-/// Reads active private LAN IPv4 addresses from the OS ARP cache (`/proc/net/arp` on Linux).
-/// Sending unicast UDP beacons to active ARP neighbors automatically punches stateful firewall
-/// (`nf_conntrack` / `ufw` / `firewalld`) pinholes without requiring root or firewall changes.
-pub fn get_lan_arp_neighbors() -> Vec<Ipv4Addr> {
-    let mut neighbors = Vec::new();
-    let local_ips = get_all_local_lan_ips();
+/// Computes the true IPv4 directed subnet broadcast address (`ip | !netmask`) for an interface.
+/// Returns `None` for point-to-point or host-only masks (`/31`, `/32`, or invalid `0.0.0.0` masks).
+pub fn compute_directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
+    let mask_u32 = u32::from(netmask);
+    // Reject 0.0.0.0, /31 (0xFFFFFFFE), and /32 (0xFFFFFFFF), and require contiguous leading 1s
+    if mask_u32 == 0 || mask_u32 >= 0xFFFF_FFFE {
+        return None;
+    }
+    let inv = !mask_u32;
+    if (inv & (inv + 1)) != 0 {
+        return None;
+    }
+    let bcast = Ipv4Addr::from(u32::from(ip) | inv);
+    if bcast == ip || bcast.is_loopback() {
+        return None;
+    }
+    Some(bcast)
+}
 
-    if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
-        for line in content.lines().skip(1) {
-            let mut parts = line.split_whitespace();
-            if let Some(ip_str) = parts.next() {
-                if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
-                    if !ipv4.is_loopback()
-                        && (ipv4.is_private() || ipv4.is_link_local())
-                        && !local_ips.iter().any(|l| l == ip_str)
-                        && !neighbors.contains(&ipv4)
-                    {
-                        neighbors.push(ipv4);
+/// Checks whether two IPv4 addresses belong to the same subnet under `netmask`.
+pub fn ipv4_in_same_subnet(a: Ipv4Addr, b: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    let mask = u32::from(netmask);
+    if mask == 0 {
+        return false;
+    }
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+/// Structure representing an active broadcast-capable local IPv4 interface and its netmask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalIpv4Subnet {
+    pub ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub broadcast: Ipv4Addr,
+}
+
+/// Queries active broadcast-capable private IPv4 interfaces and their true subnet masks.
+/// Skips loopback, point-to-point/tunnel (VPN), and down interfaces.
+#[cfg(unix)]
+pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
+    let mut subnets = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` initializes `ifap` with a linked list of interface structures
+    // allocated by libc, which we traverse read-only and free via `freeifaddrs` before returning.
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 || ifap.is_null() {
+            return subnets;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            let flags = ifa.ifa_flags as libc::c_int;
+            let is_up = (flags & libc::IFF_UP) != 0;
+            let is_bcast = (flags & libc::IFF_BROADCAST) != 0;
+            let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
+            let is_p2p = (flags & libc::IFF_POINTOPOINT) != 0;
+
+            if is_up
+                && is_bcast
+                && !is_loopback
+                && !is_p2p
+                && !ifa.ifa_addr.is_null()
+                && !ifa.ifa_netmask.is_null()
+                && (*ifa.ifa_addr).sa_family as libc::c_int == libc::AF_INET
+                && (*ifa.ifa_netmask).sa_family as libc::c_int == libc::AF_INET
+            {
+                let addr_in = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                let mask_in = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
+                let netmask = Ipv4Addr::from(u32::from_be(mask_in.sin_addr.s_addr));
+
+                if !ip.is_loopback()
+                    && (ip.is_private() || ip.is_link_local())
+                    && !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ip)
+                {
+                    if let Some(broadcast) = compute_directed_broadcast(ip, netmask) {
+                        subnets.push(LocalIpv4Subnet {
+                            ip,
+                            netmask,
+                            broadcast,
+                        });
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    subnets
+}
+
+#[cfg(not(unix))]
+pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
+    let mut subnets = Vec::new();
+    if let Ok(ifaces) = list_afinet_netifas() {
+        for (_name, ip) in ifaces {
+            if let IpAddr::V4(ipv4) = ip {
+                // Only include RFC 1918 / link-local LAN interfaces (exclude CGNAT 100.64.0.0/10 VPN tunnels)
+                if !ipv4.is_loopback()
+                    && (ipv4.is_private() || ipv4.is_link_local())
+                    && !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ipv4)
+                {
+                    let netmask = Ipv4Addr::new(255, 255, 255, 0);
+                    if let Some(broadcast) = compute_directed_broadcast(ipv4, netmask) {
+                        subnets.push(LocalIpv4Subnet {
+                            ip: ipv4,
+                            netmask,
+                            broadcast,
+                        });
                     }
                 }
             }
         }
     }
-
-    neighbors
+    subnets
 }
 
-/// Structure representing a local network interface and its target broadcast/unicast addresses.
+/// Returns true if `target_ip` is on the same L2 IPv4 subnet as any local broadcast interface,
+/// or is loopback (`127.0.0.0/8` / `::1`).
+pub fn is_same_local_subnet(target_ip: IpAddr) -> bool {
+    if target_ip.is_loopback() {
+        return true;
+    }
+    if let IpAddr::V4(target_v4) = target_ip {
+        for sub in get_local_ipv4_subnets() {
+            if ipv4_in_same_subnet(sub.ip, target_v4, sub.netmask) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Structure representing a local network interface and its deduplicated target broadcast addresses.
 #[derive(Debug, Clone)]
 pub struct BroadcastBinding {
     pub bind_ip: Ipv4Addr,
     pub targets: Vec<SocketAddr>,
 }
 
-/// Retrieves all local IPv4 LAN addresses and their respective directed subnet broadcast + ARP neighbor targets.
-/// Ensures UDP beacons are transmitted out of EVERY physical/virtual network adapter and punch stateful firewall holes.
+/// Retrieves local IPv4 broadcast bindings using each interface's real subnet broadcast address.
+/// Emits exactly 1 broadcast target per unique broadcast domain (no ARP neighbor sweeping or 3x duplicates),
+/// falling back to a single `255.255.255.255` target only when no interface-specific broadcast exists.
 pub fn get_broadcast_bindings(port: u16) -> Vec<BroadcastBinding> {
     let mut bindings = Vec::new();
-    let arp_neighbors = get_lan_arp_neighbors();
+    let mut seen_targets = HashSet::new();
 
-    if let Ok(ifaces) = list_afinet_netifas() {
-        for (_name, ip) in ifaces {
-            if let IpAddr::V4(ipv4) = ip {
-                if !ipv4.is_loopback() && crate::security::is_private_lan_ip(&ip) {
-                    let octets = ipv4.octets();
-                    // Directed subnet broadcast (e.g. 192.168.8.255 for /24)
-                    let subnet_bcast = Ipv4Addr::new(octets[0], octets[1], octets[2], 255);
-
-                    let mut targets = vec![
-                        SocketAddr::V4(SocketAddrV4::new(subnet_bcast, port)),
-                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port)),
-                    ];
-
-                    // Add unicast targets for ARP neighbors in the same /24 subnet to punch conntrack holes
-                    for neighbor in &arp_neighbors {
-                        let n_oct = neighbor.octets();
-                        if n_oct[0] == octets[0] && n_oct[1] == octets[1] && n_oct[2] == octets[2] {
-                            let target = SocketAddr::V4(SocketAddrV4::new(*neighbor, port));
-                            if !targets.contains(&target) {
-                                targets.push(target);
-                            }
-                        }
-                    }
-
-                    bindings.push(BroadcastBinding {
-                        bind_ip: ipv4,
-                        targets,
-                    });
-                }
-            }
+    for sub in get_local_ipv4_subnets() {
+        let target = SocketAddr::V4(SocketAddrV4::new(sub.broadcast, port));
+        if seen_targets.insert(target) {
+            bindings.push(BroadcastBinding {
+                bind_ip: sub.ip,
+                targets: vec![target],
+            });
         }
     }
 
-    // Always include a fallback 0.0.0.0 binding to limited broadcast + all ARP neighbors
-    let mut fallback_targets = vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port))];
-    for neighbor in arp_neighbors {
-        let target = SocketAddr::V4(SocketAddrV4::new(neighbor, port));
-        if !fallback_targets.contains(&target) {
-            fallback_targets.push(target);
-        }
+    if bindings.is_empty() {
+        bindings.push(BroadcastBinding {
+            bind_ip: Ipv4Addr::UNSPECIFIED,
+            targets: vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port))],
+        });
     }
-    bindings.push(BroadcastBinding {
-        bind_ip: Ipv4Addr::UNSPECIFIED,
-        targets: fallback_targets,
-    });
 
     bindings
 }
@@ -459,43 +563,140 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ring_beacon_hmac_verification() {
+    fn test_v3_aead_discovery_seal_and_open() {
+        let plain = b"{\"host_name\":\"Gaming-PC\",\"port\":22222}";
+        let (nonce, ciphertext) =
+            seal_discovery_payload("LANSHARE_BEACON_V3", plain, "lan-party-42");
+
+        // Ciphertext must not contain plaintext hostname
+        assert!(!String::from_utf8_lossy(&ciphertext).contains("Gaming-PC"));
+
+        let opened = open_discovery_payload(
+            "LANSHARE_BEACON_V3",
+            &nonce,
+            &ciphertext,
+            "  lan-party-42  ",
+        );
+        assert_eq!(opened.as_deref(), Some(&plain[..]));
+
+        // Wrong secret, wrong AAD magic, or tampered ciphertext must fail
+        assert!(
+            open_discovery_payload("LANSHARE_BEACON_V3", &nonce, &ciphertext, "wrong-secret")
+                .is_none()
+        );
+        assert!(
+            open_discovery_payload("LANSHARE_REVCONN_V3", &nonce, &ciphertext, "lan-party-42")
+                .is_none()
+        );
+
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 0xFF;
+        assert!(
+            open_discovery_payload("LANSHARE_BEACON_V3", &nonce, &tampered, "lan-party-42")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_ring_probe_hmac_verification() {
         let nonce = [7u8; 16];
-        let tag = compute_ring_beacon_tag("Gaming-PC", 22222, &nonce, "lan-party-42");
-        assert!(verify_ring_beacon_tag(
-            "Gaming-PC",
-            22222,
+        let tag = compute_ring_probe_tag("LANSHARE_PROBE_V3", &nonce, "lan-party-42");
+        assert!(verify_ring_probe_tag(
+            "LANSHARE_PROBE_V3",
             &nonce,
             "lan-party-42",
             &tag
         ));
-        assert!(verify_ring_beacon_tag(
-            "Gaming-PC",
-            22222,
+        assert!(verify_ring_probe_tag(
+            "LANSHARE_PROBE_V3",
             &nonce,
             "  lan-party-42  ",
             &tag
         ));
-        assert!(!verify_ring_beacon_tag(
-            "Gaming-PC",
-            22222,
+        assert!(!verify_ring_probe_tag(
+            "LANSHARE_PROBE_V3",
             &nonce,
             "wrong-secret",
             &tag
         ));
-        assert!(!verify_ring_beacon_tag(
-            "Other-PC",
-            22222,
+        assert!(!verify_ring_probe_tag(
+            "OTHER_LABEL",
             &nonce,
             "lan-party-42",
             &tag
         ));
-        assert!(!verify_ring_beacon_tag(
-            "Gaming-PC",
-            22223,
-            &nonce,
-            "lan-party-42",
-            &tag
+    }
+
+    #[test]
+    fn test_compute_directed_broadcast_and_subnet_matching() {
+        // /24 subnet
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        // /16 corporate or large LAN party subnet (must NOT be 10.20.1.255!)
+        assert_eq!(
+            compute_directed_broadcast(Ipv4Addr::new(10, 20, 1, 42), Ipv4Addr::new(255, 255, 0, 0)),
+            Some(Ipv4Addr::new(10, 20, 255, 255))
+        );
+        // /20 subnet
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(172, 16, 18, 99),
+                Ipv4Addr::new(255, 255, 240, 0)
+            ),
+            Some(Ipv4Addr::new(172, 16, 31, 255))
+        );
+        // /22 subnet
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(192, 168, 4, 10),
+                Ipv4Addr::new(255, 255, 252, 0)
+            ),
+            Some(Ipv4Addr::new(192, 168, 7, 255))
+        );
+        // /25 subnet
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(255, 255, 255, 128)
+            ),
+            Some(Ipv4Addr::new(192, 168, 1, 127))
+        );
+        // /31 and /32 point-to-point/host masks must return None
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(255, 255, 255, 254)
+            ),
+            None
+        );
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(255, 255, 255, 255)
+            ),
+            None
+        );
+        assert_eq!(
+            compute_directed_broadcast(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(0, 0, 0, 0)),
+            None
+        );
+
+        // Subnet matching
+        let mask_22 = Ipv4Addr::new(255, 255, 252, 0);
+        assert!(ipv4_in_same_subnet(
+            Ipv4Addr::new(10, 0, 4, 5),
+            Ipv4Addr::new(10, 0, 7, 250),
+            mask_22
+        ));
+        assert!(!ipv4_in_same_subnet(
+            Ipv4Addr::new(10, 0, 4, 5),
+            Ipv4Addr::new(10, 0, 8, 1),
+            mask_22
         ));
     }
 

@@ -3,40 +3,60 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_TCP_PORT: u16 = 22222;
 pub const DEFAULT_UDP_PORT: u16 = 22223;
 pub const MIN_SECRET_LEN: usize = 10;
-pub const BEACON_MAGIC: &str = "LANSHARE_BEACON_V2";
-pub const PROBE_MAGIC: &str = "LANSHARE_PROBE_V2";
-pub const REVERSE_MAGIC: &str = "LANSHARE_REVCONN_V2";
+pub const BEACON_MAGIC: &str = "LANSHARE_BEACON_V3";
+pub const PROBE_MAGIC: &str = "LANSHARE_PROBE_V3";
+pub const REVERSE_MAGIC: &str = "LANSHARE_REVCONN_V3";
 
-/// UDP Beacon broadcasted or sent via unicast by the server for LAN discovery.
-/// Includes a cryptographic HMAC-SHA256 `ring_tag` over `(nonce, host_name, port)` keyed by a
-/// PBKDF2-stretched discovery subkey, ensuring only peers with the matching secret reveal the share.
+/// Inner encrypted metadata of a V3 `DiscoveryBeacon`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BeaconPayload {
+    pub host_name: String,
+    pub port: u16,
+}
+
+/// V3 UDP Beacon broadcasted or sent via unicast by the server for LAN discovery.
+/// Encrypts `(host_name, port)` with `CHACHA20_POLY1305` keyed by a PBKDF2-stretched discovery
+/// subkey so passive sniffers on the LAN see only opaque random ciphertext.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryBeacon {
     pub magic: String,
-    pub host_name: String,
-    pub port: u16,
-    #[serde(default)]
-    pub nonce: [u8; 16],
-    #[serde(default)]
-    pub ring_tag: Vec<u8>,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
 }
 
 impl DiscoveryBeacon {
     pub fn new(host_name: String, port: u16, secret: &str) -> Self {
-        let nonce: [u8; 16] = crate::network::random_bytes();
-        let ring_tag = crate::network::compute_ring_beacon_tag(&host_name, port, &nonce, secret);
+        let payload = BeaconPayload { host_name, port };
+        let plain = serde_json::to_vec(&payload).expect("serialize BeaconPayload");
+        let (nonce, ciphertext) =
+            crate::network::seal_discovery_payload(BEACON_MAGIC, &plain, secret);
         Self {
             magic: BEACON_MAGIC.to_string(),
-            host_name,
-            port,
             nonce,
-            ring_tag,
+            ciphertext,
         }
+    }
+
+    pub fn decrypt(&self, secret: &str) -> Option<BeaconPayload> {
+        if self.magic != BEACON_MAGIC {
+            return None;
+        }
+        let plain = crate::network::open_discovery_payload(
+            BEACON_MAGIC,
+            &self.nonce,
+            &self.ciphertext,
+            secret,
+        )?;
+        let payload: BeaconPayload = serde_json::from_slice(&plain).ok()?;
+        if payload.port < 1024 {
+            return None;
+        }
+        Some(payload)
     }
 }
 
 /// Active UDP discovery probe sent by a scanning client so hosts with the matching LAN secret
-/// immediately reply via unicast (punching through client stateful firewalls like ufw/firewalld/Windows Firewall).
+/// immediately reply via unicast (with a small random jitter delay to avoid reply implosion).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryProbe {
     pub magic: String,
@@ -47,7 +67,7 @@ pub struct DiscoveryProbe {
 impl DiscoveryProbe {
     pub fn new(secret: &str) -> Self {
         let nonce: [u8; 16] = crate::network::random_bytes();
-        let ring_tag = crate::network::compute_ring_beacon_tag("LANSHARE_PROBE", 0, &nonce, secret);
+        let ring_tag = crate::network::compute_ring_probe_tag(PROBE_MAGIC, &nonce, secret);
         Self {
             magic: PROBE_MAGIC.to_string(),
             nonce,
@@ -57,9 +77,8 @@ impl DiscoveryProbe {
 
     pub fn verify(&self, secret: &str) -> bool {
         self.magic == PROBE_MAGIC
-            && crate::network::verify_ring_beacon_tag(
-                "LANSHARE_PROBE",
-                0,
+            && crate::network::verify_ring_probe_tag(
+                PROBE_MAGIC,
                 &self.nonce,
                 secret,
                 &self.ring_tag,
@@ -67,41 +86,54 @@ impl DiscoveryProbe {
     }
 }
 
-/// Authenticated UDP request sent by a client when direct TCP connection to a host is blocked by the host's firewall.
-/// Prompts the host to initiate an outbound TCP connection back to the client's listener port and run the TLS server handshake.
+/// Inner encrypted metadata of a V3 `ReverseConnectRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReverseConnectPayload {
+    pub client_name: String,
+    pub tcp_port: u16,
+}
+
+/// Authenticated and AEAD-encrypted UDP request sent by a client when direct TCP connection to a
+/// local LAN host is blocked by the host's firewall.
+/// Prompts the host to initiate an outbound TCP connection back to the client's listener port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseConnectRequest {
     pub magic: String,
-    pub client_name: String,
-    pub tcp_port: u16,
-    pub nonce: [u8; 16],
-    pub ring_tag: Vec<u8>,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
 }
 
 impl ReverseConnectRequest {
     pub fn new(client_name: String, tcp_port: u16, secret: &str) -> Self {
-        let nonce: [u8; 16] = crate::network::random_bytes();
-        let ring_tag =
-            crate::network::compute_ring_beacon_tag(&client_name, tcp_port, &nonce, secret);
-        Self {
-            magic: REVERSE_MAGIC.to_string(),
+        let payload = ReverseConnectPayload {
             client_name,
             tcp_port,
+        };
+        let plain = serde_json::to_vec(&payload).expect("serialize ReverseConnectPayload");
+        let (nonce, ciphertext) =
+            crate::network::seal_discovery_payload(REVERSE_MAGIC, &plain, secret);
+        Self {
+            magic: REVERSE_MAGIC.to_string(),
             nonce,
-            ring_tag,
+            ciphertext,
         }
     }
 
-    pub fn verify(&self, secret: &str) -> bool {
-        self.magic == REVERSE_MAGIC
-            && self.tcp_port > 0
-            && crate::network::verify_ring_beacon_tag(
-                &self.client_name,
-                self.tcp_port,
-                &self.nonce,
-                secret,
-                &self.ring_tag,
-            )
+    pub fn decrypt(&self, secret: &str) -> Option<ReverseConnectPayload> {
+        if self.magic != REVERSE_MAGIC {
+            return None;
+        }
+        let plain = crate::network::open_discovery_payload(
+            REVERSE_MAGIC,
+            &self.nonce,
+            &self.ciphertext,
+            secret,
+        )?;
+        let payload: ReverseConnectPayload = serde_json::from_slice(&plain).ok()?;
+        if payload.tcp_port == 0 {
+            return None;
+        }
+        Some(payload)
     }
 }
 

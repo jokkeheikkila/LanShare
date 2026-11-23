@@ -1,6 +1,6 @@
 use crate::network::{
     compute_tls_auth_token, get_broadcast_bindings, get_computer_name, make_client_tls_config,
-    read_frame, verify_ring_beacon_tag, verify_tls_server_auth_token, write_frame,
+    read_frame, verify_tls_server_auth_token, write_frame,
 };
 use crate::protocol::*;
 use crate::security::{
@@ -9,14 +9,13 @@ use crate::security::{
 };
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::Semaphore;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
@@ -101,158 +100,81 @@ pub struct TransferProgress {
 pub type ClientTlsStream = TlsStream<TcpStream>;
 
 /// Actively scans the LAN for hosts sharing with the same LAN secret.
-/// Combines:
-/// 1. Unified UDP listener on `:22223` + active `DiscoveryProbe` broadcasts and ARP neighbor probes
-///    (punching through client stateful firewalls like Linux `ufw`/`firewalld` and Windows Firewall).
-/// 2. Parallel TCP fallback probe on `:22222` across active ARP neighbors
-///    (so hosts reachable by Direct IP are discovered automatically even if UDP is completely blocked).
+/// Sends a deduplicated UDP `DiscoveryProbe` per broadcast domain from this instance's
+/// exclusive control socket (`control_sock`) and collects jittered unicast replies and
+/// cached V3 AEAD-encrypted beacons without any ARP or TCP port-scanning.
 pub async fn scan_lan_for_hosts(
     timeout_dur: Duration,
     ring_secret: Option<&str>,
 ) -> Vec<DiscoveredPeer> {
+    const MAX_DISCOVERED_PEERS: usize = 512;
     let mut discovered: HashMap<String, DiscoveredPeer> = HashMap::new();
     let clean_secret = ring_secret.map(|s| s.trim()).filter(|s| !s.is_empty());
 
     let svc = crate::discovery::service();
 
-    // Send active UDP DiscoveryProbe to broadcast + ARP neighbor targets to open stateful firewall holes
     let mut probed_udp_targets = std::collections::HashSet::<SocketAddr>::new();
     let probe_bytes_opt =
         clean_secret.and_then(|secret| serde_json::to_vec(&DiscoveryProbe::new(secret)).ok());
     if let (Some(s), Some(probe_bytes)) = (svc, probe_bytes_opt.as_ref()) {
         for binding in get_broadcast_bindings(DEFAULT_UDP_PORT) {
             for target in binding.targets {
-                s.send_from_both(probe_bytes, target);
-                probed_udp_targets.insert(target);
+                if probed_udp_targets.insert(target) {
+                    s.send_from_control(probe_bytes, target);
+                }
             }
-        }
-        for ip in crate::network::get_lan_arp_neighbors() {
-            let target = SocketAddr::V4(SocketAddrV4::new(ip, DEFAULT_UDP_PORT));
-            s.send_from_both(probe_bytes, target);
-            probed_udp_targets.insert(target);
         }
         for ip in s.recent_peer_ips(Duration::from_secs(60)) {
             let target = SocketAddr::new(ip, DEFAULT_UDP_PORT);
-            s.send_from_both(probe_bytes, target);
-            probed_udp_targets.insert(target);
+            if probed_udp_targets.insert(target) {
+                s.send_from_control(probe_bytes, target);
+            }
         }
         for target in s.recent_peer_addrs(Duration::from_secs(60)) {
             if probed_udp_targets.insert(target) {
-                s.send_from_both(probe_bytes, target);
+                s.send_from_control(probe_bytes, target);
             }
         }
         if let Some(secret) = clean_secret {
             for target in s.recent_beacon_udp_targets_for_secret(Duration::from_secs(60), secret) {
                 if probed_udp_targets.insert(target) {
-                    s.send_from_both(probe_bytes, target);
+                    s.send_from_control(probe_bytes, target);
                 }
             }
         }
     }
 
-    // Spawn parallel TCP fallback discovery ONLY across active ARP neighbors (prevents 100% CPU flood)
-    let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel::<DiscoveredPeer>();
-    if let Some(secret) = clean_secret {
-        let secret_owned = secret.to_string();
-        let arp_candidates = crate::network::get_lan_arp_neighbors();
-        let max_tcp_budget = timeout_dur.saturating_sub(Duration::from_millis(100));
-        tokio::spawn(async move {
-            let sem = Arc::new(Semaphore::new(8));
-            let mut handles = Vec::new();
-            for ip in arp_candidates {
-                let sem_clone = sem.clone();
-                let sec = secret_owned.clone();
-                let tx = tcp_tx.clone();
-                handles.push(tokio::spawn(async move {
-                    let Ok(_permit) = sem_clone.acquire_owned().await else {
-                        return;
-                    };
-                    let addr = SocketAddr::V4(SocketAddrV4::new(ip, DEFAULT_TCP_PORT));
-                    if let Ok(Ok(tcp_stream)) =
-                        tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
-                            .await
-                    {
-                        if let Ok((_, resp)) = tokio::time::timeout(
-                            Duration::from_millis(800),
-                            perform_tls_client_handshake(tcp_stream, &sec),
-                        )
-                        .await
-                        .unwrap_or(Err(String::new()))
-                        {
-                            let _ = tx.send(DiscoveredPeer {
-                                host_name: resp.server_name,
-                                ip: ip.to_string(),
-                                port: DEFAULT_TCP_PORT,
-                                last_seen: Instant::now(),
-                            });
-                        }
-                    }
-                }));
-            }
-            let _ = tokio::time::timeout(max_tcp_budget, async {
-                for h in handles {
-                    let _ = h.await;
-                }
-            })
-            .await;
-        });
-    } else {
-        drop(tcp_tx);
-    }
-
     let scan_start = Instant::now();
     let query_since = scan_start
-        .checked_sub(Duration::from_secs(10))
+        .checked_sub(Duration::from_secs(30))
         .unwrap_or(scan_start);
 
     while scan_start.elapsed() < timeout_dur {
-        // Collect beacons from DiscoveryService cache
-        if let Some(s) = svc {
+        // Collect and decrypt V3 beacons from DiscoveryService cache
+        if let (Some(s), Some(secret)) = (svc, clean_secret) {
             for b in s.beacons_since(query_since) {
-                if is_private_lan_ip(&b.src) && discovered.len() < 64 {
-                    if let Some(secret) = clean_secret {
-                        if !verify_ring_beacon_tag(
-                            &b.beacon.host_name,
-                            b.beacon.port,
-                            &b.beacon.nonce,
-                            secret,
-                            &b.beacon.ring_tag,
-                        ) {
-                            continue;
-                        }
-                        s.record_authenticated_peer_ip(b.src);
-                        if b.src_port != 0 && b.src_port != DEFAULT_UDP_PORT {
-                            let peer_udp_target = SocketAddr::new(b.src, b.src_port);
-                            if probed_udp_targets.insert(peer_udp_target) {
-                                if let Some(ref probe_bytes) = probe_bytes_opt {
-                                    s.send_from_both(probe_bytes, peer_udp_target);
-                                }
+                if is_private_lan_ip(&b.src) && discovered.len() < MAX_DISCOVERED_PEERS {
+                    let Some(payload) = b.beacon.decrypt(secret) else {
+                        continue;
+                    };
+                    s.record_authenticated_peer_ip(b.src);
+                    if b.src_port >= 1024 && b.src_port != DEFAULT_UDP_PORT {
+                        let peer_udp_target = SocketAddr::new(b.src, b.src_port);
+                        if probed_udp_targets.insert(peer_udp_target) {
+                            if let Some(ref probe_bytes) = probe_bytes_opt {
+                                s.send_from_control(probe_bytes, peer_udp_target);
                             }
                         }
-                    } else if !b.beacon.ring_tag.is_empty() {
-                        continue;
                     }
 
-                    let sanitized_name: String = b
-                        .beacon
-                        .host_name
-                        .chars()
-                        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                        .take(64)
-                        .collect();
-                    let host_name = if sanitized_name.is_empty() {
-                        "UnknownHost".to_string()
-                    } else {
-                        sanitized_name
-                    };
-
-                    let key = format!("{}:{}", b.src, b.beacon.port);
+                    let host_name = sanitize_discovered_host_name(&payload.host_name);
+                    let key = format!("{}:{}", b.src, payload.port);
                     discovered.insert(
                         key,
                         DiscoveredPeer {
                             host_name,
                             ip: b.src.to_string(),
-                            port: b.beacon.port,
+                            port: payload.port,
                             last_seen: b.received_at,
                         },
                     );
@@ -260,21 +182,7 @@ pub async fn scan_lan_for_hosts(
             }
         }
 
-        while let Ok(peer) = tcp_rx.try_recv() {
-            if discovered.len() < 64 {
-                let key = format!("{}:{}", peer.ip, peer.port);
-                discovered.insert(key, peer);
-            }
-        }
-
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    while let Ok(peer) = tcp_rx.try_recv() {
-        if discovered.len() < 64 {
-            let key = format!("{}:{}", peer.ip, peer.port);
-            discovered.insert(key, peer);
-        }
     }
 
     // Include self if currently hosting on this machine
@@ -360,15 +268,6 @@ async fn perform_tls_client_handshake_step(
     }
 
     Ok((tls_stream, resp))
-}
-
-async fn perform_tls_client_handshake(
-    tcp_stream: TcpStream,
-    password: &str,
-) -> Result<(ClientTlsStream, HandshakeResponse), String> {
-    perform_tls_client_handshake_step(tcp_stream, password)
-        .await
-        .map_err(TransferError::into_message)
 }
 
 async fn connect_via_reverse_tcp_step(
@@ -502,32 +401,38 @@ async fn connect_to_host_step(
         }
         _ if !policy.reverse_tcp_timeout.is_zero() => {
             // 2. Direct TCP timed out or was refused (e.g. Linux ufw/firewalld blocking inbound TCP 22222 or ephemeral server port).
-            // Look up the specific host instance's HMAC-verified UDP control port (or fallback to 22223).
-            let target_udp_port = crate::discovery::service()
-                .map(|s| s.peer_udp_port_for_secret(addr.ip(), addr.port(), password))
-                .unwrap_or(DEFAULT_UDP_PORT);
+            // Only attempt Reverse TCP if we have a verified UDP beacon from this peer (same L2 LAN discovery).
+            // For cross-subnet / VPN Direct IP connections where no UDP beacon was received, skip Reverse TCP cleanly.
+            let has_verified_udp = crate::discovery::service()
+                .map(|s| s.has_verified_beacon(addr.ip(), addr.port(), password))
+                .unwrap_or(false);
 
-            // First send a DiscoveryProbe to punch/refresh stateful conntrack pinhole on host
-            if let Some(s) = crate::discovery::service() {
-                let probe = DiscoveryProbe::new(password);
-                if let Ok(bytes) = serde_json::to_vec(&probe) {
-                    s.send_from_both(&bytes, SocketAddr::new(addr.ip(), target_udp_port));
+            if has_verified_udp {
+                let target_udp_port = crate::discovery::service()
+                    .map(|s| s.peer_udp_port_for_secret(addr.ip(), addr.port(), password))
+                    .unwrap_or(DEFAULT_UDP_PORT);
+
+                if let Some(s) = crate::discovery::service() {
+                    let probe = DiscoveryProbe::new(password);
+                    if let Ok(bytes) = serde_json::to_vec(&probe) {
+                        s.send_from_control(&bytes, SocketAddr::new(addr.ip(), target_udp_port));
+                    }
                 }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Automatically attempt Reverse TCP traversal via the host's UDP control endpoint!
-            match connect_via_reverse_tcp_step(
-                addr.ip(),
-                target_udp_port,
-                password,
-                policy.reverse_tcp_timeout,
-            )
-            .await
-            {
-                Ok(res) => return Ok(res),
-                Err(TransferError::Fatal(e)) => return Err(TransferError::Fatal(e)),
-                Err(TransferError::Recoverable(_)) => {}
+                // Automatically attempt Reverse TCP traversal via the host's UDP control endpoint!
+                match connect_via_reverse_tcp_step(
+                    addr.ip(),
+                    target_udp_port,
+                    password,
+                    policy.reverse_tcp_timeout,
+                )
+                .await
+                {
+                    Ok(res) => return Ok(res),
+                    Err(TransferError::Fatal(e)) => return Err(TransferError::Fatal(e)),
+                    Err(TransferError::Recoverable(_)) => {}
+                }
             }
         }
         _ => {}
@@ -696,33 +601,25 @@ fn find_peer_in_discovery_beacons(
     secret: &str,
 ) -> Option<DiscoveredPeer> {
     let trimmed = expected_name.trim();
-    if trimmed.is_empty() || trimmed.parse::<IpAddr>().is_ok() {
+    let clean_secret = secret.trim();
+    if trimmed.is_empty() || clean_secret.is_empty() || trimmed.parse::<IpAddr>().is_ok() {
         return None;
     }
     let svc = crate::discovery::service()?;
     let now = Instant::now();
-    let since = now.checked_sub(Duration::from_secs(30)).unwrap_or(now);
-    let clean_secret = secret.trim();
+    let since = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
     let mut candidates = Vec::new();
     for b in svc.beacons_since(since) {
         if !is_private_lan_ip(&b.src) {
             continue;
         }
-        if !clean_secret.is_empty()
-            && !verify_ring_beacon_tag(
-                &b.beacon.host_name,
-                b.beacon.port,
-                &b.beacon.nonce,
-                clean_secret,
-                &b.beacon.ring_tag,
-            )
-        {
+        let Some(payload) = b.beacon.decrypt(clean_secret) else {
             continue;
-        }
+        };
         candidates.push(DiscoveredPeer {
-            host_name: sanitize_discovered_host_name(&b.beacon.host_name),
+            host_name: sanitize_discovered_host_name(&payload.host_name),
             ip: b.src.to_string(),
-            port: b.beacon.port,
+            port: payload.port,
             last_seen: b.received_at,
         });
     }
@@ -1800,10 +1697,12 @@ mod tests {
             let mut buf = [0u8; 1024];
             let (len, src) = host_udp.recv_from(&mut buf).await.unwrap();
             let rev: ReverseConnectRequest = serde_json::from_slice(&buf[..len]).unwrap();
-            assert!(rev.verify(&sec_owned));
+            let payload = rev
+                .decrypt(&sec_owned)
+                .expect("valid V3 ReverseConnectRequest");
 
             // Host initiates outbound TCP connection back to client's callback port
-            let tcp = TcpStream::connect(SocketAddr::new(src.ip(), rev.tcp_port))
+            let tcp = TcpStream::connect(SocketAddr::new(src.ip(), payload.tcp_port))
                 .await
                 .unwrap();
             let acceptor = TlsAcceptor::from(server_cfg);
@@ -2248,23 +2147,23 @@ mod tests {
         host_udp.send_to(&beacon_bytes, target_ctrl).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            svc.peer_udp_port("127.0.0.1".parse().unwrap(), blocked_tcp_port),
+            svc.peer_udp_port_for_secret("127.0.0.1".parse().unwrap(), blocked_tcp_port, secret),
             host_udp_port
         );
 
         let sec_owned = secret.to_string();
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            let (rev, src) = loop {
+            let (payload, src) = loop {
                 let (len, src) = host_udp.recv_from(&mut buf).await.unwrap();
                 if let Ok(rev) = serde_json::from_slice::<ReverseConnectRequest>(&buf[..len]) {
-                    if rev.verify(&sec_owned) {
-                        break (rev, src);
+                    if let Some(payload) = rev.decrypt(&sec_owned) {
+                        break (payload, src);
                     }
                 }
             };
 
-            let tcp = TcpStream::connect(SocketAddr::new(src.ip(), rev.tcp_port))
+            let tcp = TcpStream::connect(SocketAddr::new(src.ip(), payload.tcp_port))
                 .await
                 .unwrap();
             let acceptor = TlsAcceptor::from(server_cfg);
@@ -2297,5 +2196,30 @@ mod tests {
             .map_err(TransferError::into_message)
             .expect("Reverse TCP must reach per-instance UDP control port");
         assert_eq!(resp.server_name, "SecondInstance");
+    }
+
+    #[tokio::test]
+    async fn test_direct_ip_without_verified_beacon_skips_reverse_tcp() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unadvertised_port = probe_listener.local_addr().unwrap().port();
+        drop(probe_listener);
+
+        let policy = ReconnectPolicy {
+            tcp_connect_timeout: Duration::from_millis(60),
+            reverse_tcp_timeout: Duration::from_millis(1500),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let res = connect_to_host_step(
+            "127.0.0.1",
+            unadvertised_port,
+            "unadvertised-vpn-secret",
+            policy,
+        )
+        .await;
+        assert!(res.is_err());
+        // Should fail fast right after tcp_connect_timeout without waiting 1500ms for Reverse TCP
+        assert!(start.elapsed() < Duration::from_millis(600));
     }
 }

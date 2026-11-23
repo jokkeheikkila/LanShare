@@ -2,15 +2,10 @@
 //!
 //! Exactly ONE socket per process owns the discovery port. A dedicated OS thread receives packets and
 //! dispatches them by their `magic` field:
-//! * `LANSHARE_BEACON_V2`  -> stored in a short-lived cache read by `scan_lan_for_hosts`
-//! * `LANSHARE_PROBE_V2`   -> forwarded to the running server (if hosting)
-//! * `LANSHARE_REVCONN_V2` -> forwarded to the running server (if hosting)
-//!
-//! Sending everything (beacons, probes, reverse-connect requests) from this same socket keeps the
-//! source port at 22223, so stateful firewalls (`nf_conntrack`, Windows Firewall) treat the peer's
-//! replies to 22223 as `ESTABLISHED` traffic.
+//! * `LANSHARE_BEACON_V3`  -> stored in a bounded cache read by `scan_lan_for_hosts`
+//! * `LANSHARE_PROBE_V3`   -> forwarded to the running server (if hosting)
+//! * `LANSHARE_REVCONN_V3` -> forwarded to the running server (if hosting)
 
-use crate::network::verify_ring_beacon_tag;
 use crate::protocol::{
     DiscoveryBeacon, DiscoveryProbe, ReverseConnectRequest, BEACON_MAGIC, DEFAULT_UDP_PORT,
     PROBE_MAGIC, REVERSE_MAGIC,
@@ -30,10 +25,10 @@ fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const MAX_CACHED_BEACONS: usize = 256;
+const MAX_CACHED_BEACONS: usize = 1024;
 const BEACON_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// A beacon received from the network (not yet verified against any LAN secret).
+/// A beacon received from the network (AEAD-encrypted until decrypted with a Share-Ring secret).
 #[derive(Debug, Clone)]
 pub struct ReceivedBeacon {
     pub beacon: DiscoveryBeacon,
@@ -61,7 +56,7 @@ pub struct DiscoveryService {
     local_port: u16,
     control_sock: UdpSocket,
     control_port: u16,
-    beacons: Mutex<HashMap<(IpAddr, u16, u16), ReceivedBeacon>>,
+    beacons: Mutex<HashMap<(IpAddr, u16), ReceivedBeacon>>,
     recent_ips: Mutex<HashMap<IpAddr, Instant>>,
     recent_addrs: Mutex<HashMap<SocketAddr, Instant>>,
     server: Mutex<Option<ServerRegistration>>,
@@ -217,25 +212,32 @@ impl DiscoveryService {
         match header.magic.as_str() {
             BEACON_MAGIC => {
                 if let Ok(beacon) = serde_json::from_slice::<DiscoveryBeacon>(data) {
-                    if beacon.port < 1024 {
+                    if beacon.ciphertext.is_empty() {
                         return;
                     }
                     let mut map = lock_mutex(&self.beacons);
-                    if map.len() >= MAX_CACHED_BEACONS {
+                    let key = (src.ip(), src.port());
+                    if !map.contains_key(&key) && map.len() >= MAX_CACHED_BEACONS {
                         map.retain(|_, b| b.received_at.elapsed() < BEACON_CACHE_TTL);
+                        if map.len() >= MAX_CACHED_BEACONS {
+                            if let Some(oldest_key) = map
+                                .iter()
+                                .min_by_key(|(_, b)| b.received_at)
+                                .map(|(k, _)| *k)
+                            {
+                                map.remove(&oldest_key);
+                            }
+                        }
                     }
-                    let key = (src.ip(), beacon.port, src.port());
-                    if map.len() < MAX_CACHED_BEACONS || map.contains_key(&key) {
-                        map.insert(
-                            key,
-                            ReceivedBeacon {
-                                beacon,
-                                src: src.ip(),
-                                src_port: src.port(),
-                                received_at: Instant::now(),
-                            },
-                        );
-                    }
+                    map.insert(
+                        key,
+                        ReceivedBeacon {
+                            beacon,
+                            src: src.ip(),
+                            src_port: src.port(),
+                            received_at: Instant::now(),
+                        },
+                    );
                 }
             }
             PROBE_MAGIC => {
@@ -295,7 +297,25 @@ impl DiscoveryService {
             .collect()
     }
 
-    /// Returns the UDP source port last seen on HMAC-verified beacons from `(ip, tcp_port)` for `secret`,
+    /// Returns true if a recent (within `BEACON_CACHE_TTL`) AEAD-verified beacon from `(ip, tcp_port)`
+    /// matching `secret` exists in the discovery cache.
+    pub fn has_verified_beacon(&self, ip: IpAddr, tcp_port: u16, secret: &str) -> bool {
+        let clean = secret.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        lock_mutex(&self.beacons).values().any(|b| {
+            b.src == ip
+                && b.src_port >= 1024
+                && b.received_at.elapsed() < BEACON_CACHE_TTL
+                && b.beacon
+                    .decrypt(clean)
+                    .map(|p| p.port == tcp_port)
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Returns the UDP source port last seen on AEAD-verified beacons from `(ip, tcp_port)` for `secret`,
     /// falling back to `22223`. Prevents unauthenticated or different-key LAN packets from hijacking Reverse TCP.
     pub fn peer_udp_port_for_secret(&self, ip: IpAddr, tcp_port: u16, secret: &str) -> u16 {
         let clean = secret.trim();
@@ -306,32 +326,18 @@ impl DiscoveryService {
             .values()
             .filter(|b| {
                 b.src == ip
-                    && b.beacon.port == tcp_port
                     && b.src_port >= 1024
-                    && verify_ring_beacon_tag(
-                        &b.beacon.host_name,
-                        b.beacon.port,
-                        &b.beacon.nonce,
-                        clean,
-                        &b.beacon.ring_tag,
-                    )
+                    && b.beacon
+                        .decrypt(clean)
+                        .map(|p| p.port == tcp_port)
+                        .unwrap_or(false)
             })
             .max_by_key(|b| b.received_at)
             .map(|b| b.src_port)
             .unwrap_or(DEFAULT_UDP_PORT)
     }
 
-    /// Returns the UDP source port last seen on beacons from `(ip, tcp_port)`, falling back to `22223`.
-    pub fn peer_udp_port(&self, ip: IpAddr, tcp_port: u16) -> u16 {
-        lock_mutex(&self.beacons)
-            .values()
-            .filter(|b| b.src == ip && b.beacon.port == tcp_port && b.src_port >= 1024)
-            .max_by_key(|b| b.received_at)
-            .map(|b| b.src_port)
-            .unwrap_or(DEFAULT_UDP_PORT)
-    }
-
-    /// Unique `(ip, udp_port)` endpoints of recently heard beacons whose `ring_tag` is verified for `secret`.
+    /// Unique `(ip, udp_port)` endpoints of recently heard beacons whose AEAD payload is verified for `secret`.
     pub fn recent_beacon_udp_targets_for_secret(
         &self,
         within: Duration,
@@ -346,13 +352,7 @@ impl DiscoveryService {
             .filter(|b| {
                 b.received_at.elapsed() < within
                     && b.src_port >= 1024
-                    && verify_ring_beacon_tag(
-                        &b.beacon.host_name,
-                        b.beacon.port,
-                        &b.beacon.nonce,
-                        clean,
-                        &b.beacon.ring_tag,
-                    )
+                    && b.beacon.decrypt(clean).is_some()
             })
             .map(|b| SocketAddr::new(b.src, b.src_port))
             .collect();
@@ -454,9 +454,23 @@ mod tests {
             SocketAddr::new(ip, 50102),
         );
 
-        assert_eq!(svc.peer_udp_port(ip, 22222), 50101);
-        assert_eq!(svc.peer_udp_port(ip, 43867), 50102);
-        assert_eq!(svc.peer_udp_port(ip, 55555), DEFAULT_UDP_PORT);
+        assert!(svc.has_verified_beacon(ip, 22222, "ring-a-secret"));
+        assert!(svc.has_verified_beacon(ip, 43867, "ring-b-secret"));
+        assert!(!svc.has_verified_beacon(ip, 43867, "ring-a-secret"));
+        assert!(!svc.has_verified_beacon(ip, 55555, "ring-b-secret"));
+
+        assert_eq!(
+            svc.peer_udp_port_for_secret(ip, 22222, "ring-a-secret"),
+            50101
+        );
+        assert_eq!(
+            svc.peer_udp_port_for_secret(ip, 43867, "ring-b-secret"),
+            50102
+        );
+        assert_eq!(
+            svc.peer_udp_port_for_secret(ip, 55555, "ring-b-secret"),
+            DEFAULT_UDP_PORT
+        );
 
         // Rogue / wrong-secret beacon claiming the same (ip, tcp_port) from another UDP source port
         // must NOT hijack peer_udp_port_for_secret or recent_beacon_udp_targets_for_secret.
@@ -488,5 +502,34 @@ mod tests {
         assert!(verified_targets.contains(&SocketAddr::new(ip, 50102)));
         assert!(!verified_targets.contains(&SocketAddr::new(ip, 59999)));
         assert!(!verified_targets.contains(&SocketAddr::new(ip, 53)));
+    }
+
+    #[test]
+    fn test_discovery_cache_evicts_oldest_when_at_capacity() {
+        let svc = service().expect("discovery service should start");
+        let beacon = DiscoveryBeacon::new("LanPartyHost".to_string(), 22222, "lan-party-secret");
+        let bytes = serde_json::to_vec(&beacon).unwrap();
+
+        for i in 0..(MAX_CACHED_BEACONS + 32) {
+            let b2 = ((i / 250) % 250 + 1) as u8;
+            let b3 = (i % 250 + 1) as u8;
+            let ip: IpAddr = Ipv4Addr::new(10, 99, b2, b3).into();
+            let port = 40000 + (i as u16 % 10000);
+            svc.handle_packet(&bytes, SocketAddr::new(ip, port));
+        }
+
+        let cache_len = lock_mutex(&svc.beacons).len();
+        assert!(cache_len <= MAX_CACHED_BEACONS);
+
+        // The most recently inserted peer must be retained, not dropped
+        let last_idx = MAX_CACHED_BEACONS + 31;
+        let last_ip: IpAddr = Ipv4Addr::new(
+            10,
+            99,
+            ((last_idx / 250) % 250 + 1) as u8,
+            (last_idx % 250 + 1) as u8,
+        )
+        .into();
+        assert!(svc.has_verified_beacon(last_ip, 22222, "lan-party-secret"));
     }
 }

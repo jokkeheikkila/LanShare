@@ -423,7 +423,7 @@ pub async fn start_server(
     let udp_active_uploads = active_uploads.clone();
 
     tokio::spawn(async move {
-        let mut seen_rev_nonces: VecDeque<[u8; 16]> = VecDeque::with_capacity(32);
+        let mut seen_rev_nonces: VecDeque<[u8; 12]> = VecDeque::with_capacity(32);
         let mut next_broadcast = Instant::now();
 
         while beacon_running.load(Ordering::Relaxed) {
@@ -432,32 +432,26 @@ pub async fn start_server(
                 let beacon = DiscoveryBeacon::new(host_name.clone(), port, &beacon_secret);
                 if let Ok(beacon_bytes) = serde_json::to_vec(&beacon) {
                     if let Some(svc) = crate::discovery::service() {
-                        let bindings = crate::network::get_broadcast_bindings(DEFAULT_UDP_PORT);
-                        for binding in &bindings {
-                            for target in &binding.targets {
-                                svc.send_from_control(&beacon_bytes, *target);
+                        let mut targets = std::collections::HashSet::new();
+                        for binding in crate::network::get_broadcast_bindings(DEFAULT_UDP_PORT) {
+                            for target in binding.targets {
+                                targets.insert(target);
                             }
                         }
                         for peer_ip in svc.recent_peer_ips(Duration::from_secs(60)) {
-                            svc.send_from_control(
-                                &beacon_bytes,
-                                SocketAddr::new(peer_ip, DEFAULT_UDP_PORT),
-                            );
+                            targets.insert(SocketAddr::new(peer_ip, DEFAULT_UDP_PORT));
                         }
                         for peer_addr in svc.recent_peer_addrs(Duration::from_secs(60)) {
-                            if peer_addr.port() != DEFAULT_UDP_PORT {
-                                svc.send_from_control(&beacon_bytes, peer_addr);
-                            }
+                            targets.insert(peer_addr);
                         }
-                        for arp_ip in crate::network::get_lan_arp_neighbors() {
-                            svc.send_from_control(
-                                &beacon_bytes,
-                                SocketAddr::new(arp_ip.into(), DEFAULT_UDP_PORT),
-                            );
+                        for target in targets {
+                            svc.send_from_control(&beacon_bytes, target);
                         }
                     }
                 }
-                next_broadcast = Instant::now() + Duration::from_millis(850);
+                let jitter_bytes: [u8; 2] = crate::network::random_bytes();
+                let jitter_ms = (u16::from_le_bytes(jitter_bytes) % 3001) as u64;
+                next_broadcast = Instant::now() + Duration::from_millis(12_000 + jitter_ms);
             }
 
             let wait_dur = next_broadcast
@@ -479,13 +473,12 @@ pub async fn start_server(
                                 if let Some(svc) = crate::discovery::service() {
                                     svc.record_authenticated_peer_addr(src);
                                     if let Ok(reply_bytes) = serde_json::to_vec(&reply) {
-                                        svc.send_from_control(&reply_bytes, src);
-                                        if src.port() != DEFAULT_UDP_PORT {
-                                            svc.send_from_control(
-                                                &reply_bytes,
-                                                SocketAddr::new(src.ip(), DEFAULT_UDP_PORT),
-                                            );
-                                        }
+                                        let jitter_byte = crate::network::random_bytes::<1>()[0];
+                                        let delay_ms = 20 + (u64::from(jitter_byte) % 131);
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                            svc.send_from_control(&reply_bytes, src);
+                                        });
                                     }
                                 }
                             }
@@ -504,10 +497,10 @@ pub async fn start_server(
                                 }
                             }
 
-                            if !rev_req.verify(&beacon_secret) {
+                            let Some(rev_payload) = rev_req.decrypt(&beacon_secret) else {
                                 record_failed_attempt(&udp_failed, peer_ip).await;
                                 continue;
-                            }
+                            };
 
                             if let Some(svc) = crate::discovery::service() {
                                 svc.record_authenticated_peer_addr(src);
@@ -526,7 +519,7 @@ pub async fn start_server(
                                 continue;
                             };
 
-                            let target_addr = SocketAddr::new(peer_ip, rev_req.tcp_port);
+                            let target_addr = SocketAddr::new(peer_ip, rev_payload.tcp_port);
                             let acc = udp_acceptor.clone();
                             let reg = udp_registry.clone();
                             let pwd = udp_pwd.clone();
@@ -541,7 +534,7 @@ pub async fn start_server(
                             let ts = crate::core::Local::now().format("%Y-%m-%d %H:%M:%S");
                             let _ = l_tx.send(ServerLogEvent {
                                 timestamp: ts,
-                                message: format!("Reverse TCP requested by {}. Connecting to callback port {}...", peer_ip, rev_req.tcp_port),
+                                message: format!("Reverse TCP requested by {}. Connecting to callback port {}...", peer_ip, rev_payload.tcp_port),
                                 is_error: false,
                             });
 
