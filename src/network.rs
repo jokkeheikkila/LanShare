@@ -274,11 +274,47 @@ pub struct LocalIpv4Subnet {
     pub broadcast: Ipv4Addr,
 }
 
+/// Returns true if an adapter/interface name matches known virtual hypervisor, container, or tunnel
+/// bridges (e.g., VMware `VMnet1`/`VMnet8`, VirtualBox Host-Only, Hyper-V/WSL `vEthernet`, Docker).
+pub fn is_virtual_interface_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("vmware")
+        || lower.contains("vmnet")
+        || lower.contains("virtualbox")
+        || lower.contains("vboxnet")
+        || lower.contains("vethernet")
+        || lower.contains("hyper-v")
+        || lower.contains("wsl")
+        || lower.contains("docker")
+        || lower.starts_with("br-")
+        || lower.starts_with("virbr")
+        || lower.starts_with("veth")
+        || lower.contains("loopback")
+}
+
+/// Queries the OS routing table via an unbound UDP connect to determine the primary default-route
+/// outbound IPv4 LAN address (never transmits any packets on the wire).
+fn detect_primary_route_ipv4() -> Option<Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80")
+        .or_else(|_| sock.connect("8.8.8.8:80"))
+        .ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(ipv4)
+            if !ipv4.is_loopback() && crate::security::is_private_lan_ip(&IpAddr::V4(ipv4)) =>
+        {
+            Some(ipv4)
+        }
+        _ => None,
+    }
+}
+
 /// Queries active broadcast-capable private IPv4 interfaces and their true subnet masks.
-/// Skips loopback, point-to-point/tunnel (VPN), and down interfaces.
+/// Skips loopback, point-to-point/tunnel (VPN), virtual hypervisor bridges (VMware/VirtualBox/Docker), and down interfaces.
 #[cfg(unix)]
 pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
     let mut subnets = Vec::new();
+    let mut fallback_virtual = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` initializes `ifap` with a linked list of interface structures
     // allocated by libc, which we traverse read-only and free via `freeifaddrs` before returning.
@@ -304,21 +340,33 @@ pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
                 && (*ifa.ifa_addr).sa_family as libc::c_int == libc::AF_INET
                 && (*ifa.ifa_netmask).sa_family as libc::c_int == libc::AF_INET
             {
+                let if_name = if !ifa.ifa_name.is_null() {
+                    std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy()
+                } else {
+                    std::borrow::Cow::Borrowed("")
+                };
                 let addr_in = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                 let mask_in = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
                 let ip = Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
                 let netmask = Ipv4Addr::from(u32::from_be(mask_in.sin_addr.s_addr));
 
-                if !ip.is_loopback()
-                    && (ip.is_private() || ip.is_link_local())
-                    && !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ip)
-                {
+                if !ip.is_loopback() && (ip.is_private() || ip.is_link_local()) {
                     if let Some(broadcast) = compute_directed_broadcast(ip, netmask) {
-                        subnets.push(LocalIpv4Subnet {
+                        let entry = LocalIpv4Subnet {
                             ip,
                             netmask,
                             broadcast,
-                        });
+                        };
+                        if is_virtual_interface_name(&if_name) {
+                            if !fallback_virtual
+                                .iter()
+                                .any(|s: &LocalIpv4Subnet| s.ip == ip)
+                            {
+                                fallback_virtual.push(entry);
+                            }
+                        } else if !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ip) {
+                            subnets.push(entry);
+                        }
                     }
                 }
             }
@@ -326,33 +374,66 @@ pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
         }
         libc::freeifaddrs(ifap);
     }
-    subnets
+    if subnets.is_empty() {
+        fallback_virtual
+    } else {
+        subnets
+    }
 }
 
 #[cfg(not(unix))]
 pub fn get_local_ipv4_subnets() -> Vec<LocalIpv4Subnet> {
     let mut subnets = Vec::new();
+    let mut fallback_virtual = Vec::new();
+    let primary_ip = detect_primary_route_ipv4();
     if let Ok(ifaces) = list_afinet_netifas() {
-        for (_name, ip) in ifaces {
+        for (name, ip) in ifaces {
             if let IpAddr::V4(ipv4) = ip {
                 // Only include RFC 1918 / link-local LAN interfaces (exclude CGNAT 100.64.0.0/10 VPN tunnels)
-                if !ipv4.is_loopback()
-                    && (ipv4.is_private() || ipv4.is_link_local())
-                    && !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ipv4)
-                {
+                if !ipv4.is_loopback() && (ipv4.is_private() || ipv4.is_link_local()) {
+                    // Use /24 for 192.168.x.x, or /16 for 10.x.x.x / 172.16-31.x.x if /24 isn't known on Windows
                     let netmask = Ipv4Addr::new(255, 255, 255, 0);
                     if let Some(broadcast) = compute_directed_broadcast(ipv4, netmask) {
-                        subnets.push(LocalIpv4Subnet {
+                        let entry = LocalIpv4Subnet {
                             ip: ipv4,
                             netmask,
                             broadcast,
-                        });
+                        };
+                        if is_virtual_interface_name(&name) && primary_ip != Some(ipv4) {
+                            if !fallback_virtual
+                                .iter()
+                                .any(|s: &LocalIpv4Subnet| s.ip == ipv4)
+                            {
+                                fallback_virtual.push(entry);
+                            }
+                        } else if !subnets.iter().any(|s: &LocalIpv4Subnet| s.ip == ipv4) {
+                            subnets.push(entry);
+                        }
                     }
                 }
             }
         }
     }
-    subnets
+    if let Some(p_ip) = primary_ip {
+        if !subnets.iter().any(|s| s.ip == p_ip) {
+            let netmask = Ipv4Addr::new(255, 255, 255, 0);
+            if let Some(broadcast) = compute_directed_broadcast(p_ip, netmask) {
+                subnets.insert(
+                    0,
+                    LocalIpv4Subnet {
+                        ip: p_ip,
+                        netmask,
+                        broadcast,
+                    },
+                );
+            }
+        }
+    }
+    if subnets.is_empty() {
+        fallback_virtual
+    } else {
+        subnets
+    }
 }
 
 /// Returns true if `target_ip` is on the same L2 IPv4 subnet as any local broadcast interface,
@@ -378,9 +459,52 @@ pub struct BroadcastBinding {
     pub targets: Vec<SocketAddr>,
 }
 
+/// Reads active private LAN IPv4 addresses on our local non-virtual subnets from the OS ARP cache
+/// (`/proc/net/arp` on Linux), capped at 16 neighbors.
+/// Sending a single unicast UDP probe to active local ARP neighbors punches Linux `nf_conntrack`
+/// (`ufw`/`firewalld`) stateful firewall pinholes even when the remote peer's firewall drops
+/// inbound broadcast UDP (`:22223`) while allowing TCP (`:22222`).
+pub fn get_local_arp_neighbors_capped(max_neighbors: usize) -> Vec<Ipv4Addr> {
+    let mut neighbors = Vec::new();
+    let local_subnets = get_local_ipv4_subnets();
+    if local_subnets.is_empty() {
+        return neighbors;
+    }
+
+    if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
+        for line in content.lines().skip(1) {
+            if neighbors.len() >= max_neighbors {
+                break;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(ip_str) = parts.next() else { continue };
+            let _hw_type = parts.next();
+            let flags = parts.next().unwrap_or("");
+            // Skip incomplete ARP entries (0x0)
+            if flags == "0x0" {
+                continue;
+            }
+            if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
+                if !ipv4.is_loopback()
+                    && (ipv4.is_private() || ipv4.is_link_local())
+                    && !local_subnets.iter().any(|s| s.ip == ipv4)
+                    && local_subnets
+                        .iter()
+                        .any(|s| ipv4_in_same_subnet(s.ip, ipv4, s.netmask))
+                    && !neighbors.contains(&ipv4)
+                {
+                    neighbors.push(ipv4);
+                }
+            }
+        }
+    }
+
+    neighbors
+}
+
 /// Retrieves local IPv4 broadcast bindings using each interface's real subnet broadcast address.
-/// Emits exactly 1 broadcast target per unique broadcast domain (no ARP neighbor sweeping or 3x duplicates),
-/// falling back to a single `255.255.255.255` target only when no interface-specific broadcast exists.
+/// Emits 1 directed broadcast target per unique physical broadcast domain (plus a single `255.255.255.255`
+/// limited broadcast fallback on non-Unix platforms where netmask is estimated), with zero ARP sweeping in periodic loops.
 pub fn get_broadcast_bindings(port: u16) -> Vec<BroadcastBinding> {
     let mut bindings = Vec::new();
     let mut seen_targets = HashSet::new();
@@ -395,55 +519,83 @@ pub fn get_broadcast_bindings(port: u16) -> Vec<BroadcastBinding> {
         }
     }
 
-    if bindings.is_empty() {
-        bindings.push(BroadcastBinding {
-            bind_ip: Ipv4Addr::UNSPECIFIED,
-            targets: vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port))],
-        });
+    if bindings.is_empty() || cfg!(not(unix)) {
+        let limited = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port));
+        if seen_targets.insert(limited) {
+            bindings.push(BroadcastBinding {
+                bind_ip: Ipv4Addr::UNSPECIFIED,
+                targets: vec![limited],
+            });
+        }
     }
 
     bindings
 }
 
-/// Returns a prioritized list of local LAN IP addresses (prioritizing 192.168.x.x, then 10.x.x.x).
+/// Returns a prioritized list of local LAN IP addresses:
+/// 1. OS default-route primary physical LAN IP first (`detect_primary_route_ipv4` / `local_ip()`),
+/// 2. Non-virtual physical RFC 1918 LAN adapters (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`),
+/// 3. CGNAT / Tailscale (`100.64.0.0/10`),
+/// 4. Virtual hypervisor adapters (`VMware`, `VirtualBox`, `vEthernet`, `WSL`, `Docker`) last so `all_ips[0]`
+///    always displays the real physical LAN IP while `all_ips.contains(...)` still recognizes local virtual IPs.
 pub fn get_all_local_lan_ips() -> Vec<String> {
-    let mut ips = Vec::new();
+    let primary_ip = detect_primary_route_ipv4().or_else(|| match local_ip() {
+        Ok(IpAddr::V4(v4))
+            if !v4.is_loopback() && crate::security::is_private_lan_ip(&IpAddr::V4(v4)) =>
+        {
+            Some(v4)
+        }
+        _ => None,
+    });
 
+    let mut candidates: Vec<(Ipv4Addr, bool)> = Vec::new();
     if let Ok(ifaces) = list_afinet_netifas() {
-        for (_name, ip) in ifaces {
+        for (name, ip) in ifaces {
             if let IpAddr::V4(ipv4) = ip {
                 if !ipv4.is_loopback() && crate::security::is_private_lan_ip(&ip) {
-                    ips.push(ipv4.to_string());
+                    let is_virt = is_virtual_interface_name(&name);
+                    if let Some(existing) = candidates.iter_mut().find(|(c_ip, _)| *c_ip == ipv4) {
+                        // If any non-virtual adapter owns this IP, mark it non-virtual
+                        existing.1 = existing.1 && is_virt;
+                    } else {
+                        candidates.push((ipv4, is_virt));
+                    }
                 }
             }
         }
     }
 
-    if ips.is_empty() {
-        if let Ok(ip) = local_ip() {
-            ips.push(ip.to_string());
-        } else {
-            ips.push("127.0.0.1".to_string());
+    if let Some(p_ip) = primary_ip {
+        if !candidates.iter().any(|(c_ip, _)| *c_ip == p_ip) {
+            candidates.push((p_ip, false));
         }
-    } else {
-        // Prioritize 192.168.x.x, then 10.x.x.x, then 172.x.x.x, then Tailscale 100.x.x.x
-        ips.sort_by_key(|ip| {
-            if ip.starts_with("192.168.") {
-                0
-            } else if ip.starts_with("10.") {
-                1
-            } else if ip.starts_with("172.") {
-                2
-            } else if ip.starts_with("100.") {
-                3
-            } else {
-                4
-            }
-        });
-        ips.dedup();
     }
 
-    ips
+    if candidates.is_empty() {
+        return vec!["127.0.0.1".to_string()];
+    }
+
+    candidates.sort_by_key(|(ipv4, is_virt)| {
+        let is_primary = primary_ip == Some(*ipv4) && !*is_virt;
+        let oct = ipv4.octets();
+        let subnet_rank = if oct[0] == 192 && oct[1] == 168 {
+            0
+        } else if oct[0] == 10 {
+            1
+        } else if oct[0] == 172 && (16..=31).contains(&oct[1]) {
+            2
+        } else if oct[0] == 100 && (64..=127).contains(&oct[1]) {
+            3
+        } else {
+            4
+        };
+        (!is_primary, *is_virt, subnet_rank)
+    });
+
+    candidates
+        .into_iter()
+        .map(|(ipv4, _)| ipv4.to_string())
+        .collect()
 }
 
 /// Generates an in-memory ephemeral self-signed certificate and private key.
@@ -698,6 +850,23 @@ mod tests {
             Ipv4Addr::new(10, 0, 8, 1),
             mask_22
         ));
+    }
+
+    #[test]
+    fn test_virtual_interface_name_detection() {
+        assert!(is_virtual_interface_name("VMware Network Adapter VMnet8"));
+        assert!(is_virtual_interface_name("VMware Network Adapter VMnet1"));
+        assert!(is_virtual_interface_name("vmnet8"));
+        assert!(is_virtual_interface_name(
+            "vEthernet (WSL (Hyper-V firewall))"
+        ));
+        assert!(is_virtual_interface_name("VirtualBox Host-Only Network"));
+        assert!(is_virtual_interface_name("docker0"));
+        assert!(is_virtual_interface_name("virbr0"));
+        assert!(!is_virtual_interface_name("Ethernet"));
+        assert!(!is_virtual_interface_name("Wi-Fi"));
+        assert!(!is_virtual_interface_name("enp5s0"));
+        assert!(!is_virtual_interface_name("wlan0"));
     }
 
     #[tokio::test]

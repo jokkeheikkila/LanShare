@@ -444,14 +444,19 @@ pub async fn start_server(
                         for peer_addr in svc.recent_peer_addrs(Duration::from_secs(60)) {
                             targets.insert(peer_addr);
                         }
+                        // Also punch/refresh local conntrack pinholes to up to 16 active local ARP neighbors
+                        // on the same physical subnet so replies from peers (like Windows) pass Linux ufw/firewalld.
+                        for arp_ip in crate::network::get_local_arp_neighbors_capped(16) {
+                            targets.insert(SocketAddr::new(arp_ip.into(), DEFAULT_UDP_PORT));
+                        }
                         for target in targets {
-                            svc.send_from_control(&beacon_bytes, target);
+                            svc.send_from_both(&beacon_bytes, target);
                         }
                     }
                 }
                 let jitter_bytes: [u8; 2] = crate::network::random_bytes();
-                let jitter_ms = (u16::from_le_bytes(jitter_bytes) % 3001) as u64;
-                next_broadcast = Instant::now() + Duration::from_millis(12_000 + jitter_ms);
+                let jitter_ms = (u16::from_le_bytes(jitter_bytes) % 1001) as u64;
+                next_broadcast = Instant::now() + Duration::from_millis(2_500 + jitter_ms);
             }
 
             let wait_dur = next_broadcast
@@ -477,7 +482,13 @@ pub async fn start_server(
                                         let delay_ms = 20 + (u64::from(jitter_byte) % 131);
                                         tokio::spawn(async move {
                                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                            svc.send_from_control(&reply_bytes, src);
+                                            svc.send_from_both(&reply_bytes, src);
+                                            if src.port() != DEFAULT_UDP_PORT {
+                                                svc.send_from_both(
+                                                    &reply_bytes,
+                                                    SocketAddr::new(src.ip(), DEFAULT_UDP_PORT),
+                                                );
+                                            }
                                         });
                                     }
                                 }

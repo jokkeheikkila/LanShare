@@ -120,25 +120,32 @@ pub async fn scan_lan_for_hosts(
         for binding in get_broadcast_bindings(DEFAULT_UDP_PORT) {
             for target in binding.targets {
                 if probed_udp_targets.insert(target) {
-                    s.send_from_control(probe_bytes, target);
+                    s.send_from_both(probe_bytes, target);
                 }
+            }
+        }
+        // Punch Linux nf_conntrack pinholes for up to 16 active local ARP neighbors on our physical subnet
+        for ip in crate::network::get_local_arp_neighbors_capped(16) {
+            let target = SocketAddr::new(ip.into(), DEFAULT_UDP_PORT);
+            if probed_udp_targets.insert(target) {
+                s.send_from_both(probe_bytes, target);
             }
         }
         for ip in s.recent_peer_ips(Duration::from_secs(60)) {
             let target = SocketAddr::new(ip, DEFAULT_UDP_PORT);
             if probed_udp_targets.insert(target) {
-                s.send_from_control(probe_bytes, target);
+                s.send_from_both(probe_bytes, target);
             }
         }
         for target in s.recent_peer_addrs(Duration::from_secs(60)) {
             if probed_udp_targets.insert(target) {
-                s.send_from_control(probe_bytes, target);
+                s.send_from_both(probe_bytes, target);
             }
         }
         if let Some(secret) = clean_secret {
             for target in s.recent_beacon_udp_targets_for_secret(Duration::from_secs(60), secret) {
                 if probed_udp_targets.insert(target) {
-                    s.send_from_control(probe_bytes, target);
+                    s.send_from_both(probe_bytes, target);
                 }
             }
         }
@@ -162,7 +169,7 @@ pub async fn scan_lan_for_hosts(
                         let peer_udp_target = SocketAddr::new(b.src, b.src_port);
                         if probed_udp_targets.insert(peer_udp_target) {
                             if let Some(ref probe_bytes) = probe_bytes_opt {
-                                s.send_from_control(probe_bytes, peer_udp_target);
+                                s.send_from_both(probe_bytes, peer_udp_target);
                             }
                         }
                     }
@@ -305,6 +312,9 @@ async fn connect_via_reverse_tcp_step(
         for _ in 0..4 {
             if let Some(s) = svc {
                 s.send_from_both(&req_bytes, udp_target);
+                if udp_port != DEFAULT_UDP_PORT {
+                    s.send_from_both(&req_bytes, SocketAddr::new(target_ip, DEFAULT_UDP_PORT));
+                }
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -401,11 +411,26 @@ async fn connect_to_host_step(
         }
         _ if !policy.reverse_tcp_timeout.is_zero() => {
             // 2. Direct TCP timed out or was refused (e.g. Linux ufw/firewalld blocking inbound TCP 22222 or ephemeral server port).
-            // Only attempt Reverse TCP if we have a verified UDP beacon from this peer (same L2 LAN discovery).
-            // For cross-subnet / VPN Direct IP connections where no UDP beacon was received, skip Reverse TCP cleanly.
-            let has_verified_udp = crate::discovery::service()
+            // Only attempt Reverse TCP if we have a verified UDP beacon from this peer (or confirm via a quick unicast UDP probe
+            // when the peer is on our local L2 subnet, in case the user waited >5m after scanning).
+            // For cross-subnet / VPN Direct IP connections where no UDP beacon exists, skip Reverse TCP cleanly.
+            let mut has_verified_udp = crate::discovery::service()
                 .map(|s| s.has_verified_beacon(addr.ip(), addr.port(), password))
                 .unwrap_or(false);
+
+            if !has_verified_udp
+                && !addr.ip().is_loopback()
+                && crate::network::is_same_local_subnet(addr.ip())
+            {
+                if let Some(s) = crate::discovery::service() {
+                    let probe = DiscoveryProbe::new(password);
+                    if let Ok(bytes) = serde_json::to_vec(&probe) {
+                        s.send_from_both(&bytes, SocketAddr::new(addr.ip(), DEFAULT_UDP_PORT));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    has_verified_udp = s.has_verified_beacon(addr.ip(), addr.port(), password);
+                }
+            }
 
             if has_verified_udp {
                 let target_udp_port = crate::discovery::service()
@@ -415,7 +440,10 @@ async fn connect_to_host_step(
                 if let Some(s) = crate::discovery::service() {
                     let probe = DiscoveryProbe::new(password);
                     if let Ok(bytes) = serde_json::to_vec(&probe) {
-                        s.send_from_control(&bytes, SocketAddr::new(addr.ip(), target_udp_port));
+                        s.send_from_both(&bytes, SocketAddr::new(addr.ip(), target_udp_port));
+                        if target_udp_port != DEFAULT_UDP_PORT {
+                            s.send_from_both(&bytes, SocketAddr::new(addr.ip(), DEFAULT_UDP_PORT));
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;

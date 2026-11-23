@@ -26,7 +26,7 @@ fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 const MAX_CACHED_BEACONS: usize = 1024;
-const BEACON_CACHE_TTL: Duration = Duration::from_secs(60);
+const BEACON_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// A beacon received from the network (AEAD-encrypted until decrypted with a Share-Ring secret).
 #[derive(Debug, Clone)]
@@ -265,12 +265,6 @@ impl DiscoveryService {
         let _ = self.send_sock.send_to(data, target);
     }
 
-    /// Sends a datagram from this process's exclusive UDP control socket so replies return
-    /// directly to this instance even when multiple LanShare processes share port 22223.
-    pub fn send_from_control(&self, data: &[u8], target: SocketAddr) {
-        let _ = self.control_sock.send_to(data, target);
-    }
-
     /// Sends a datagram from both the shared discovery socket (`:22223`) and the exclusive
     /// control socket, matching firewall pinholes opened on either source port.
     pub fn send_from_both(&self, data: &[u8], target: SocketAddr) {
@@ -315,8 +309,9 @@ impl DiscoveryService {
         })
     }
 
-    /// Returns the UDP source port last seen on AEAD-verified beacons from `(ip, tcp_port)` for `secret`,
-    /// falling back to `22223`. Prevents unauthenticated or different-key LAN packets from hijacking Reverse TCP.
+    /// Returns the UDP source port last seen on AEAD-verified beacons from `(ip, tcp_port)` for `secret`
+    /// (preferring a dedicated per-instance control port `!= 22223` when present), falling back to `22223`.
+    /// Prevents unauthenticated or different-key LAN packets from hijacking Reverse TCP.
     pub fn peer_udp_port_for_secret(&self, ip: IpAddr, tcp_port: u16, secret: &str) -> u16 {
         let clean = secret.trim();
         if clean.is_empty() {
@@ -332,7 +327,7 @@ impl DiscoveryService {
                         .map(|p| p.port == tcp_port)
                         .unwrap_or(false)
             })
-            .max_by_key(|b| b.received_at)
+            .max_by_key(|b| (b.src_port != DEFAULT_UDP_PORT, b.received_at))
             .map(|b| b.src_port)
             .unwrap_or(DEFAULT_UDP_PORT)
     }

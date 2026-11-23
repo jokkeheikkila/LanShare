@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+### Added
+- **V3 ChaCha20-Poly1305 AEAD Encrypted UDP Discovery (`LANSHARE_BEACON_V3`, `LANSHARE_PROBE_V3`, `LANSHARE_REVCONN_V3`)**: Encrypts `DiscoveryBeacon` (`host_name`, `port`) and `ReverseConnectRequest` (`client_name`, `tcp_port`) payloads with `ring::aead::CHACHA20_POLY1305` keyed by a PBKDF2-HMAC-SHA256 stretched discovery subkey so zero plaintext computer names or TCP ports appear on the LAN/Wi-Fi wire.
+- **True IPv4 Subnet Broadcast Calculation (`compute_directed_broadcast`, `get_local_ipv4_subnets`)**: Queries real interface netmasks and flags via `libc::getifaddrs` on Unix to compute accurate directed broadcast addresses (`ip | !netmask`) across `/16`–`/30` networks, preventing accidental unicast packets to `.255` host IPs on `/16`–`/23` corporate and LAN-party networks.
+- **Virtual Hypervisor & Container Adapter Filtering (`is_virtual_interface_name`, `detect_primary_route_ipv4`)**: Automatically deprioritizes virtual switches (`VMware` / `VMnet1` / `VMnet8`, `VirtualBox`, `vEthernet`, `Hyper-V`, `WSL`, `Docker`) so Windows and Linux always display and broadcast on the primary default-route physical LAN interface first.
+
+### Changed
+- **Corporate IDS/EDR & Large LAN-Party Safe Discovery**: Removed parallel TCP `:22222` ARP neighbor port-scanning completely, replaced the fixed `850 ms` server broadcast loop with a jittered `2.5–3.5 s` heartbeat, added `20–150 ms` random jitter to unicast `DiscoveryProbe` replies (preventing reply implosion at large LAN parties), and capped Linux `nf_conntrack` local-subnet ARP UDP pinhole refresh to 16 active local neighbors.
+- **Smart Reverse-TCP Guard**: `connect_to_host` now only attempts Reverse-TCP UDP traversal when a verified V3 UDP beacon exists from the target peer (or on the local L2 subnet), skipping UDP hole-punching and callback listeners cleanly on cross-subnet or VPN Direct IP failures.
+- **Scaled Discovery Cache**: Raised `DiscoveryService` beacon cache capacity from `256` to `1,024` entries (`300 s` TTL) with expired-first and oldest-entry LRU eviction, and raised the client scan peer cap from `64` to `512`.
+
 ## [1.1.2] - 2026-11-19
 
 ### Added
@@ -78,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direct IP Connect support for Tailscale (`100.64.0.0/10`) and private LAN/ULA subnets, plus offline `--test` simulated multi-peer mode.
 - Read-only path validation, symlink/`O_NOFOLLOW` protection, `--secret-env` / `--secret-stdin` secret loading, and bounded OS-standard log rotation.
 
-[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/jokkeheikkila/LanShare/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/jokkeheikkila/LanShare/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jokkeheikkila/LanShare/compare/v1.0.0...v1.1.0
